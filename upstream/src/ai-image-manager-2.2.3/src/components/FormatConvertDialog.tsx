@@ -1,0 +1,336 @@
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  DEFAULT_FORMAT_CONVERT_PREFERENCES,
+  type FormatConvertFormat,
+  readFormatConvertPreferences,
+  saveFormatConvertPreferences,
+} from "@/actions/format-convert-preferences";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { ipc } from "@/ipc/manager";
+
+interface ConvertResult {
+  converted: number;
+  outputDir: string;
+}
+
+interface FormatConvertDialogProps {
+  onClose: () => void;
+  onConvert?: (options: {
+    format: "jpg" | "png" | "webp" | "avif";
+    quality: number;
+    maxWidth: number;
+    outputDir: string;
+  }) => Promise<ConvertResult>;
+  open: boolean;
+  photoCount: number;
+}
+
+const FORMATS: Array<{
+  value: FormatConvertFormat;
+  label: string;
+  descriptionKey: string;
+}> = [
+  { value: "webp", label: "WebP", descriptionKey: "convertWebpDescription" },
+  { value: "avif", label: "AVIF", descriptionKey: "convertAvifDescription" },
+  { value: "jpg", label: "JPEG", descriptionKey: "convertJpgDescription" },
+  { value: "png", label: "PNG", descriptionKey: "convertPngDescription" },
+];
+
+export function FormatConvertDialog({
+  onClose,
+  onConvert,
+  open,
+  photoCount,
+}: FormatConvertDialogProps) {
+  const { t } = useTranslation();
+  const [format, setFormat] = useState<FormatConvertFormat>(
+    DEFAULT_FORMAT_CONVERT_PREFERENCES.format
+  );
+  const [quality, setQuality] = useState(
+    DEFAULT_FORMAT_CONVERT_PREFERENCES.quality
+  );
+  const [maxWidth, setMaxWidth] = useState(
+    DEFAULT_FORMAT_CONVERT_PREFERENCES.maxWidth
+  );
+  const [outputDir, setOutputDir] = useState(
+    DEFAULT_FORMAT_CONVERT_PREFERENCES.outputDir
+  );
+  const [executing, setExecuting] = useState(false);
+  const [result, setResult] = useState<ConvertResult | null>(null);
+  const [error, setError] = useState("");
+
+  async function pickOutputDir() {
+    const res = await ipc.client.shell.openFolderDialog({});
+    const pickedPath = (res as { path?: string })?.path;
+    if (pickedPath) {
+      setOutputDir(pickedPath);
+    }
+  }
+
+  useEffect(() => {
+    if (open) {
+      const preferences = readFormatConvertPreferences();
+      setFormat(preferences.format);
+      setQuality(preferences.quality);
+      setMaxWidth(preferences.maxWidth);
+      setOutputDir(preferences.outputDir);
+      setResult(null);
+      setError("");
+    }
+  }, [open]);
+
+  const handleConvert = async () => {
+    setExecuting(true);
+    setError("");
+    try {
+      const options = {
+        format,
+        quality,
+        maxWidth: Number.parseInt(maxWidth, 10) || 0,
+        outputDir,
+      };
+      if (!onConvert) {
+        return;
+      }
+      
+      const res = await onConvert(options);
+      if (res.converted > 0) {
+        saveFormatConvertPreferences({
+          format: options.format,
+          quality: options.quality,
+          maxWidth,
+          outputDir: options.outputDir,
+        });
+      }
+      setResult(res);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      setError(message || t("convertFailed"));
+    } finally {
+      setExecuting(false);
+    }
+  };
+
+  const hasResult = result !== null;
+  const blockClose = executing || hasResult;
+
+  return (
+    <Dialog
+      onOpenChange={(next) => {
+        if (!(next || blockClose)) {
+          onClose();
+        }
+      }}
+      open={open}
+    >
+      <DialogContent
+        className="max-h-[calc(100dvh-1rem)] overflow-y-auto overflow-x-hidden overscroll-contain"
+        onEscapeKeyDown={(e) => {
+          e.stopPropagation();
+          if (blockClose) {
+            e.preventDefault();
+          }
+        }}
+        onPointerDownOutside={(e) => {
+          if (blockClose) {
+            e.preventDefault();
+          }
+        }}
+        showCloseButton={!executing}
+        size="lg"
+      >
+        <DialogHeader>
+          <DialogTitle>{t("convertTitle", { count: photoCount })}</DialogTitle>
+        </DialogHeader>
+
+        {hasResult ? (
+          <>
+            <div className="flex items-center gap-2 text-[14px] text-success">
+              {t("convertSuccessCount", { count: result.converted })}
+            </div>
+            <div className="min-w-0 text-[12px] text-muted-foreground">
+              {t("outputDir")}:{" "}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-block max-w-full truncate align-bottom font-mono text-foreground">
+                    {result.outputDir}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-[min(28rem,calc(100vw-1rem))] break-all">
+                  {result.outputDir}
+                </TooltipContent>
+              </Tooltip>
+            </div>
+            <DialogFooter>
+              <button
+                className="rounded-md bg-primary px-4 py-1.5 font-medium text-[13px] text-primary-foreground transition-opacity hover:opacity-90"
+                onClick={onClose}
+                type="button"
+              >
+                {t("done")}
+              </button>
+            </DialogFooter>
+          </>
+        ) : (
+          <>
+            <div>
+              <label
+                className="mb-2 block text-[12px] text-muted-foreground"
+                htmlFor="convert-format"
+              >
+                {t("targetFormat")}
+              </label>
+              <div
+                className="grid grid-cols-[repeat(auto-fit,minmax(min(10rem,100%),1fr))] gap-2"
+                id="convert-format"
+              >
+                {FORMATS.map((f) => (
+                  <button
+                    className={`rounded-md border px-3 py-2.5 text-left transition-colors ${
+                      format === f.value
+                        ? "border-primary bg-primary/10 text-foreground"
+                        : "border-border text-muted-foreground hover:bg-foreground/5"
+                    }`}
+                    key={f.value}
+                    onClick={() => setFormat(f.value)}
+                    type="button"
+                  >
+                    <div className="font-medium text-[13px]">{f.label}</div>
+                    <div className="mt-0.5 text-[11px] opacity-60">
+                      {t(f.descriptionKey)}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <label
+                  className="text-[12px] text-muted-foreground"
+                  htmlFor="convert-quality"
+                >
+                  {t("quality")}
+                </label>
+                <span className="font-mono text-[13px] text-foreground">
+                  {quality}%
+                </span>
+              </div>
+              <input
+                className="w-full"
+                id="convert-quality"
+                max={100}
+                min={10}
+                onChange={(e) => setQuality(Number(e.target.value))}
+                style={{ accentColor: "var(--primary)" }}
+                type="range"
+                value={quality}
+              />
+              <div className="mt-1 flex justify-between text-[10px] text-muted-foreground/70">
+                <span>{t("smallestSize")}</span>
+                <span>{t("bestQuality")}</span>
+              </div>
+            </div>
+
+            <div>
+              <label
+                className="mb-1.5 block text-[12px] text-muted-foreground"
+                htmlFor="convert-max-width"
+              >
+                {t("maxWidthOptional")}
+              </label>
+              <input
+                className="w-32 rounded-md border border-border bg-secondary px-3 py-2 font-mono text-[14px] text-foreground outline-none focus:border-primary"
+                id="convert-max-width"
+                onChange={(e) => setMaxWidth(e.target.value.replace(/\D/g, ""))}
+                placeholder={t("noLimit")}
+                value={maxWidth}
+              />
+            </div>
+
+            <div>
+              <label
+                className="mb-1.5 block text-[12px] text-muted-foreground"
+                htmlFor="convert-output-dir"
+              >
+                {t("outputDir")}
+              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span
+                      className="min-w-0 flex-[1_1_12rem] truncate rounded-md border border-border bg-secondary px-3 py-2 font-mono text-[12px] text-muted-foreground/70"
+                      id="convert-output-dir"
+                    >
+                      {outputDir || t("defaultTempDir")}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-[min(28rem,calc(100vw-1rem))] break-all">
+                    {outputDir || t("defaultTempDir")}
+                  </TooltipContent>
+                </Tooltip>
+                <button
+                  className="flex-shrink-0 rounded-md border border-border px-3 py-2 text-[12px] text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+                  onClick={pickOutputDir}
+                  type="button"
+                >
+                  {t("pickOutputDir")}
+                </button>
+              </div>
+            </div>
+
+            {error && (
+              <div className="rounded-md border border-destructive/20 bg-destructive/10 px-3 py-2 text-[12px] text-destructive [overflow-wrap:anywhere]">
+                {error}
+              </div>
+            )}
+
+            {executing && (
+              <div>
+                <div className="mb-1.5 text-[11px] text-muted-foreground">
+                  {t("convertingPhotos", { count: photoCount })}
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                  <div className="h-full w-1/3 animate-[indeterminate_1.5s_ease-in-out_infinite] rounded-full bg-primary" />
+                </div>
+              </div>
+            )}
+
+            <DialogFooter>
+              <button
+                className="rounded-md border border-border px-4 py-1.5 font-medium text-[13px] text-muted-foreground transition-colors hover:bg-foreground/5 disabled:opacity-40"
+                disabled={executing}
+                onClick={onClose}
+                type="button"
+              >
+                {t("cancel")}
+              </button>
+              <button
+                className="rounded-md bg-primary px-4 py-1.5 font-medium text-[13px] text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+                disabled={executing}
+                onClick={handleConvert}
+                type="button"
+              >
+                {executing
+                  ? t("converting")
+                  : t("convertActionCount", { count: photoCount })}
+              </button>
+            </DialogFooter>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}

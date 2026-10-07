@@ -1,0 +1,2023 @@
+// biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: scoped component lint cleanup preserves existing UI behavior
+// biome-ignore-all lint/a11y/useKeyWithClickEvents: scoped component lint cleanup preserves existing UI behavior
+// biome-ignore-all lint/a11y/noStaticElementInteractions: scoped component lint cleanup preserves existing UI behavior
+// biome-ignore-all lint/a11y/noNoninteractiveElementInteractions: scoped component lint cleanup preserves existing UI behavior
+// biome-ignore-all lint/suspicious/noArrayIndexKey: scoped component lint cleanup preserves existing UI behavior
+import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  ChevronUp,
+  Layers,
+  Scissors,
+  Timer,
+  Unlink,
+} from "lucide-react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
+import { photoSequenceActions } from "@/actions/photo-sequences";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { useSequenceReturnFocus } from "@/hooks/useSequenceReturnFocus";
+import type { SearchMatch } from "@/types/photo";
+import type {
+  PhotoSequence,
+  PhotoSequenceDetail,
+  SequenceOrderChange,
+} from "@/types/photo-sequence";
+import {
+  type GalleryReturnTarget,
+  getGalleryReturnPresentation,
+} from "@/utils/gallery-return";
+import {
+  buildPhotoGroupHeaders,
+  hasMatchingPhotoGroupPrefix,
+  type PhotoGroupInputSnapshot,
+  snapshotPhotoGroupInputs,
+} from "@/utils/photo-group-headers";
+import type { GroupHeader, MasonryGridHandle } from "./MasonryGrid";
+import { MasonryGrid } from "./MasonryGrid";
+import { type FaceOverlay, PhotoCard } from "./PhotoCard";
+import { RecentlyViewedBadge } from "./RecentlyViewedBadge";
+import { SequenceCard } from "./SequenceCard";
+import { SortDropdown } from "./SortDropdown";
+import { LoadingSpinner } from "./ui/loading-spinner";
+import { Skeleton } from "./ui/skeleton";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+
+interface Photo {
+  dominantColors?: string | null;
+  fileDate?: number | null;
+  filename: string;
+  fileSize: number;
+  height: number;
+  id: number;
+  isFavorite?: boolean;
+  isIndexed: boolean;
+  match?: SearchMatch;
+  path: string;
+  thumbnailPath: string | null;
+  thumbnailSmallPath?: string | null;
+  width: number;
+}
+
+interface SequenceTrayPhoto extends Photo {
+  fullWidth: true;
+  sequenceTray: PhotoSequenceDetail;
+  trayColumns: number;
+}
+
+type DisplayPhoto = Photo | SequenceTrayPhoto;
+export type SortField = "date" | "name" | "size";
+export type SortOrder = "asc" | "desc";
+
+interface PhotoGridProps {
+  columnWidth?: number;
+  deletingIds?: Set<number>;
+  disablePhotoDrag?: boolean;
+  emptyState?: React.ReactNode;
+  error?: string;
+  expandedSequence?: PhotoSequenceDetail | null;
+  expandedSequenceComplete?: PhotoSequenceDetail | null;
+  expandingSequenceId?: number | null;
+  faceOverlayByPhotoId?: ReadonlyMap<number, FaceOverlay[]>;
+  faceOverlaysVisible?: boolean;
+  /** MasonryGrid 命令式 ref，用于原子化滚动定位 */
+  gridRef?: React.RefObject<MasonryGridHandle | null>;
+  /** 是否还有更多数据可加载（对应 infinite scroll 的 hasNextPage） */
+  hasMore?: boolean;
+  /** 正在加载更多数据（useInfiniteQuery 的 isFetchingNextPage） */
+  isLoadingMore?: boolean;
+  /**
+   * 是否为占位数据（keepPreviousData 期间的旧缓存）。
+   * 为 true 时 MasonryGrid 会锁死滚动恢复和锚点调整，
+   * 避免基于假数据做错误定位。
+   */
+  isPlaceholderData?: boolean;
+  /** 当搜索/浏览切换时数据尚未同步，显示半透明遮罩以避免闪烁 */
+  isStale?: boolean;
+  loading: boolean;
+  onBackgroundClick?: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+  onDoubleClick: (id: number) => void;
+  onEndReached?: () => void;
+  onKeyboardSelect?: (id: number) => void;
+  onMarqueeSelect?: (ids: Set<number>) => void;
+  onNameFace?: (id: number) => void;
+  onOpenSequence?: (sequenceId: number) => void;
+  onOpenSequenceDetails?: (sequenceId: number) => void;
+  onRestoreSettled?: (routeKey: string) => void;
+  onRetrySequences?: () => void;
+  onReturnLocated?: (request: number) => void;
+  onScrollTopChange?: (scrollTop: number) => void;
+  onSelect: (id: number, event: React.MouseEvent) => void;
+  onSelectSequence?: (memberIds: number[], event: React.MouseEvent) => void;
+  onSelectSequenceMembers?: (memberIds: number[], selectAll: boolean) => void;
+  onSequenceModeChange?: (mode: "photos" | "sequences") => void;
+  onSequenceMutationComplete?: () => void;
+  onSequenceOrderChange?: (change: SequenceOrderChange) => void;
+  onSortChange?: (sort: SortField, order: SortOrder) => void;
+  onToggleFavorite?: (id: number) => void;
+  onToggleSequenceExpand?: (sequenceId: number) => void;
+  photos: Photo[];
+  /** A failed refresh can retain only a previously confirmed gallery. */
+  preserveOnSequenceError?: boolean;
+  recentlyViewedPhotoId?: number | null;
+  recentlyViewedPulseActive?: boolean;
+  recentlyViewedPulseKey?: number;
+  recentlyViewedReturnRequest?: number;
+  recentlyViewedTarget?: GalleryReturnTarget | null;
+  restoreGateReady?: boolean;
+  /**
+   * 路由唯一标识，用于区分不同页面的滚动位置
+   * 例如: "home" | "album-123" | "person-456"
+   */
+  routeKey: string;
+  searchQuery?: string;
+  selectedIds: Set<number>;
+  /** 本次语义搜索最佳匹配的原始余弦相似度，透传给 PhotoCard 归一化角标 */
+  semanticTopSimilarity?: number;
+  /** 序列数量徽标；传给工具栏"序列"切换按钮。默认不显示。 */
+  sequenceCount?: number;
+  /** 序列归属查询失败时阻止展示未确认的混合内容。 */
+  sequenceError?: string | null;
+  /** 序列归属尚未解析完成时，禁止短暂展示混合内容。 */
+  sequenceLoading?: boolean;
+  sequenceMode?: "photos" | "sequences";
+  sequences?: PhotoSequence[];
+  showGroupHeaders?: boolean;
+  showToolbar?: boolean;
+  sort?: SortField;
+  sortOrder?: SortOrder;
+  topInset?: number;
+}
+
+export function createPhotoGridItemStateVersion(
+  deletingIds: ReadonlySet<number> | undefined,
+  faceOverlayByPhotoId: ReadonlyMap<number, FaceOverlay[]> | undefined,
+  faceOverlaysVisible: boolean,
+  selectedIds: ReadonlySet<number>,
+  recentlyViewedPhotoId?: number | null,
+  recentlyViewedPulseActive?: boolean,
+  recentlyViewedPulseKey?: number,
+  recentlyViewedTarget?: GalleryReturnTarget | null,
+  recentlyViewedReturnRequest?: number,
+  trayReadyRequest?: number
+) {
+  return {
+    deletingIds,
+    faceOverlayByPhotoId,
+    faceOverlaysVisible,
+    recentlyViewedPhotoId,
+    recentlyViewedTarget,
+    recentlyViewedReturnRequest,
+    trayReadyRequest,
+    recentlyViewedPulseActive,
+    recentlyViewedPulseKey,
+    selectedIds,
+  };
+}
+
+const MIN_COLUMNS = 2;
+export const GRID_COLUMN_WIDTH_MIN = 140;
+export const GRID_COLUMN_WIDTH_MAX = 320;
+export const GRID_COLUMN_WIDTH_DEFAULT = 220;
+const GAP = 8;
+const INITIAL_EAGER_ROWS = 2;
+const SEQUENCE_TRAY_GAP = 8;
+const SEQUENCE_TRAY_MAX_HEIGHT = 560;
+const SEQUENCE_TRAY_MANAGEMENT_HEIGHT = 40;
+const SEQUENCE_TRAY_PADDING = 24;
+
+function scopedSequenceMemberIds(sequence: PhotoSequence): number[] {
+  return sequence.matchedPhotoIds ?? sequence.memberPhotoIds ?? [];
+}
+
+function getSequenceRowHeight(
+  members: PhotoSequenceDetail["members"],
+  containerWidth: number,
+  columns: number,
+  rowIndex: number
+) {
+  const tileWidth = Math.max(
+    1,
+    (containerWidth -
+      SEQUENCE_TRAY_PADDING -
+      SEQUENCE_TRAY_GAP * (columns - 1)) /
+      columns
+  );
+  const row = members.slice(rowIndex * columns, (rowIndex + 1) * columns);
+  return (
+    Math.max(
+      ...row.map((member) => {
+        const aspect = Math.max(
+          0.6,
+          Math.min(member.width / member.height || 4 / 3, 3)
+        );
+        return tileWidth / aspect;
+      }),
+      1
+    ) + SEQUENCE_TRAY_GAP
+  );
+}
+
+function getSequenceGridHeight(
+  members: PhotoSequenceDetail["members"],
+  containerWidth: number,
+  columns: number
+) {
+  const rowCount = Math.ceil(members.length / columns);
+  return Array.from({ length: rowCount }, (_, rowIndex) =>
+    getSequenceRowHeight(members, containerWidth, columns, rowIndex)
+  ).reduce((total, height) => total + height, 0);
+}
+
+export const GRID_COLUMN_WIDTH_KEY = "grid_column_width";
+
+function createSequenceTray(
+  sequence: PhotoSequenceDetail,
+  containerWidth: number,
+  columns: number
+): SequenceTrayPhoto | null {
+  const representative =
+    sequence.members.find(
+      (photo) => photo.id === sequence.representativePhotoId
+    ) ?? sequence.members[0];
+  if (!representative) {
+    return null;
+  }
+  const gridHeight = getSequenceGridHeight(
+    sequence.members,
+    containerWidth,
+    columns
+  );
+  return {
+    ...representative,
+    fullWidth: true,
+    height:
+      56 +
+      SEQUENCE_TRAY_PADDING +
+      SEQUENCE_TRAY_MANAGEMENT_HEIGHT +
+      Math.min(gridHeight, SEQUENCE_TRAY_MAX_HEIGHT),
+    id: -sequence.id,
+    sequenceTray: sequence,
+    trayColumns: columns,
+    width: containerWidth,
+  };
+}
+
+export function loadGridColumnWidth(): number {
+  try {
+    const raw = localStorage.getItem(GRID_COLUMN_WIDTH_KEY);
+    if (raw !== null) {
+      const val = Number(raw);
+      if (
+        !Number.isNaN(val) &&
+        val >= GRID_COLUMN_WIDTH_MIN &&
+        val <= GRID_COLUMN_WIDTH_MAX
+      ) {
+        return val;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return GRID_COLUMN_WIDTH_DEFAULT;
+}
+
+export interface SequenceFocusTrayProps {
+  columns: number;
+  completeMembers?: readonly Photo[];
+  containerWidth: number;
+  disablePhotoDrag?: boolean;
+  faceOverlayByPhotoId?: ReadonlyMap<number, FaceOverlay[]>;
+  faceOverlaysVisible?: boolean;
+  getDragIds: (id: number) => number[];
+  onDoubleClick: (id: number) => void;
+  onNameFace?: (id: number) => void;
+  onReturnLocated?: (request: number) => void;
+  onSelect: (id: number, event: React.MouseEvent) => void;
+  onSelectSequenceMembers?: (memberIds: number[], selectAll: boolean) => void;
+  onSequenceMutationComplete?: () => void;
+  onSequenceOrderChange?: (change: SequenceOrderChange) => void;
+  onToggleFavorite?: (id: number) => void;
+  onToggleSequenceExpand?: (sequenceId: number) => void;
+  recentlyViewedMemberId?: number | null;
+  recentlyViewedPulseActive?: boolean;
+  recentlyViewedPulseKey?: number;
+  recentlyViewedSequence?: boolean;
+  renderImage: boolean;
+  returnRequest?: number;
+  searchQuery?: string;
+  selectedIds: Set<number>;
+  sequence: PhotoSequenceDetail;
+  topInset?: number;
+}
+
+export function SequenceFocusTray({
+  containerWidth,
+  columns,
+  completeMembers,
+  disablePhotoDrag = false,
+  faceOverlayByPhotoId,
+  faceOverlaysVisible = true,
+  getDragIds,
+  onDoubleClick,
+  onNameFace,
+  onSelect,
+  onSelectSequenceMembers,
+  onSequenceMutationComplete,
+  onSequenceOrderChange,
+  onToggleFavorite,
+  onToggleSequenceExpand,
+  renderImage,
+  searchQuery,
+  selectedIds,
+  sequence,
+  recentlyViewedMemberId = null,
+  recentlyViewedSequence = false,
+  recentlyViewedPulseActive = false,
+  recentlyViewedPulseKey = 0,
+  returnRequest = 0,
+  onReturnLocated,
+  topInset = 0,
+}: SequenceFocusTrayProps) {
+  const { t } = useTranslation();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const fullMembers = completeMembers ?? sequence.members;
+  const initialMemberOrder = fullMembers.map((member) => member.id);
+  const [memberOrder, setMemberOrder] = useState(initialMemberOrder);
+  const [moveFeedback, setMoveFeedback] = useState<"moving" | "moved" | null>(
+    null
+  );
+  const [movingMemberId, setMovingMemberId] = useState<number | null>(null);
+  const moveFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
+  const memberOrderSignature = initialMemberOrder.join(",");
+  const memberOrderSourceRef = useRef(memberOrderSignature);
+  useEffect(() => {
+    if (memberOrderSourceRef.current === memberOrderSignature) {
+      return;
+    }
+    memberOrderSourceRef.current = memberOrderSignature;
+    setMemberOrder(initialMemberOrder);
+  }, [initialMemberOrder, memberOrderSignature]);
+  useEffect(
+    () => () => {
+      if (moveFeedbackTimerRef.current !== null) {
+        clearTimeout(moveFeedbackTimerRef.current);
+      }
+    },
+    []
+  );
+  const orderedFullMembers = useMemo(() => {
+    const membersById = new Map(
+      fullMembers.map((member) => [member.id, member])
+    );
+    const seen = new Set<number>();
+    const ordered = memberOrder.flatMap((id) => {
+      const member = membersById.get(id);
+      if (!member || seen.has(id)) {
+        return [];
+      }
+      seen.add(id);
+      return [member];
+    });
+    return ordered.concat(fullMembers.filter((member) => !seen.has(member.id)));
+  }, [fullMembers, memberOrder]);
+  const visibleMemberIds = useMemo(
+    () => new Set(sequence.members.map((member) => member.id)),
+    [sequence.members]
+  );
+  const displayMembers = useMemo(() => {
+    const orderedVisible = orderedFullMembers.filter((member) =>
+      visibleMemberIds.has(member.id)
+    );
+    const orderedVisibleIds = new Set(
+      orderedVisible.map((member) => member.id)
+    );
+    return orderedVisible.concat(
+      sequence.members.filter((member) => !orderedVisibleIds.has(member.id))
+    );
+  }, [orderedFullMembers, sequence.members, visibleMemberIds]);
+  const rowCount = Math.ceil(displayMembers.length / columns);
+  const gridHeight = getSequenceGridHeight(
+    displayMembers,
+    containerWidth,
+    columns
+  );
+  const virtualizer = useVirtualizer({
+    count: rowCount,
+    estimateSize: (rowIndex) =>
+      getSequenceRowHeight(displayMembers, containerWidth, columns, rowIndex),
+    getScrollElement: () => scrollRef.current,
+    initialRect: {
+      height: Math.min(gridHeight, SEQUENCE_TRAY_MAX_HEIGHT),
+      width: containerWidth,
+    },
+    overscan: 2,
+  });
+  const returnMemberIds = useMemo(
+    () => displayMembers.map((member) => member.id),
+    [displayMembers]
+  );
+  const scrollToReturnRow = useCallback(
+    (row: number) => {
+      virtualizer.scrollToIndex(row, { align: "auto" });
+    },
+    [virtualizer]
+  );
+  useSequenceReturnFocus({
+    scrollRef,
+    memberId: recentlyViewedMemberId,
+    memberIds: returnMemberIds,
+    columns,
+    request: returnRequest,
+    scrollToRow: scrollToReturnRow,
+    onLocated: onReturnLocated,
+    topInset,
+  });
+  const selectedMemberCount = displayMembers.filter((member) =>
+    selectedIds.has(member.id)
+  ).length;
+  const selectedMemberIds = displayMembers
+    .filter((member) => selectedIds.has(member.id))
+    .map((member) => member.id);
+  const selectedFullIndex =
+    selectedMemberIds.length === 1
+      ? orderedFullMembers.findIndex(
+          (member) => member.id === selectedMemberIds[0]
+        )
+      : -1;
+  const [isMutating, setIsMutating] = useState(false);
+  const [confirmation, setConfirmation] = useState<{
+    confirmText: string;
+    description: React.ReactNode;
+    operation: () => Promise<unknown>;
+    successText: string;
+    title: string;
+  } | null>(null);
+  const dissolveExcludeRef = useRef(false);
+  const finishMutation = useCallback(
+    async (operation: () => Promise<unknown>, successText: string) => {
+      setIsMutating(true);
+      try {
+        await operation();
+        onSelectSequenceMembers?.(
+          fullMembers.map((member) => member.id),
+          false
+        );
+        onSequenceMutationComplete?.();
+        toast.success(successText);
+      } catch (error) {
+        console.error("[SequenceFocusTray] mutation failed", error);
+        toast.error(t("sequenceActionFailed"));
+      } finally {
+        setIsMutating(false);
+      }
+    },
+    [fullMembers, onSelectSequenceMembers, onSequenceMutationComplete, t]
+  );
+  const handleMove = useCallback(
+    async (direction: -1 | 1) => {
+      if (selectedFullIndex < 0) {
+        return;
+      }
+      const targetIndex = selectedFullIndex + direction;
+      if (targetIndex < 0 || targetIndex >= orderedFullMembers.length) {
+        return;
+      }
+      const selectedMemberId = orderedFullMembers[selectedFullIndex].id;
+      const previousOrder = orderedFullMembers.map((member) => member.id);
+      const orderedIds = [...previousOrder];
+      [orderedIds[selectedFullIndex], orderedIds[targetIndex]] = [
+        orderedIds[targetIndex],
+        orderedIds[selectedFullIndex],
+      ];
+      setMemberOrder(orderedIds);
+      setMovingMemberId(selectedMemberId);
+      setMoveFeedback("moving");
+      setIsMutating(true);
+      try {
+        await photoSequenceActions.updateMembers(sequence.id, orderedIds);
+        onSequenceOrderChange?.({
+          orderedMemberIds: orderedIds,
+          sequenceId: sequence.id,
+        });
+        setMoveFeedback("moved");
+        if (moveFeedbackTimerRef.current !== null) {
+          clearTimeout(moveFeedbackTimerRef.current);
+        }
+        moveFeedbackTimerRef.current = setTimeout(() => {
+          setMoveFeedback(null);
+          setMovingMemberId(null);
+        }, 1200);
+        toast.success(t("sequenceMoveSuccess"));
+      } catch (error) {
+        console.error("[SequenceFocusTray] sequence move failed", error);
+        setMemberOrder(previousOrder);
+        setMoveFeedback(null);
+        setMovingMemberId(null);
+        toast.error(t("sequenceMoveFailed"));
+      } finally {
+        setIsMutating(false);
+      }
+    },
+    [
+      onSequenceOrderChange,
+      orderedFullMembers,
+      selectedFullIndex,
+      sequence.id,
+      t,
+    ]
+  );
+  const allMembersSelected =
+    displayMembers.length > 0 && selectedMemberCount === displayMembers.length;
+  let selectionLabel = `${t("selectAll")} (${displayMembers.length})`;
+  if (allMembersSelected) {
+    selectionLabel = t("clearSelection");
+  } else if (selectedMemberCount > 0) {
+    selectionLabel = `${selectedMemberCount}/${sequence.members.length}`;
+  }
+  return (
+    <section
+      className={`fade-in-0 slide-in-from-top-2 relative animate-in rounded-[10px] border-2 border-primary/50 bg-primary/[0.06] p-3 shadow-sm duration-200 ${recentlyViewedSequence && recentlyViewedPulseActive ? "photo-card-recently-viewed-pulse" : ""}`}
+      data-sequence-tray-id={sequence.id}
+      tabIndex={-1}
+    >
+      <header className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2 text-primary">
+          {sequence.type === "burst" ? (
+            <Layers className="h-4 w-4 shrink-0" />
+          ) : (
+            <Timer className="h-4 w-4 shrink-0" />
+          )}
+          <span className="truncate font-medium text-[13px]">
+            {t(
+              sequence.type === "burst" ? "sequenceBurst" : "sequenceTimelapse"
+            )}
+            {` · ${sequence.frameCount} ${t("sequenceFrames")}`}
+          </span>
+          {recentlyViewedSequence && <RecentlyViewedBadge inline />}
+        </div>
+        <div className="flex min-w-0 shrink-0 items-center gap-2">
+          {moveFeedback && (
+            <span
+              aria-live="polite"
+              className="flex min-w-0 items-center gap-1 text-[11px] text-primary"
+              role="status"
+            >
+              {moveFeedback === "moving" ? (
+                <span className="h-3 w-3 shrink-0 animate-spin rounded-full border border-primary/30 border-t-primary" />
+              ) : (
+                <Check className="h-3 w-3 shrink-0" />
+              )}
+              <span className="truncate">
+                {t(
+                  moveFeedback === "moving" ? "sequenceMoving" : "sequenceMoved"
+                )}
+              </span>
+            </span>
+          )}
+          {onSelectSequenceMembers && (
+            <button
+              className="h-8 rounded-md border border-border bg-background/80 px-2 text-[12px] text-foreground hover:bg-muted"
+              onClick={(event) => {
+                event.stopPropagation();
+                onSelectSequenceMembers(
+                  displayMembers.map((member) => member.id),
+                  !allMembersSelected
+                );
+              }}
+              type="button"
+            >
+              {selectionLabel}
+            </button>
+          )}
+          {onToggleSequenceExpand && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  aria-label={t("sequenceCollapse")}
+                  className="flex h-8 shrink-0 items-center gap-1 rounded-md border border-primary/30 bg-background/80 px-2 text-[12px] text-foreground hover:bg-primary/10"
+                  disabled={isMutating}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onToggleSequenceExpand(sequence.id);
+                  }}
+                  type="button"
+                >
+                  <ChevronUp size={16} />
+                  {t("sequenceCollapse")}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>{t("sequenceCollapse")}</TooltipContent>
+            </Tooltip>
+          )}
+        </div>
+      </header>
+      <div className="mb-3 flex h-7 items-center gap-2 overflow-x-auto">
+        <span className="shrink-0 text-[11px] text-muted-foreground">
+          {t("sequenceManagement")}
+        </span>
+        <button
+          className="h-7 shrink-0 rounded-md border border-border bg-background/80 px-2 text-[11px] disabled:opacity-40"
+          disabled={
+            isMutating ||
+            moveFeedback !== null ||
+            selectedMemberIds.length === 0
+          }
+          onClick={(event) => {
+            event.stopPropagation();
+            setConfirmation({
+              confirmText: t("sequenceRemoveAction"),
+              description: t("sequenceRemoveDescription", {
+                count: selectedMemberIds.length,
+              }),
+              operation: () =>
+                photoSequenceActions.removeMembers(
+                  sequence.id,
+                  selectedMemberIds
+                ),
+              successText: t("sequenceRemoveSuccess"),
+              title: t("sequenceRemoveConfirmTitle"),
+            });
+          }}
+          type="button"
+        >
+          <Unlink className="mr-1 inline size-3.5" />
+          {t("sequenceRemoveShort")}
+        </button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              aria-label={t("sequenceMoveUp")}
+              className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border bg-background/80 disabled:opacity-40"
+              disabled={
+                isMutating || moveFeedback !== null || selectedFullIndex <= 0
+              }
+              onClick={(event) => {
+                event.stopPropagation();
+                handleMove(-1).catch(() => undefined);
+              }}
+              type="button"
+            >
+              <ArrowLeft className="size-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>{t("sequenceMoveUp")}</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              aria-label={t("sequenceMoveDown")}
+              className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border bg-background/80 disabled:opacity-40"
+              disabled={
+                isMutating ||
+                moveFeedback !== null ||
+                selectedFullIndex < 0 ||
+                selectedFullIndex >= orderedFullMembers.length - 1
+              }
+              onClick={(event) => {
+                event.stopPropagation();
+                handleMove(1).catch(() => undefined);
+              }}
+              type="button"
+            >
+              <ArrowRight className="size-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>{t("sequenceMoveDown")}</TooltipContent>
+        </Tooltip>
+        <button
+          className="h-7 shrink-0 rounded-md border border-border bg-background/80 px-2 text-[11px] disabled:opacity-40"
+          disabled={
+            isMutating ||
+            moveFeedback !== null ||
+            selectedFullIndex < 2 ||
+            selectedFullIndex > fullMembers.length - 2
+          }
+          onClick={(event) => {
+            event.stopPropagation();
+            setConfirmation({
+              confirmText: t("sequenceSplitAction"),
+              description: t("sequenceSplitDescription", {
+                after: fullMembers.length - selectedFullIndex,
+                before: selectedFullIndex,
+              }),
+              operation: () =>
+                photoSequenceActions.split(sequence.id, selectedFullIndex),
+              successText: t("sequenceSplitTraySuccess"),
+              title: t("sequenceConfirmSplit"),
+            });
+          }}
+          type="button"
+        >
+          <Scissors className="mr-1 inline size-3.5" />
+          {t("sequenceSplitHere")}
+        </button>
+        <button
+          className="h-7 shrink-0 rounded-md border border-destructive/30 bg-background/80 px-2 text-[11px] text-destructive disabled:opacity-40"
+          disabled={isMutating || moveFeedback !== null}
+          onClick={(event) => {
+            event.stopPropagation();
+            dissolveExcludeRef.current = false;
+            setConfirmation({
+              confirmText: t("sequenceDissolveAction"),
+              description: (
+                <>
+                  <span className="mb-3 block">
+                    {t("sequenceDissolveDescription", {
+                      count: fullMembers.length,
+                    })}
+                  </span>
+                  <span className="checkbox-wrapper flex items-center gap-2">
+                    <input
+                      className="check"
+                      defaultChecked={false}
+                      id="dissolve-exclude-check"
+                      onChange={(e) => {
+                        dissolveExcludeRef.current = e.target.checked;
+                      }}
+                      type="checkbox"
+                    />
+                    <label
+                      className="label flex cursor-pointer items-center gap-2 text-[13px] text-muted-foreground"
+                      htmlFor="dissolve-exclude-check"
+                    >
+                      <svg
+                        aria-hidden="true"
+                        className="flex-none text-foreground/55"
+                        height="40"
+                        viewBox="0 0 95 95"
+                        width="40"
+                      >
+                        <rect
+                          fill="none"
+                          height="50"
+                          stroke="currentColor"
+                          width="50"
+                          x="30"
+                          y="20"
+                        />
+                        <g transform="translate(0,-952.36222)">
+                          <path
+                            className="path1"
+                            d="m 56,963 c -102,122 6,9 7,9 17,-5 -66,69 -38,52 122,-77 -7,14 18,4 29,-11 45,-43 23,-4"
+                            fill="none"
+                            stroke="var(--danger)"
+                            strokeWidth="3"
+                          />
+                        </g>
+                      </svg>
+                      {t("sequenceDissolveExclude")}
+                    </label>
+                  </span>
+                </>
+              ),
+              operation: () =>
+                dissolveExcludeRef.current
+                  ? photoSequenceActions.dissolveAndExclude(sequence.id)
+                  : photoSequenceActions.dissolve(sequence.id),
+              successText: t("sequenceDissolveSuccess"),
+              title: t("sequenceDissolveConfirmTitle"),
+            });
+          }}
+          type="button"
+        >
+          <Unlink className="mr-1 inline size-3.5" />
+          {t("sequenceDissolveShort")}
+        </button>
+      </div>
+      <div
+        className="overflow-y-auto overscroll-contain px-1 pt-1"
+        data-sequence-virtual-scroll=""
+        ref={scrollRef}
+        style={{ height: Math.min(gridHeight, SEQUENCE_TRAY_MAX_HEIGHT) }}
+      >
+        <div
+          className="relative w-full"
+          data-sequence-virtual-grid=""
+          style={{ height: virtualizer.getTotalSize() }}
+        >
+          {virtualizer.getVirtualItems().map((virtualRow) => {
+            const startIndex = virtualRow.index * columns;
+            const rowMembers = displayMembers.slice(
+              startIndex,
+              startIndex + columns
+            );
+            return (
+              <div
+                className="absolute top-0 left-0 grid w-full gap-2"
+                data-sequence-virtual-row={virtualRow.index}
+                key={virtualRow.key}
+                style={{
+                  gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+                  minHeight: virtualRow.size,
+                  paddingBottom: SEQUENCE_TRAY_GAP,
+                  transform: `translateY(${virtualRow.start}px)`,
+                }}
+              >
+                {rowMembers.map((member, columnIndex) => {
+                  const isMovingMember = movingMemberId === member.id;
+                  return (
+                    <div
+                      className={`relative rounded-[8px] transition-shadow duration-300 ${isMovingMember ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
+                      data-sequence-member-id={member.id}
+                      key={member.id}
+                    >
+                      <PhotoCard
+                        disableDrag={disablePhotoDrag}
+                        dominantColors={member.dominantColors}
+                        faceOverlays={faceOverlayByPhotoId?.get(member.id)}
+                        faceOverlaysVisible={faceOverlaysVisible}
+                        filename={member.filename}
+                        getDragIds={getDragIds}
+                        height={member.height}
+                        id={member.id}
+                        isFavorite={member.isFavorite}
+                        isSelected={selectedIds.has(member.id)}
+                        loading={
+                          startIndex + columnIndex <
+                          columns * INITIAL_EAGER_ROWS
+                            ? "eager"
+                            : "lazy"
+                        }
+                        onClick={onSelect}
+                        onDoubleClick={onDoubleClick}
+                        onNameFace={onNameFace}
+                        onToggleFavorite={onToggleFavorite}
+                        path={member.path}
+                        recentlyViewed={recentlyViewedMemberId === member.id}
+                        recentlyViewedPulseActive={
+                          recentlyViewedMemberId === member.id &&
+                          recentlyViewedPulseActive
+                        }
+                        recentlyViewedPulseKey={recentlyViewedPulseKey}
+                        renderImage={renderImage}
+                        searchQuery={searchQuery}
+                        thumbnailPath={member.thumbnailPath}
+                        width={member.width}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <ConfirmDialog
+        confirmText={confirmation?.confirmText ?? t("confirm")}
+        description={confirmation?.description}
+        destructive
+        disabled={isMutating}
+        onCancel={() => setConfirmation(null)}
+        onConfirm={() => {
+          const pending = confirmation;
+          if (!pending) {
+            return;
+          }
+          setConfirmation(null);
+          finishMutation(pending.operation, pending.successText);
+        }}
+        open={confirmation !== null}
+        title={confirmation?.title ?? t("confirm")}
+      />
+    </section>
+  );
+}
+
+export const PhotoGrid = memo(
+  function PhotoGrid({
+    photos,
+    columnWidth,
+    disablePhotoDrag = false,
+    loading,
+    isLoadingMore = false,
+    selectedIds,
+    deletingIds,
+    gridRef,
+    routeKey,
+    searchQuery,
+    semanticTopSimilarity,
+    sort = "date",
+    sortOrder = "desc",
+    emptyState,
+    error,
+    faceOverlayByPhotoId,
+    faceOverlaysVisible = true,
+    isPlaceholderData = false,
+    isStale = false,
+    onSelect,
+    onSelectSequence,
+    onSelectSequenceMembers,
+    onSequenceMutationComplete,
+    onSequenceOrderChange,
+    onRetrySequences,
+    onDoubleClick,
+    onContextMenu,
+    onEndReached,
+    hasMore = false,
+    onSortChange,
+    onToggleFavorite,
+    onKeyboardSelect,
+    onMarqueeSelect,
+    onRestoreSettled,
+    onScrollTopChange,
+    onBackgroundClick,
+    recentlyViewedTarget = null,
+    recentlyViewedReturnRequest,
+    onReturnLocated,
+    recentlyViewedPhotoId = null,
+    recentlyViewedPulseActive = false,
+    recentlyViewedPulseKey = 0,
+    showToolbar = true,
+    topInset = 0,
+    restoreGateReady = true,
+    sequences = [],
+    sequenceCount,
+    sequenceError,
+    preserveOnSequenceError = false,
+    sequenceLoading = false,
+    sequenceMode = "photos",
+    showGroupHeaders = true,
+    onOpenSequence,
+    onOpenSequenceDetails,
+    onNameFace,
+    onSequenceModeChange,
+    expandedSequence,
+    expandedSequenceComplete,
+    expandingSequenceId,
+    onToggleSequenceExpand,
+  }: PhotoGridProps) {
+    const { t, i18n } = useTranslation();
+    const [internalColumnWidth, setInternalColumnWidth] =
+      useState(loadGridColumnWidth);
+    const targetColWidth = columnWidth ?? internalColumnWidth;
+    const [containerWidth, setContainerWidth] = useState(0);
+    const columnCount = Math.max(
+      MIN_COLUMNS,
+      Math.floor(containerWidth / targetColWidth)
+    );
+    const [isToolbarScrolled, setIsToolbarScrolled] = useState(false);
+    const containerRef = useRef<HTMLDivElement>(null);
+    const toolbarRef = useRef<HTMLDivElement>(null);
+    const [toolbarHeight, setToolbarHeight] = useState(0);
+    const observerRef = useRef<ResizeObserver | null>(null);
+    const handleGridScrollTopChange = useCallback(
+      (scrollTop: number) => {
+        setIsToolbarScrolled((previous) => {
+          const next = scrollTop > 4;
+          return previous === next ? previous : next;
+        });
+        onScrollTopChange?.(scrollTop);
+      },
+      [onScrollTopChange]
+    );
+    // selectedIds/deletingIds 通过 ref 传递，稳定 renderItem 引用。
+    // 移除 deps 中的 Set 依赖 → 选中操作仅触发实际变化卡片的 memo 比较。
+    const selectedIdsRef = useRef(selectedIds);
+    selectedIdsRef.current = selectedIds;
+    const scopedSequences = useMemo(() => {
+      const photosById = new Map(photos.map((photo) => [photo.id, photo]));
+      return sequences.flatMap((sequence) => {
+        const memberIds = scopedSequenceMemberIds(sequence);
+        if (memberIds.length === 0) {
+          return [];
+        }
+        const representative =
+          (sequence.representativePhotoId != null &&
+          memberIds.includes(sequence.representativePhotoId)
+            ? sequence.photo
+            : undefined) ?? photosById.get(memberIds[0]);
+        const scopedRepresentative = representative ?? sequence.matchedPhoto;
+        if (!scopedRepresentative) {
+          return [];
+        }
+        return [
+          {
+            ...sequence,
+            matchedCount: memberIds.length,
+            matchedPhotoIds: memberIds,
+            photo: scopedRepresentative,
+            representativePhotoId: scopedRepresentative.id,
+          },
+        ];
+      });
+    }, [photos, sequences]);
+    const orderedSequences = useMemo(() => {
+      const sorted = [...scopedSequences];
+      sorted.sort((a, b) => {
+        let comparison = 0;
+        if (sort === "name") {
+          comparison = a.photo.filename.localeCompare(b.photo.filename);
+        } else if (sort === "size") {
+          comparison = a.photo.fileSize - b.photo.fileSize;
+        } else {
+          comparison = (a.photo.fileDate ?? 0) - (b.photo.fileDate ?? 0);
+        }
+        return sortOrder === "asc" ? comparison : -comparison;
+      });
+      return sorted;
+    }, [scopedSequences, sort, sortOrder]);
+    const sequenceByRepresentative = useMemo(
+      () =>
+        new Map(
+          (sequenceMode === "sequences" ? orderedSequences : []).map(
+            (sequence) => [sequence.photo.id, sequence]
+          )
+        ),
+      [orderedSequences, sequenceMode]
+    );
+    const sequenceMemberIds = useMemo(
+      () =>
+        new Set(
+          orderedSequences.flatMap((sequence) =>
+            scopedSequenceMemberIds(sequence)
+          )
+        ),
+      [orderedSequences]
+    );
+    const displayPhotos = useMemo<DisplayPhoto[]>(() => {
+      const trayColumns = Math.max(1, Math.min(columnCount, 6));
+      const tray = expandedSequence
+        ? createSequenceTray(expandedSequence, containerWidth, trayColumns)
+        : null;
+      if (sequenceMode === "sequences") {
+        const visible = orderedSequences.map((sequence) => sequence.photo);
+        if (!(expandedSequence && tray)) {
+          return visible;
+        }
+        const representativeId =
+          expandedSequence.representativePhotoId ??
+          expandedSequence.members[0]?.id;
+        const representativeIndex = visible.findIndex(
+          (photo) => photo.id === representativeId
+        );
+        if (representativeIndex < 0) {
+          return visible;
+        }
+        return [
+          ...visible.slice(0, representativeIndex),
+          tray,
+          ...visible.slice(representativeIndex + 1),
+        ];
+      }
+      return photos.filter((photo) => !sequenceMemberIds.has(photo.id));
+    }, [
+      photos,
+      sequenceMode,
+      sequenceMemberIds,
+      orderedSequences,
+      expandedSequence,
+      columnCount,
+      containerWidth,
+    ]);
+    const handleGridMarqueeSelect = useCallback(
+      (ids: Set<number>) => {
+        if (!onMarqueeSelect) {
+          return;
+        }
+        if (sequenceMode !== "sequences") {
+          onMarqueeSelect(ids);
+          return;
+        }
+        const expandedIds = new Set<number>();
+        for (const id of ids) {
+          const sequence = sequenceByRepresentative.get(id);
+          if (sequence) {
+            for (const memberId of scopedSequenceMemberIds(sequence)) {
+              expandedIds.add(memberId);
+            }
+            continue;
+          }
+          if (id < 0 && expandedSequence?.id === -id) {
+            for (const member of expandedSequence.members) {
+              expandedIds.add(member.id);
+            }
+            continue;
+          }
+          expandedIds.add(id);
+        }
+        if (expandedIds.size > 0) {
+          onMarqueeSelect(expandedIds);
+        }
+      },
+      [
+        expandedSequence,
+        onMarqueeSelect,
+        sequenceByRepresentative,
+        sequenceMode,
+      ]
+    );
+    // Re-measure when the conditional loading/empty toolbar is replaced by the
+    // populated grid toolbar; the ref target changes without changing props.
+    // biome-ignore lint/correctness/useExhaustiveDependencies: render-state changes are intentional re-measure triggers
+    useLayoutEffect(() => {
+      if (!showToolbar) {
+        setToolbarHeight(0);
+        return;
+      }
+      const element = toolbarRef.current;
+      if (!element) {
+        return;
+      }
+      const updateHeight = () => setToolbarHeight(element.offsetHeight);
+      updateHeight();
+      if (typeof ResizeObserver === "undefined") {
+        return;
+      }
+      const observer = new ResizeObserver(updateHeight);
+      observer.observe(element);
+      return () => observer.disconnect();
+    }, [
+      displayPhotos.length,
+      loading,
+      sequenceLoading,
+      sequenceError,
+      showToolbar,
+    ]);
+
+    const gridTopInset = Math.max(topInset, showToolbar ? toolbarHeight : 0);
+    const effectiveReturnTarget =
+      recentlyViewedTarget ??
+      (recentlyViewedPhotoId === null
+        ? null
+        : { kind: "photo" as const, photoId: recentlyViewedPhotoId });
+    const returnPresentation = getGalleryReturnPresentation(
+      effectiveReturnTarget,
+      orderedSequences,
+      expandedSequence,
+      expandedSequenceComplete
+    );
+    const keyboardReturnId =
+      returnPresentation.memberId ??
+      (returnPresentation.itemId !== null && returnPresentation.itemId < 0
+        ? (expandedSequence?.members[0]?.id ?? null)
+        : returnPresentation.itemId);
+    const returnRequest = recentlyViewedReturnRequest ?? recentlyViewedPulseKey;
+    const [trayReadyRequest, setTrayReadyRequest] = useState(0);
+    const handleReturnLocated = useCallback(
+      (request: number) => {
+        if (request !== returnRequest || !request) {
+          return;
+        }
+        if (returnPresentation.memberId === null) {
+          if (
+            returnPresentation.itemId !== null &&
+            returnPresentation.itemId < 0
+          ) {
+            containerRef.current
+              ?.querySelector<HTMLElement>(
+                `[data-sequence-tray-id="${-returnPresentation.itemId}"]`
+              )
+              ?.focus({ preventScroll: true });
+          }
+          onReturnLocated?.(request);
+        } else {
+          setTrayReadyRequest(request);
+        }
+      },
+      [
+        returnRequest,
+        returnPresentation.memberId,
+        returnPresentation.itemId,
+        onReturnLocated,
+      ]
+    );
+    const keyboardPhotos = useMemo(
+      () =>
+        displayPhotos.flatMap((photo) =>
+          "sequenceTray" in photo ? photo.sequenceTray.members : [photo]
+        ),
+      [displayPhotos]
+    );
+    const deletingIdsRef = useRef(deletingIds);
+    deletingIdsRef.current = deletingIds;
+    const itemStateVersion = useMemo(
+      () =>
+        createPhotoGridItemStateVersion(
+          deletingIds,
+          faceOverlayByPhotoId,
+          faceOverlaysVisible,
+          selectedIds,
+          recentlyViewedPhotoId,
+          recentlyViewedPulseActive,
+          recentlyViewedPulseKey,
+          recentlyViewedTarget,
+          recentlyViewedReturnRequest,
+          trayReadyRequest
+        ),
+      [
+        deletingIds,
+        faceOverlayByPhotoId,
+        faceOverlaysVisible,
+        selectedIds,
+        recentlyViewedPhotoId,
+        recentlyViewedPulseActive,
+        recentlyViewedPulseKey,
+        recentlyViewedTarget,
+        recentlyViewedReturnRequest,
+        trayReadyRequest,
+      ]
+    );
+    const groupHeaderCacheRef = useRef<{
+      headers: GroupHeader[];
+      language: string;
+      photoSnapshot: PhotoGroupInputSnapshot[];
+      routeKey: string;
+      sort: SortField;
+    } | null>(null);
+
+    const containerCallbackRef = useCallback((node: HTMLDivElement | null) => {
+      if (observerRef.current) {
+        observerRef.current.disconnect();
+        observerRef.current = null;
+      }
+      containerRef.current = node;
+      if (!node) {
+        return;
+      }
+      // Set initial width synchronously so MasonryGrid never renders with
+      // containerWidth=0 (avoids a blank first frame while waiting for the
+      // async ResizeObserver callback).
+      const w = node.clientWidth;
+      setContainerWidth(w);
+      // ResizeObserver for subsequent size changes.
+      const observer = new ResizeObserver(([entry]) => {
+        setContainerWidth(entry.contentRect.width);
+      });
+      observer.observe(node);
+      observerRef.current = observer;
+    }, []);
+
+    // Track the single selected photo id for scroll-to behavior
+    const scrollToId = useMemo(() => {
+      if (expandedSequence) {
+        return -expandedSequence.id;
+      }
+      if (selectedIds.size === 1) {
+        return [...selectedIds][0];
+      }
+      return null;
+    }, [expandedSequence, selectedIds]);
+
+    // Keyboard navigation (arrow keys)
+    useEffect(() => {
+      if (!onKeyboardSelect || keyboardPhotos.length === 0) {
+        return;
+      }
+      function handleKeyDown(e: KeyboardEvent) {
+        if (
+          e.target instanceof HTMLInputElement ||
+          e.target instanceof HTMLTextAreaElement
+        ) {
+          return;
+        }
+        const arrows = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
+        if (!arrows.includes(e.key)) {
+          return;
+        }
+
+        e.preventDefault();
+        const currentId =
+          selectedIds.size === 1 ? [...selectedIds][0] : keyboardReturnId;
+        let currentIdx = currentId
+          ? keyboardPhotos.findIndex((p) => p.id === currentId)
+          : -1;
+        if (currentIdx < 0) {
+          currentIdx = 0;
+        }
+
+        let nextIdx = currentIdx;
+        if (e.key === "ArrowRight") {
+          nextIdx = Math.min(keyboardPhotos.length - 1, currentIdx + 1);
+        } else if (e.key === "ArrowLeft") {
+          nextIdx = Math.max(0, currentIdx - 1);
+        } else if (e.key === "ArrowDown") {
+          nextIdx = Math.min(
+            keyboardPhotos.length - 1,
+            currentIdx + columnCount
+          );
+        } else if (e.key === "ArrowUp") {
+          nextIdx = Math.max(0, currentIdx - columnCount);
+        }
+
+        if (nextIdx !== currentIdx || currentId === null) {
+          onKeyboardSelect?.(keyboardPhotos[nextIdx].id);
+        }
+      }
+      window.addEventListener("keydown", handleKeyDown);
+      return () => window.removeEventListener("keydown", handleKeyDown);
+    }, [
+      keyboardPhotos,
+      selectedIds,
+      columnCount,
+      onKeyboardSelect,
+      keyboardReturnId,
+    ]);
+
+    const skeletonAspects = useCallback(
+      () => [3 / 4, 4 / 3, 1 / 1, 3 / 2, 2 / 3],
+      []
+    );
+
+    const getDragIds = useCallback((id: number) => {
+      const current = selectedIdsRef.current;
+      return current.has(id) ? [...current] : [id];
+    }, []);
+
+    const renderItem = useCallback(
+      (
+        photo: DisplayPhoto,
+        index: number,
+        _style: React.CSSProperties,
+        options: { renderImage: boolean }
+      ) => {
+        if ("sequenceTray" in photo) {
+          return (
+            <SequenceFocusTray
+              columns={photo.trayColumns}
+              completeMembers={expandedSequenceComplete?.members}
+              containerWidth={containerWidth}
+              disablePhotoDrag={disablePhotoDrag}
+              faceOverlayByPhotoId={faceOverlayByPhotoId}
+              faceOverlaysVisible={faceOverlaysVisible}
+              getDragIds={getDragIds}
+              onDoubleClick={onDoubleClick}
+              onNameFace={onNameFace}
+              onReturnLocated={onReturnLocated}
+              onSelect={onSelect}
+              onSelectSequenceMembers={onSelectSequenceMembers}
+              onSequenceMutationComplete={onSequenceMutationComplete}
+              onSequenceOrderChange={onSequenceOrderChange}
+              onToggleFavorite={onToggleFavorite}
+              onToggleSequenceExpand={onToggleSequenceExpand}
+              recentlyViewedMemberId={returnPresentation.memberId}
+              recentlyViewedPulseActive={recentlyViewedPulseActive}
+              recentlyViewedPulseKey={recentlyViewedPulseKey}
+              recentlyViewedSequence={
+                returnPresentation.itemId === photo.id &&
+                returnPresentation.memberId === null
+              }
+              renderImage={options.renderImage}
+              returnRequest={
+                trayReadyRequest === returnRequest ? returnRequest : 0
+              }
+              searchQuery={searchQuery}
+              selectedIds={selectedIdsRef.current}
+              sequence={photo.sequenceTray}
+              topInset={gridTopInset}
+            />
+          );
+        }
+        const sequence = sequenceByRepresentative.get(photo.id);
+        if (!options.renderImage) {
+          return (
+            <div
+              aria-hidden="true"
+              className="h-full w-full overflow-hidden rounded-[8px] bg-muted"
+              data-photo-id={photo.id}
+              data-photo-path={photo.path}
+            />
+          );
+        }
+        if (
+          sequence &&
+          sequence.id !== expandedSequence?.id &&
+          onOpenSequence &&
+          onOpenSequenceDetails
+        ) {
+          const memberIds = scopedSequenceMemberIds(sequence);
+          return (
+            <SequenceCard
+              expanded={false}
+              expanding={expandingSequenceId === sequence.id}
+              faceOverlays={faceOverlayByPhotoId?.get(photo.id)}
+              faceOverlaysVisible={faceOverlaysVisible}
+              isSelected={
+                memberIds.length > 0 &&
+                memberIds.every((id) => selectedIdsRef.current.has(id))
+              }
+              loading={
+                index < columnCount * INITIAL_EAGER_ROWS ? "eager" : "lazy"
+              }
+              onClick={(_id, event) => {
+                if (onSelectSequence) {
+                  onSelectSequence(memberIds, event);
+                } else {
+                  onSelect(photo.id, event);
+                }
+              }}
+              onOpen={onOpenSequence}
+              onOpenDetails={onOpenSequenceDetails}
+              onToggleExpand={onToggleSequenceExpand}
+              recentlyViewed={returnPresentation.itemId === photo.id}
+              recentlyViewedFrame={
+                returnPresentation.itemId === photo.id
+                  ? returnPresentation.frame
+                  : undefined
+              }
+              recentlyViewedPulseActive={
+                returnPresentation.itemId === photo.id &&
+                recentlyViewedPulseActive
+              }
+              sequence={sequence}
+            />
+          );
+        }
+        const photoCard = (
+          <PhotoCard
+            deleting={deletingIdsRef.current?.has(photo.id)}
+            disableDrag={disablePhotoDrag}
+            dominantColors={photo.dominantColors}
+            faceOverlays={faceOverlayByPhotoId?.get(photo.id)}
+            faceOverlaysVisible={faceOverlaysVisible}
+            filename={photo.filename}
+            getDragIds={getDragIds}
+            height={photo.height}
+            id={photo.id}
+            isFavorite={photo.isFavorite}
+            isSelected={selectedIdsRef.current.has(photo.id)}
+            loading={
+              index < columnCount * INITIAL_EAGER_ROWS ? "eager" : "lazy"
+            }
+            match={photo.match}
+            onClick={onSelect}
+            onDoubleClick={onDoubleClick}
+            onNameFace={onNameFace}
+            onToggleFavorite={onToggleFavorite}
+            path={photo.path}
+            recentlyViewed={recentlyViewedPhotoId === photo.id}
+            recentlyViewedPulseActive={
+              recentlyViewedPulseActive && recentlyViewedPhotoId === photo.id
+            }
+            recentlyViewedPulseKey={recentlyViewedPulseKey}
+            searchQuery={searchQuery}
+            semanticTopSimilarity={semanticTopSimilarity}
+            thumbnailPath={photo.thumbnailPath}
+            thumbnailSmallPath={photo.thumbnailSmallPath}
+            width={photo.width}
+          />
+        );
+        const representativeId =
+          expandedSequence?.representativePhotoId ??
+          expandedSequence?.members[0]?.id;
+        if (
+          expandedSequence &&
+          photo.id === representativeId &&
+          onToggleSequenceExpand
+        ) {
+          return (
+            <div className="relative h-full w-full">
+              {photoCard}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    aria-label={t("sequenceCollapse")}
+                    className="absolute top-2 right-2 z-10 flex h-8 w-8 items-center justify-center rounded-md bg-black/65 text-white shadow backdrop-blur transition-colors hover:bg-black/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onToggleSequenceExpand(expandedSequence.id);
+                    }}
+                    type="button"
+                  >
+                    <ChevronUp size={17} />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>{t("sequenceCollapse")}</TooltipContent>
+              </Tooltip>
+            </div>
+          );
+        }
+        return photoCard;
+      },
+      [
+        onSelect,
+        onSelectSequence,
+        onSelectSequenceMembers,
+        onSequenceMutationComplete,
+        onSequenceOrderChange,
+        onDoubleClick,
+        onToggleFavorite,
+        searchQuery,
+        getDragIds,
+        columnCount,
+        containerWidth,
+        sequenceByRepresentative,
+        onOpenSequence,
+        onOpenSequenceDetails,
+        onNameFace,
+        expandedSequence,
+        expandedSequenceComplete,
+        expandingSequenceId,
+        onToggleSequenceExpand,
+        disablePhotoDrag,
+        recentlyViewedPhotoId,
+        recentlyViewedPulseActive,
+        recentlyViewedPulseKey,
+        returnPresentation.itemId,
+        returnPresentation.memberId,
+        returnPresentation.frame,
+        trayReadyRequest,
+        returnRequest,
+        onReturnLocated,
+        gridTopInset,
+        faceOverlayByPhotoId,
+        faceOverlaysVisible,
+        t,
+        semanticTopSimilarity,
+      ]
+    );
+
+    const groupHeaders = useMemo((): GroupHeader[] => {
+      if (sort !== "date" || displayPhotos.length === 0) {
+        groupHeaderCacheRef.current = null;
+        return [];
+      }
+
+      const cached = groupHeaderCacheRef.current;
+      const cacheContextMatches =
+        cached?.sort === sort &&
+        cached.language === i18n.language &&
+        cached.routeKey === routeKey;
+      if (
+        cacheContextMatches &&
+        cached.photoSnapshot.length === displayPhotos.length &&
+        hasMatchingPhotoGroupPrefix(cached.photoSnapshot, displayPhotos)
+      ) {
+        return cached.headers;
+      }
+
+      let startIndex = 0;
+      let existingHeaders: GroupHeader[] = [];
+      if (
+        cacheContextMatches &&
+        cached.photoSnapshot.length < displayPhotos.length &&
+        hasMatchingPhotoGroupPrefix(cached.photoSnapshot, displayPhotos)
+      ) {
+        existingHeaders = cached.headers;
+        startIndex = cached.photoSnapshot.length;
+      }
+      const headers = buildPhotoGroupHeaders(
+        displayPhotos,
+        i18n.language,
+        startIndex,
+        existingHeaders
+      );
+      groupHeaderCacheRef.current = {
+        headers,
+        language: i18n.language,
+        photoSnapshot: snapshotPhotoGroupInputs(displayPhotos),
+        routeKey,
+        sort,
+      };
+      return headers;
+    }, [displayPhotos, sort, i18n.language, routeKey]);
+
+    const sequenceModeToggle = onSequenceModeChange ? (
+      <div className="flex shrink-0 whitespace-nowrap rounded-md border border-border p-0.5 text-[11px]">
+        <button
+          className={`rounded px-2 py-1 ${sequenceMode === "photos" ? "bg-muted text-foreground" : "text-muted-foreground"}`}
+          onClick={() => onSequenceModeChange("photos")}
+          type="button"
+        >
+          {t("sequenceViewPhotos")}
+        </button>
+        <button
+          className={`rounded px-2 py-1 ${sequenceMode === "sequences" ? "bg-muted text-foreground" : "text-muted-foreground"}`}
+          onClick={() => onSequenceModeChange("sequences")}
+          type="button"
+        >
+          {t("sequenceViewSequences")}
+          <span className="inline-block min-w-[2ch] text-left tabular-nums">
+            {sequenceCount !== undefined && sequenceCount > 0
+              ? sequenceCount
+              : "\u00a0"}
+          </span>
+        </button>
+      </div>
+    ) : null;
+
+    const toolbarActions = (
+      <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2">
+        {sequenceModeToggle}
+        {onSortChange && (
+          <SortDropdown onChange={onSortChange} order={sortOrder} sort={sort} />
+        )}
+        <label className="flex shrink-0 items-center gap-1.5 text-[10px] text-muted-foreground/70">
+          <span>{t("gridSize")}</span>
+          <input
+            aria-label={t("gridSize")}
+            className="h-4 w-20 cursor-pointer accent-primary"
+            max={GRID_COLUMN_WIDTH_MAX}
+            min={GRID_COLUMN_WIDTH_MIN}
+            onChange={(event) => {
+              const width = Number(event.target.value);
+              setInternalColumnWidth(width);
+              try {
+                localStorage.setItem(GRID_COLUMN_WIDTH_KEY, String(width));
+              } catch {
+                // Keep the in-memory preference.
+              }
+            }}
+            step={10}
+            type="range"
+            value={targetColWidth}
+          />
+        </label>
+      </div>
+    );
+
+    // `displayPhotos` can be temporarily empty while changing presentation
+    // modes (for example, before the sequence query resolves). The full-grid
+    // skeleton is only for the initial photo query, not for a derived view.
+    if (sequenceLoading || (loading && photos.length === 0)) {
+      const skelCols = Array.from({ length: columnCount }, (_, ci) =>
+        Array.from({ length: 3 }, (_, ri) => ci * 3 + ri)
+      );
+      return (
+        <div
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
+          style={{ paddingTop: showToolbar ? undefined : topInset }}
+        >
+          {showToolbar && (
+            <div className="flex items-center justify-between border-border border-b px-4 py-2">
+              <Skeleton className="h-4 w-24 bg-card" />
+              <div className="flex items-center gap-2">
+                {sequenceModeToggle}
+                <Skeleton className="h-2.5 w-8 rounded-[2px] bg-card" />
+                <Skeleton className="h-4 w-20 rounded-[4px] bg-card" />
+              </div>
+            </div>
+          )}
+          <div className="flex-1 overflow-y-auto px-2 pt-2">
+            <div className="flex gap-2">
+              {skelCols.map((items, ci) => (
+                <div className="flex flex-1 flex-col gap-2" key={ci}>
+                  {items.map((i) => (
+                    <Skeleton
+                      className="w-full rounded-[8px] bg-muted"
+                      key={i}
+                      style={{
+                        aspectRatio:
+                          skeletonAspects()[i % skeletonAspects().length],
+                      }}
+                    />
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (
+      (sequenceError &&
+        (!preserveOnSequenceError || displayPhotos.length === 0)) ||
+      (!loading && displayPhotos.length === 0)
+    ) {
+      const displayError = sequenceError ?? error;
+      const isError = Boolean(displayError);
+      return (
+        <div
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
+          style={{ paddingTop: showToolbar ? undefined : topInset }}
+        >
+          {showToolbar && (
+            <div className="flex items-center justify-between border-border border-b px-4 py-2">
+              <span className="truncate text-[12px] text-muted-foreground">
+                {t("photosCount", {
+                  count: sequenceError ? 0 : displayPhotos.length,
+                })}
+              </span>
+              {toolbarActions}
+            </div>
+          )}
+          <div className="flex flex-1 items-center justify-center">
+            {isError ? (
+              <div className="flex flex-col items-center gap-3 px-6 text-center">
+                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-danger/10">
+                  <svg
+                    aria-hidden="true"
+                    className="h-5 w-5 text-danger"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      d="M12 9v3.75m9-.75a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 3.75h.008v.008H12v-.008Z"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </div>
+                <p className="text-[13px] text-muted-foreground/70">
+                  {displayError}
+                </p>
+                {sequenceError && onRetrySequences && (
+                  <button
+                    className="rounded-md border border-border px-3 py-1.5 text-[12px] text-foreground hover:bg-foreground/5"
+                    onClick={onRetrySequences}
+                    type="button"
+                  >
+                    {t("retry")}
+                  </button>
+                )}
+              </div>
+            ) : (
+              (emptyState ??
+              (sequenceMode === "photos" && orderedSequences.length > 0 ? (
+                <div className="flex flex-col items-center gap-3 px-6 text-center">
+                  <Layers
+                    aria-hidden="true"
+                    className="h-5 w-5 text-muted-foreground"
+                  />
+                  <p className="text-[13px] text-muted-foreground/70">
+                    {t("sequenceEmptyPhotosTitle")}
+                  </p>
+                  <p className="max-w-sm text-[12px] text-muted-foreground/60">
+                    {t("sequenceEmptyPhotosDescription")}
+                  </p>
+                  {onSequenceModeChange && (
+                    <button
+                      className="rounded-md border border-border px-3 py-1.5 text-[12px] text-foreground hover:bg-foreground/5"
+                      onClick={() => onSequenceModeChange("sequences")}
+                      type="button"
+                    >
+                      {t("sequenceEmptyViewSequences")}
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <span className="text-[13px] text-muted-foreground/70">
+                  {t("noPhotos")}
+                </span>
+              )))
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className="relative flex flex-1 flex-col"
+        onClick={(e) => {
+          if (onBackgroundClick) {
+            const target = e.target as HTMLElement;
+            // 只有点击非照片卡片区域才触发背景点击
+            if (!target.closest("[data-photo-id]")) {
+              onBackgroundClick();
+            }
+          }
+        }}
+      >
+        {/* Floating glass toolbar — 悬浮毛玻璃工具条 */}
+        {/* Masonry grid */}
+        {showToolbar && (
+          <div
+            className={`page-toolbar absolute top-0 right-0 left-0 z-50 flex items-center justify-between border-b px-4 py-2 ${
+              isToolbarScrolled ? "is-scrolled" : ""
+            }`}
+            onClick={(event) => event.stopPropagation()}
+            ref={toolbarRef}
+          >
+            <span className="truncate text-[12px] text-muted-foreground">
+              {t("photosCount", {
+                count: displayPhotos.length.toLocaleString(),
+              })}
+              {selectedIds.size > 0 &&
+                t("photosSelected", { count: selectedIds.size })}
+            </span>
+            {toolbarActions}
+          </div>
+        )}
+        <div
+          className="min-h-0 flex-1"
+          onContextMenu={onContextMenu}
+          ref={containerCallbackRef}
+          style={{
+            opacity: isStale ? 0.6 : 1,
+            transition: "opacity 0.15s ease",
+          }}
+        >
+          <MasonryGrid
+            className={`scrollbar-thin px-2 ${gridTopInset > 0 ? "" : "pt-2"} ${selectedIds.size > 0 ? "pb-[var(--selection-action-avoid-bottom)]" : "pb-2"}`}
+            columnCount={columnCount}
+            containerWidth={Math.max(0, containerWidth - 16)}
+            gap={GAP}
+            groupHeaders={groupHeaders}
+            hasMore={hasMore}
+            isLoadingMore={isLoadingMore}
+            isPlaceholderData={isPlaceholderData}
+            itemStateVersion={itemStateVersion}
+            items={displayPhotos}
+            onEndReached={onEndReached}
+            onMarqueeSelect={handleGridMarqueeSelect}
+            onRestoreSettled={onRestoreSettled}
+            onReturnLocated={handleReturnLocated}
+            onScrollTopChange={handleGridScrollTopChange}
+            ref={gridRef}
+            renderItem={renderItem}
+            restoreGateReady={restoreGateReady}
+            returnToMemberId={returnPresentation.memberId}
+            returnToPhotoId={returnPresentation.itemId}
+            returnToPhotoRequest={returnRequest}
+            routeKey={routeKey}
+            scrollToAlignment={expandedSequence ? "start" : "center"}
+            scrollToId={scrollToId}
+            selectionActive={selectedIds.size > 0}
+            showGroupHeaders={showGroupHeaders}
+            topInset={gridTopInset}
+          />
+        </div>
+
+        {/* Loading overlay */}
+        {sequenceError && displayPhotos.length > 0 && (
+          <div
+            className="absolute right-2 bottom-2 left-2 z-30 flex flex-wrap items-center justify-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-[12px]"
+            role="status"
+          >
+            <span>{sequenceError}</span>
+            {onRetrySequences && (
+              <button
+                className="rounded border border-border px-2 py-1 hover:bg-muted"
+                onClick={onRetrySequences}
+                type="button"
+              >
+                {t("retry")}
+              </button>
+            )}
+          </div>
+        )}
+        {loading && displayPhotos.length > 0 && (
+          <div className="pointer-events-none absolute top-0 right-0 bottom-0 left-0 flex items-start justify-center bg-background/30 pt-4">
+            <LoadingSpinner size="lg" />
+          </div>
+        )}
+      </div>
+    );
+  },
+  (prevProps, nextProps) => {
+    if (prevProps.columnWidth !== nextProps.columnWidth) {
+      return false;
+    }
+    if (prevProps.disablePhotoDrag !== nextProps.disablePhotoDrag) {
+      return false;
+    }
+    if (prevProps.photos !== nextProps.photos) {
+      return false;
+    }
+    if (prevProps.sequences !== nextProps.sequences) {
+      return false;
+    }
+    if (prevProps.sequenceCount !== nextProps.sequenceCount) {
+      return false;
+    }
+    if (prevProps.sequenceLoading !== nextProps.sequenceLoading) {
+      return false;
+    }
+    if (prevProps.sequenceError !== nextProps.sequenceError) {
+      return false;
+    }
+    if (
+      prevProps.preserveOnSequenceError !== nextProps.preserveOnSequenceError
+    ) {
+      return false;
+    }
+    if (prevProps.onRetrySequences !== nextProps.onRetrySequences) {
+      return false;
+    }
+    if (prevProps.sequenceMode !== nextProps.sequenceMode) {
+      return false;
+    }
+    if (prevProps.faceOverlayByPhotoId !== nextProps.faceOverlayByPhotoId) {
+      return false;
+    }
+    if (prevProps.faceOverlaysVisible !== nextProps.faceOverlaysVisible) {
+      return false;
+    }
+    if (prevProps.onOpenSequence !== nextProps.onOpenSequence) {
+      return false;
+    }
+    if (prevProps.onOpenSequenceDetails !== nextProps.onOpenSequenceDetails) {
+      return false;
+    }
+    if (prevProps.onNameFace !== nextProps.onNameFace) {
+      return false;
+    }
+    if (prevProps.expandedSequence !== nextProps.expandedSequence) {
+      return false;
+    }
+    if (
+      prevProps.expandedSequenceComplete !== nextProps.expandedSequenceComplete
+    ) {
+      return false;
+    }
+    if (prevProps.expandingSequenceId !== nextProps.expandingSequenceId) {
+      return false;
+    }
+    if (prevProps.onToggleSequenceExpand !== nextProps.onToggleSequenceExpand) {
+      return false;
+    }
+    if (
+      prevProps.onSequenceMutationComplete !==
+      nextProps.onSequenceMutationComplete
+    ) {
+      return false;
+    }
+    if (prevProps.onSequenceOrderChange !== nextProps.onSequenceOrderChange) {
+      return false;
+    }
+    if (prevProps.loading !== nextProps.loading) {
+      return false;
+    }
+    if (prevProps.isLoadingMore !== nextProps.isLoadingMore) {
+      return false;
+    }
+    if (prevProps.selectedIds !== nextProps.selectedIds) {
+      return false;
+    }
+    if (
+      prevProps.recentlyViewedTarget !== nextProps.recentlyViewedTarget ||
+      prevProps.recentlyViewedReturnRequest !==
+        nextProps.recentlyViewedReturnRequest ||
+      prevProps.onReturnLocated !== nextProps.onReturnLocated
+    ) {
+      return false;
+    }
+    if (prevProps.recentlyViewedPhotoId !== nextProps.recentlyViewedPhotoId) {
+      return false;
+    }
+    if (
+      prevProps.recentlyViewedPulseActive !==
+      nextProps.recentlyViewedPulseActive
+    ) {
+      return false;
+    }
+    if (prevProps.recentlyViewedPulseKey !== nextProps.recentlyViewedPulseKey) {
+      return false;
+    }
+    if (prevProps.deletingIds !== nextProps.deletingIds) {
+      return false;
+    }
+    if (prevProps.routeKey !== nextProps.routeKey) {
+      return false;
+    }
+    if (prevProps.restoreGateReady !== nextProps.restoreGateReady) {
+      return false;
+    }
+    if (prevProps.onRestoreSettled !== nextProps.onRestoreSettled) {
+      return false;
+    }
+    if (prevProps.searchQuery !== nextProps.searchQuery) {
+      return false;
+    }
+    if (prevProps.sort !== nextProps.sort) {
+      return false;
+    }
+    if (prevProps.sortOrder !== nextProps.sortOrder) {
+      return false;
+    }
+    if (prevProps.isPlaceholderData !== nextProps.isPlaceholderData) {
+      return false;
+    }
+    if (prevProps.isStale !== nextProps.isStale) {
+      return false;
+    }
+    if (prevProps.error !== nextProps.error) {
+      return false;
+    }
+    if (prevProps.hasMore !== nextProps.hasMore) {
+      return false;
+    }
+    if (prevProps.showToolbar !== nextProps.showToolbar) {
+      return false;
+    }
+    if (prevProps.showGroupHeaders !== nextProps.showGroupHeaders) {
+      return false;
+    }
+    if (prevProps.onScrollTopChange !== nextProps.onScrollTopChange) {
+      return false;
+    }
+    if (prevProps.topInset !== nextProps.topInset) {
+      return false;
+    }
+    return true;
+  }
+);

@@ -1,0 +1,97 @@
+import { RouterProvider } from "@tanstack/react-router";
+import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Toaster, toast } from "sonner";
+import {
+  applyAccentColor,
+  cacheAccentColor,
+  setAccentColorPreference,
+} from "./actions/accent-color";
+import { listenSystemThemeChanges, syncWithLocalTheme } from "./actions/theme";
+import { installDownloadedUpdate } from "./actions/update";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { UiPreferencesProvider } from "./contexts/ui-preferences-context";
+import { ipc } from "./ipc/manager";
+import { PluginBackdropHost, PluginHostProvider } from "./plugins/runtime";
+import { QueryProvider } from "./providers/QueryProvider";
+import { router } from "./utils/routes";
+
+export default function App() {
+  const { t } = useTranslation();
+  const [updateReminder, setUpdateReminder] = useState(true);
+
+  useEffect(() => {
+    syncWithLocalTheme();
+  }, []);
+
+  useEffect(() => {
+    ipc.client.settings
+      .getAppPreferences({})
+      .then((preferences) => {
+        const accentColor = applyAccentColor(preferences.accentColor);
+        cacheAccentColor(accentColor);
+        if (accentColor !== preferences.accentColor) {
+          setAccentColorPreference(accentColor).catch(() => undefined);
+        }
+        setUpdateReminder(preferences.updateReminder);
+      })
+      .catch(() => undefined);
+    function handleReminder(event: Event) {
+      setUpdateReminder((event as CustomEvent<boolean>).detail === true);
+    }
+    window.addEventListener("update-reminder-changed", handleReminder);
+    return () =>
+      window.removeEventListener("update-reminder-changed", handleReminder);
+  }, []);
+
+  // Listen for OS-level theme changes when using "system" mode
+  useEffect(() => {
+    return listenSystemThemeChanges();
+  }, []);
+
+  // Listen for update availability
+  const handleUpdate = useCallback(
+    (event: MessageEvent) => {
+      if (updateReminder && event.data?.channel === "update:available") {
+        toast(t("updateDownloaded", { version: event.data.version }), {
+          duration: 30_000,
+          action: {
+            label: t("updateRestart"),
+            onClick: async () => {
+              await installDownloadedUpdate();
+            },
+          },
+        });
+      }
+    },
+    [t, updateReminder]
+  );
+
+  useEffect(() => {
+    window.addEventListener("message", handleUpdate);
+    return () => window.removeEventListener("message", handleUpdate);
+  }, [handleUpdate]);
+
+  return (
+    <ErrorBoundary>
+      <UiPreferencesProvider>
+        <PluginHostProvider>
+          <PluginBackdropHost />
+          <QueryProvider>
+            <RouterProvider router={router} />
+            <Toaster
+              position="bottom-right"
+              toastOptions={{
+                style: {
+                  background: "var(--popover)",
+                  color: "var(--foreground)",
+                  border: "1px solid var(--border)",
+                },
+              }}
+            />
+          </QueryProvider>
+        </PluginHostProvider>
+      </UiPreferencesProvider>
+    </ErrorBoundary>
+  );
+}

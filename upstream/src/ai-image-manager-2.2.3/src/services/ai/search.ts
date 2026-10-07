@@ -1,0 +1,1329 @@
+import { fork } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { app } from "electron";
+import { captureWorkerOutput } from "@/services/diagnostics/worker-output";
+import {
+  type EmbeddingExecutionProvider,
+  EmbeddingProviderError,
+  resolveEmbeddingExecutionProvider,
+} from "@/services/embed-worker-pool";
+import { getSetting } from "@/services/settings-manager";
+import { trackChildProcess } from "@/services/tracked-child-processes";
+import { WORKER_TIMEOUT } from "./constants";
+import {
+  getActiveEmbeddingModel,
+  getActiveEmbeddingWorkerAdapter,
+  getSemanticPolicyVersion,
+} from "./model-config";
+import {
+  getActiveEmbeddingFingerprint,
+  isVectorCompatibilitySearchable,
+  resolveRuntimeVectorCompatibility,
+  type VectorCompatibility,
+} from "./model-fingerprint";
+import { ensureLocalModel, loadModel } from "./model-loader";
+import { getActiveTagger, PRIVATE_BUILD } from "@/config/private-build";
+import {
+  applyNegativeSemanticPenalty,
+  filterCosineSearchResults,
+  fuseRankedSearchEvidence,
+  isValidEmbeddingVector,
+  selectRelevantSemanticResults,
+} from "./scoring";
+import {
+  getActiveSearchSensitivity,
+  getSensitivityMultiplier,
+  type SearchSensitivity,
+} from "./search-sensitivity";
+import {
+  getSemanticQueryPlan,
+  getSemanticQueryPlanFingerprint,
+  prepareSemanticQueryPlan,
+  SEMANTIC_QUERY_PLAN_VERSION,
+  type SemanticQueryPlan,
+  semanticQueryPlanCacheKey,
+} from "./semantic-query-plan";
+import {
+  _localModelPath,
+  embeddingModel,
+  getActiveEmbeddingRuntime,
+  photoTable,
+  setLocalModelPath,
+} from "./state";
+import {
+  getActiveThresholdProfile,
+  getThresholdProfileIdentity,
+} from "./threshold-profile";
+import {
+  getTranslationModelVersion,
+  warmupTranslationWorker,
+} from "./translation-worker-client";
+import { initVectorDB, withVectorDbOperation } from "./vector-db";
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+interface ArrayLikeVector {
+  toArray: () => ArrayLike<number>;
+}
+
+function isArrayLikeVector(value: unknown): value is ArrayLikeVector {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "toArray" in value &&
+    typeof value.toArray === "function"
+  );
+}
+
+function findWorkerScript(): string {
+  if (app.isPackaged) {
+    const unpacked = path.join(
+      process.resourcesPath,
+      "app.asar.unpacked",
+      "scripts",
+      "embed-worker.mjs"
+    );
+    if (fs.existsSync(unpacked)) {
+      return unpacked;
+    }
+    const bundled = path.join(
+      process.resourcesPath,
+      "scripts",
+      "embed-worker.mjs"
+    );
+    if (fs.existsSync(bundled)) {
+      return bundled;
+    }
+  }
+  const cwd = process.cwd();
+  const candidate = path.join(cwd, "scripts", "embed-worker.mjs");
+  if (fs.existsSync(candidate)) {
+    return candidate;
+  }
+  const alt = path.join(app.getAppPath(), "scripts", "embed-worker.mjs");
+  if (fs.existsSync(alt)) {
+    return alt;
+  }
+  throw new Error("embed-worker.mjs not found");
+}
+
+function embedImageInWorkerWithProvider(
+  imagePath: string,
+  modelPath: string,
+  provider: EmbeddingExecutionProvider
+): Promise<number[]> {
+  return new Promise((resolve, reject) => {
+    const adapter = getActiveEmbeddingWorkerAdapter(modelPath);
+    const workerScript = findWorkerScript();
+    console.log(`[AI] Starting one-shot image worker provider=${provider}`);
+    const child = trackChildProcess(
+      fork(workerScript, [], {
+        stdio: ["ignore", "pipe", "pipe", "ipc"],
+        timeout: WORKER_TIMEOUT,
+      })
+    );
+    captureWorkerOutput(child, "search-worker");
+
+    let stderr = "";
+    let resolved = false;
+
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        child.kill();
+        reject(new Error("Image embed worker timed out"));
+      }
+    }, WORKER_TIMEOUT);
+
+    child.stderr?.on("data", (data: Buffer) => {
+      stderr += data.toString();
+    });
+
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Worker result handling synchronizes protocol validation, timeout settlement, and vector resolution.
+    child.on("message", (rawMessage: unknown) => {
+      if (typeof rawMessage !== "object" || rawMessage === null) {
+        return;
+      }
+      const msg = rawMessage as {
+        adapterId?: string;
+        error?: string;
+        fingerprint?: string;
+        results?: Array<{ error?: string; vector?: number[] }>;
+        provider?: EmbeddingExecutionProvider;
+        type?: string;
+      };
+      if (msg.type === "ready") {
+        if (msg.provider && msg.provider !== provider) {
+          resolved = true;
+          clearTimeout(timeout);
+          child.kill();
+          reject(
+            new EmbeddingProviderError(
+              `Image worker selected ${msg.provider} instead of ${provider}`
+            )
+          );
+          return;
+        }
+        child.send({
+          type: "embed",
+          photos: [{ id: 1, path: imagePath }],
+        });
+      } else if (msg.type === "init-error" && !resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        child.kill();
+        reject(new Error(msg.error || "Image embed worker init failed"));
+      } else if (msg.type === "provider-error" && !resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        child.kill();
+        reject(
+          new EmbeddingProviderError(
+            msg.error || "DirectML image embedding failed"
+          )
+        );
+      } else if (msg.type === "result" && !resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        child.kill();
+        if (
+          msg.adapterId !== undefined &&
+          (msg.adapterId !== adapter.adapterId ||
+            msg.fingerprint !== adapter.fingerprint)
+        ) {
+          reject(new Error("Stale image embedding worker result discarded"));
+          return;
+        }
+        const result = msg.results?.[0];
+        if (result?.vector && result.vector.length > 0) {
+          resolve(result.vector);
+        } else {
+          reject(
+            new Error(
+              `Image embedding failed: ${result?.error || "empty vector"}`
+            )
+          );
+        }
+      }
+    });
+
+    child.on("close", (code) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        reject(
+          new Error(
+            `Image embed worker exited with code ${code}: ${stderr.slice(-300)}`
+          )
+        );
+      }
+    });
+
+    child.on("error", (err) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        reject(err);
+      }
+    });
+
+    child.send({
+      type: "init",
+      adapter,
+      execution: { provider, intraOpNumThreads: 1 },
+    });
+  });
+}
+
+export async function embedImageInWorker(
+  imagePath: string,
+  modelPath: string
+): Promise<number[]> {
+  const useGPU = getSetting("gpu.enabled") === "true";
+  const provider = await resolveEmbeddingExecutionProvider(modelPath, useGPU);
+  try {
+    return await embedImageInWorkerWithProvider(imagePath, modelPath, provider);
+  } catch (error) {
+    if (provider !== "directml") {
+      throw error;
+    }
+    console.warn(
+      `[AI] One-shot DirectML image worker failed; retrying on CPU: ${getErrorMessage(error)}`
+    );
+    return embedImageInWorkerWithProvider(imagePath, modelPath, "cpu");
+  }
+}
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Brute-force fallback keeps pagination, vector normalization, scoring, and safety limits in one path.
+async function fallbackSearch(
+  queryVector: number[],
+  limit: number,
+  maxDistance = 0.75,
+  knownRowCount?: number
+): Promise<Array<{ photoId: number; similarity: number }>> {
+  if (!photoTable) {
+    return [];
+  }
+  const model = getActiveEmbeddingModel();
+  if (!isValidEmbeddingVector(queryVector, model)) {
+    console.error(
+      `[AI] fallbackSearch rejected invalid ${model.displayName} query vector: expected=${model.vectorDimensions} actual=${queryVector.length}`
+    );
+    return [];
+  }
+
+  const rowCount = knownRowCount ?? (await photoTable.countRows());
+
+  console.log(
+    `[AI] Library (${rowCount} rows), attempting paginated brute-force`
+  );
+  const PAGE_SIZE = 500;
+  const MAX_PAGES = Math.ceil(rowCount / PAGE_SIZE);
+  const MAX_SAFE_PAGES = 100; // 最多 50000 条，防止极端情况
+  const allScored: Array<{ photoId: number; distance: number }> = [];
+
+  for (let page = 0; page < Math.min(MAX_PAGES, MAX_SAFE_PAGES); page++) {
+    const rows = await photoTable
+      .query()
+      .limit(PAGE_SIZE)
+      .offset(page * PAGE_SIZE)
+      .toArray();
+
+    if (rows.length === 0) {
+      break;
+    }
+
+    for (const row of rows as Record<string, unknown>[]) {
+      const rawVec = row.vector;
+      if (!rawVec) {
+        continue;
+      }
+      let vec: Float32Array | null = null;
+      if (rawVec instanceof Float32Array) {
+        vec = rawVec;
+      } else if (Array.isArray(rawVec)) {
+        vec = new Float32Array(rawVec as number[]);
+      } else if (isArrayLikeVector(rawVec)) {
+        vec = new Float32Array(rawVec.toArray());
+      } else if (ArrayBuffer.isView(rawVec)) {
+        const view = rawVec as ArrayBufferView & { length?: number };
+        vec = new Float32Array(
+          view.buffer,
+          view.byteOffset,
+          view.length ?? view.byteLength
+        );
+      }
+      const vectorDimensions = getActiveEmbeddingModel().vectorDimensions;
+      if (vec && vec.length === vectorDimensions) {
+        const photoId = row.photo_id as number;
+        let dot = 0;
+        let normQ = 0;
+        let normV = 0;
+        for (let i = 0; i < vectorDimensions; i++) {
+          dot += queryVector[i] * vec[i];
+          normQ += queryVector[i] * queryVector[i];
+          normV += vec[i] * vec[i];
+        }
+        const norm = Math.sqrt(normQ) * Math.sqrt(normV);
+        const cosDist = norm > 0 ? 1 - dot / norm : 1;
+        allScored.push({ photoId, distance: cosDist });
+      }
+    }
+  }
+
+  allScored.sort((a, b) => a.distance - b.distance);
+
+  return allScored
+    .filter((r) => r.distance <= maxDistance)
+    .slice(0, limit)
+    .map((r) => ({
+      photoId: r.photoId,
+      similarity: Math.round(Math.max(0, 1 - r.distance) * 10_000) / 10_000,
+    }));
+}
+
+interface SearchTimings {
+  embedMs: number;
+  vectorMs: number;
+}
+
+export interface RankedSemanticSearchResult {
+  photoId: number;
+  primarySimilarity: number;
+  rankScore: number;
+  similarity: number;
+  supportingGroups: string[];
+}
+
+async function searchVector(
+  queryVector: number[],
+  limit: number,
+  maxCosineDistance: number,
+  rowCount: number
+): Promise<Array<{ photoId: number; similarity: number }>> {
+  if (!photoTable) {
+    return [];
+  }
+  const model = getActiveEmbeddingModel();
+  if (!isValidEmbeddingVector(queryVector, model)) {
+    console.error(
+      `[AI] searchVector rejected invalid ${model.displayName} query vector: expected=${model.vectorDimensions} actual=${queryVector.length}`
+    );
+    return [];
+  }
+  const adaptiveRefine = Math.min(
+    10,
+    Math.max(3, Math.ceil(100 / Math.sqrt(Math.max(rowCount, 1))))
+  );
+
+  let rawResults: Record<string, unknown>[] = [];
+  const queryLimit = Math.min(Math.max(limit, 1), Math.max(rowCount, 1));
+  try {
+    const vq = photoTable
+      .vectorSearch(queryVector)
+      .distanceType("cosine")
+      .refineFactor(adaptiveRefine)
+      .limit(queryLimit);
+    rawResults = (await vq.toArray()) as Record<string, unknown>[];
+  } catch (err: unknown) {
+    console.error("[AI] vectorSearch failed:", getErrorMessage(err));
+  }
+
+  if (rawResults.length === 0) {
+    return fallbackSearch(queryVector, limit, maxCosineDistance, rowCount);
+  }
+
+  const filtered = filterCosineSearchResults(
+    rawResults.map((result) => ({
+      distance: result._distance as number,
+      photoId: result.photo_id as number,
+    })),
+    maxCosineDistance,
+    limit
+  );
+
+  if (filtered.length === 0) {
+    const nearestDistance = rawResults[0]?._distance as number | undefined;
+    console.log(
+      `[AI] All ${rawResults.length} ${model.displayName} results above distance threshold ${maxCosineDistance}; nearest=${nearestDistance?.toFixed(4) ?? "n/a"}`
+    );
+    return [];
+  }
+
+  return filtered;
+}
+
+interface EmbeddingCacheEntry {
+  timestamp: number;
+  vector: number[];
+}
+
+const textEmbeddingCache = new Map<string, EmbeddingCacheEntry>();
+const pendingEmbeddingBatches = new Map<string, Promise<number[][]>>();
+const EMBEDDING_CACHE_TTL = 10 * 60 * 1000;
+const MAX_EMBEDDING_CACHE = 100;
+let embeddingCacheModel: typeof embeddingModel = null;
+
+function getCachedEmbedding(text: string): number[] | null {
+  const key = JSON.stringify({
+    embeddingFingerprint: getActiveEmbeddingFingerprint(),
+    text,
+  });
+  const entry = textEmbeddingCache.get(key);
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() - entry.timestamp > EMBEDDING_CACHE_TTL) {
+    textEmbeddingCache.delete(key);
+    return null;
+  }
+  textEmbeddingCache.delete(key);
+  textEmbeddingCache.set(key, entry);
+  return entry.vector;
+}
+
+function setCachedEmbedding(text: string, vector: number[]): void {
+  const key = JSON.stringify({
+    embeddingFingerprint: getActiveEmbeddingFingerprint(),
+    text,
+  });
+  if (textEmbeddingCache.size >= MAX_EMBEDDING_CACHE) {
+    const lru = textEmbeddingCache.keys().next().value;
+    if (lru !== undefined) {
+      textEmbeddingCache.delete(lru);
+    }
+  }
+  textEmbeddingCache.delete(key);
+  textEmbeddingCache.set(key, { timestamp: Date.now(), vector });
+}
+
+async function embedSearchTexts(
+  texts: string[],
+  timings: SearchTimings
+): Promise<number[][]> {
+  if (!embeddingModel) {
+    return [];
+  }
+  if (embeddingCacheModel !== embeddingModel) {
+    textEmbeddingCache.clear();
+    pendingEmbeddingBatches.clear();
+    embeddingCacheModel = embeddingModel;
+  }
+
+  const vectors: Array<number[] | null> = texts.map((text) =>
+    getCachedEmbedding(text)
+  );
+  const missing = texts
+    .map((text, index) => ({ index, text }))
+    .filter(({ index }) => vectors[index] === null);
+
+  if (missing.length > 0) {
+    const startedAt = Date.now();
+    const missingTexts = missing.map(({ text }) => text);
+    const batchKey = JSON.stringify({
+      embeddingFingerprint: getActiveEmbeddingFingerprint(),
+      texts: missingTexts,
+    });
+    let generationTask = pendingEmbeddingBatches.get(batchKey);
+    if (!generationTask) {
+      generationTask = embeddingModel.embedTexts
+        ? embeddingModel.embedTexts(missingTexts)
+        : (async () => {
+            const sequential: number[][] = [];
+            for (const text of missingTexts) {
+              sequential.push(await embeddingModel.embedText(text));
+            }
+            return sequential;
+          })();
+      pendingEmbeddingBatches.set(batchKey, generationTask);
+    }
+    let generated: number[][];
+    try {
+      generated = await generationTask;
+    } finally {
+      if (pendingEmbeddingBatches.get(batchKey) === generationTask) {
+        pendingEmbeddingBatches.delete(batchKey);
+      }
+    }
+    timings.embedMs += Date.now() - startedAt;
+    if (generated.length !== missing.length) {
+      throw new Error("SigLIP 批量文本向量数量不匹配");
+    }
+
+    const model = getActiveEmbeddingModel();
+    for (let index = 0; index < missing.length; index++) {
+      const item = missing[index];
+      const vector = generated[index];
+      if (!isValidEmbeddingVector(vector, model)) {
+        throw new Error(
+          `${model.displayName} 文本向量无效: expected=${model.vectorDimensions} actual=${vector.length}`
+        );
+      }
+      vectors[item.index] = vector;
+      setCachedEmbedding(item.text, vector);
+    }
+  }
+
+  return vectors.filter((vector): vector is number[] => vector !== null);
+}
+
+interface MultiPromptSearchResult {
+  candidateDepth: number;
+  candidateMinimum: number;
+  consensusCutoff: number;
+  cutoffReason: string;
+  finalCutoff: number;
+  hasMore: boolean;
+  promptGroupCount: number;
+  rejectedWeak: number;
+  results: RankedSemanticSearchResult[];
+  strongAccepted: number;
+  strongCutoff: number;
+  supportCandidates: RankedSemanticSearchResult[];
+  supportCutoff: number;
+  supportedAccepted: number;
+  topSimilarity: number;
+}
+
+async function multiPromptSearch(
+  plan: SemanticQueryPlan,
+  limit: number,
+  timings: SearchTimings = { embedMs: 0, vectorMs: 0 },
+  sensitivity: SearchSensitivity = "standard"
+): Promise<MultiPromptSearchResult> {
+  if (!(embeddingModel && photoTable) || plan.prompts.length === 0) {
+    return {
+      candidateMinimum: 0,
+      candidateDepth: 0,
+      consensusCutoff: 0,
+      cutoffReason: "no-prompts",
+      finalCutoff: 0,
+      hasMore: false,
+      promptGroupCount: 0,
+      rejectedWeak: 0,
+      results: [],
+      supportCandidates: [],
+      supportCutoff: 0,
+      strongAccepted: 0,
+      strongCutoff: 0,
+      supportedAccepted: 0,
+      topSimilarity: 0,
+    };
+  }
+
+  const allTexts = [
+    ...plan.prompts.map((prompt) => prompt.text),
+    ...plan.negativePrompts,
+  ];
+  const vectors = await embedSearchTexts(allTexts, timings);
+  const positiveVectors = vectors.slice(0, plan.prompts.length);
+  const negativeVectors = vectors.slice(plan.prompts.length);
+  const rowCount = await photoTable.countRows();
+  const model = getActiveEmbeddingModel();
+  const evidenceGroups = plan.prompts.map((prompt) => prompt.evidenceGroup);
+  const promptGroupCount = new Set(evidenceGroups).size;
+  const primaryPromptIndex = Math.max(
+    0,
+    plan.prompts.findIndex((prompt) => prompt.role === "primary")
+  );
+  // 灵敏度同时缩放 ANN 候选预过滤阈值——否则 relaxed 档在召回层就丢掉弱匹配。
+  const s = getSensitivityMultiplier(sensitivity);
+  const thresholdProfile = getActiveThresholdProfile();
+  const candidateMinimum =
+    thresholdProfile.calibrationStatus === "uncalibrated"
+      ? -1
+      : Math.max(
+          0.005,
+          thresholdProfile.semanticSearch.candidateMinimumSimilarity * s
+        );
+  const candidateMaxDistance = 1 - candidateMinimum;
+  let candidateDepth = Math.min(rowCount, Math.max(200, limit));
+
+  while (candidateDepth > 0) {
+    const vectorStartedAt = Date.now();
+    const resultSets = await Promise.all(
+      positiveVectors.map((vector) =>
+        searchVector(vector, candidateDepth, candidateMaxDistance, rowCount)
+      )
+    );
+    const negativeResultSets = await Promise.all(
+      negativeVectors.map((vector) =>
+        searchVector(vector, candidateDepth, candidateMaxDistance, rowCount)
+      )
+    );
+    timings.vectorMs += Date.now() - vectorStartedAt;
+
+    const fused = fuseRankedSearchEvidence(
+      resultSets,
+      rowCount,
+      plan.prompts.map((prompt) => prompt.weight),
+      evidenceGroups,
+      primaryPromptIndex
+    );
+    const penalized = applyNegativeSemanticPenalty(
+      fused,
+      negativeResultSets,
+      rowCount
+    );
+    const selection = selectRelevantSemanticResults(
+      penalized,
+      model,
+      promptGroupCount,
+      limit,
+      {
+        candidateTails: resultSets.map((results, index) => ({
+          evidenceGroup: evidenceGroups[index],
+          similarity: results.at(-1)?.similarity ?? 0,
+        })),
+        intent: plan.intent,
+        primaryScores: resultSets[primaryPromptIndex]?.map(
+          ({ similarity }) => similarity
+        ),
+        promptGroupCount,
+        sensitivity: s,
+      }
+    );
+    const exhausted = candidateDepth >= rowCount;
+    const enoughForPage = selection.results.length >= limit;
+    const hasMore =
+      selection.acceptedCount > limit || (!exhausted && selection.canContinue);
+
+    if (enoughForPage || exhausted || !selection.hasMoreCandidates) {
+      console.log(
+        `[AI] Semantic relevance: policy=${getSemanticPolicyVersion()} model=${model.kind} intent=${plan.intent} primary="${plan.prompts[primaryPromptIndex]?.text ?? ""}" prompts=${plan.rawPromptCount}->${plan.prompts.length} groups=${promptGroupCount} depth=${candidateDepth}/${rowCount} top=${selection.topSimilarity.toFixed(4)} cutoff=${selection.finalCutoff.toFixed(4)} reason=${selection.cutoffReason} strong=${selection.strongAccepted} supported=${selection.supportedAccepted} rejectedWeak=${selection.rejectedWeak} accepted=${selection.results.length} hasMore=${hasMore}`
+      );
+      return {
+        candidateMinimum,
+        candidateDepth,
+        consensusCutoff: selection.consensusCutoff,
+        cutoffReason: selection.cutoffReason,
+        finalCutoff: selection.finalCutoff,
+        hasMore,
+        promptGroupCount,
+        rejectedWeak: selection.rejectedWeak,
+        results: selection.results,
+        supportCandidates: selection.supportCandidates,
+        supportCutoff: selection.supportCutoff,
+        strongAccepted: selection.strongAccepted,
+        strongCutoff: selection.strongCutoff,
+        supportedAccepted: selection.supportedAccepted,
+        topSimilarity: selection.topSimilarity,
+      };
+    }
+
+    candidateDepth = Math.min(
+      rowCount,
+      Math.max(candidateDepth + 200, candidateDepth * 2)
+    );
+  }
+
+  return {
+    candidateMinimum: 0,
+    candidateDepth: 0,
+    consensusCutoff: 0,
+    cutoffReason: "no-candidates",
+    finalCutoff: 0,
+    hasMore: false,
+    promptGroupCount,
+    rejectedWeak: 0,
+    results: [],
+    supportCandidates: [],
+    supportCutoff: 0,
+    strongAccepted: 0,
+    strongCutoff: 0,
+    supportedAccepted: 0,
+    topSimilarity: 0,
+  };
+}
+
+// ── AI 文本搜索 TTL 缓存 ────────────────────────────────────────────
+// 避免相同 query 短时间内反复触发 SigLIP 文本推理（~50ms）+ LanceDB 搜索
+interface SearchCacheEntry {
+  result: SemanticTextSearchResult;
+  timestamp: number;
+}
+const textSearchCache = new Map<string, SearchCacheEntry>();
+const pendingTextSearches = new Map<
+  string,
+  Promise<SemanticTextSearchResult>
+>();
+const SEARCH_CACHE_TTL = 2 * 60 * 1000; // 2 minutes
+const MAX_SEARCH_CACHE = 30;
+let warmedModel: typeof embeddingModel = null;
+let warmedTable: typeof photoTable = null;
+let searchCacheModel: typeof embeddingModel = null;
+let searchCacheTable: typeof photoTable = null;
+
+function getEffectiveVectorCompatibility(): VectorCompatibility | null {
+  const runtime = getActiveEmbeddingRuntime();
+  if (!runtime) {
+    return null;
+  }
+  const model = getActiveEmbeddingModel();
+  return resolveRuntimeVectorCompatibility(
+    {
+      adapterId: model.adapterId,
+      dimensions: model.vectorDimensions,
+      fingerprint: getActiveEmbeddingFingerprint(),
+    },
+    runtime,
+    runtime.vectorCompatibility
+  );
+}
+
+export function isAiSearchReady(): boolean {
+  return (
+    embeddingModel !== null &&
+    photoTable !== null &&
+    warmedModel === embeddingModel &&
+    warmedTable === photoTable
+  );
+}
+
+function getCachedSearch(cacheKey: string): SemanticTextSearchResult | null {
+  const entry = textSearchCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() - entry.timestamp > SEARCH_CACHE_TTL) {
+    textSearchCache.delete(cacheKey);
+    return null;
+  }
+  // LRU: 命中时移到末尾
+  textSearchCache.delete(cacheKey);
+  textSearchCache.set(cacheKey, entry);
+  return entry.result;
+}
+
+function setCachedSearch(
+  cacheKey: string,
+  result: SemanticTextSearchResult
+): void {
+  if (textSearchCache.size >= MAX_SEARCH_CACHE) {
+    const lru = textSearchCache.keys().next().value;
+    if (lru !== undefined) {
+      textSearchCache.delete(lru);
+    }
+  }
+  textSearchCache.delete(cacheKey);
+  textSearchCache.set(cacheKey, { result, timestamp: Date.now() });
+}
+
+export async function searchByText(
+  query: string,
+  limit = 50
+): Promise<Array<{ photoId: number; similarity: number }>> {
+  return (await searchByTextWithPlan(query, limit)).results.map(
+    ({ photoId, similarity }) => ({ photoId, similarity })
+  );
+}
+
+export interface SemanticTextSearchResult {
+  candidateDepth: number;
+  candidateMinimum?: number;
+  consensusCutoff: number;
+  cutoffReason: string;
+  finalCutoff: number;
+  hasMore: boolean;
+  plan: SemanticQueryPlan;
+  promptGroupCount: number;
+  rejectedWeak: number;
+  results: RankedSemanticSearchResult[];
+  sensitivity?: SearchSensitivity;
+  sensitivityMultiplier?: number;
+  strongAccepted: number;
+  strongCutoff: number;
+  supportCandidates: RankedSemanticSearchResult[];
+  supportCutoff: number;
+  supportedAccepted: number;
+  topSimilarity: number;
+}
+
+export async function searchByTextWithPlan(
+  query: string,
+  limit = 50
+): Promise<SemanticTextSearchResult> {
+  if (!query.trim()) {
+    return {
+      candidateDepth: 0,
+      consensusCutoff: 0,
+      cutoffReason: "empty-query",
+      finalCutoff: 0,
+      hasMore: false,
+      plan: await prepareSemanticQueryPlan(""),
+      promptGroupCount: 0,
+      rejectedWeak: 0,
+      results: [],
+      supportCandidates: [],
+      supportCutoff: 0,
+      strongAccepted: 0,
+      strongCutoff: 0,
+      supportedAccepted: 0,
+      topSimilarity: 0,
+    };
+  }
+
+  const sensitivity = getActiveSearchSensitivity();
+  const cacheKey = JSON.stringify({
+    embeddingFingerprint: getActiveEmbeddingFingerprint(),
+    limit,
+    queryPlanFingerprint: getSemanticQueryPlanFingerprint(
+      getTranslationModelVersion()
+    ),
+    policy: getSemanticPolicyVersion(),
+    thresholdProfile: getThresholdProfileIdentity(),
+    query: query.trim(),
+    sensitivity,
+    strategy: "hybrid-zh-v2",
+    translation: getTranslationModelVersion(),
+    version: SEMANTIC_QUERY_PLAN_VERSION,
+  });
+  const pending = pendingTextSearches.get(cacheKey);
+  if (pending) {
+    console.log(`[AI] searchByText IN-FLIGHT HIT: limit=${limit}`);
+    return pending;
+  }
+
+  if (searchCacheModel !== embeddingModel || searchCacheTable !== photoTable) {
+    textSearchCache.clear();
+    searchCacheModel = embeddingModel;
+    searchCacheTable = photoTable;
+  }
+
+  // TTL cache check — avoids redundant SigLIP inference + LanceDB search
+  const cached = getCachedSearch(cacheKey);
+  if (cached) {
+    console.log(`[AI] searchByText CACHE HIT: limit=${limit}`);
+    return cached;
+  }
+
+  const searchPromise = (async () => {
+    await initVectorDB();
+    return withVectorDbOperation(() =>
+      performTextSearch(query, limit, cacheKey, sensitivity)
+    );
+  })();
+  pendingTextSearches.set(cacheKey, searchPromise);
+  try {
+    return await searchPromise;
+  } finally {
+    if (pendingTextSearches.get(cacheKey) === searchPromise) {
+      pendingTextSearches.delete(cacheKey);
+    }
+  }
+}
+
+async function performTextSearch(
+  query: string,
+  limit: number,
+  cacheKey: string,
+  sensitivity: SearchSensitivity
+): Promise<SemanticTextSearchResult> {
+  const totalStartedAt = Date.now();
+  const timings: SearchTimings = { embedMs: 0, vectorMs: 0 };
+  const initStartedAt = Date.now();
+
+  try {
+    await loadModel();
+  } catch (err: unknown) {
+    console.error(
+      "[AI] searchByText: model load failed:",
+      getErrorMessage(err)
+    );
+    return {
+      candidateDepth: 0,
+      consensusCutoff: 0,
+      cutoffReason: "model-load-failed",
+      finalCutoff: 0,
+      hasMore: false,
+      plan: await prepareSemanticQueryPlan(query, {
+        translate: async () => "",
+      }),
+      promptGroupCount: 0,
+      rejectedWeak: 0,
+      results: [],
+      supportCandidates: [],
+      supportCutoff: 0,
+      strongAccepted: 0,
+      strongCutoff: 0,
+      supportedAccepted: 0,
+      topSimilarity: 0,
+    };
+  }
+
+  const initMs = Date.now() - initStartedAt;
+
+  const vectorCompatibility = getEffectiveVectorCompatibility();
+  if (
+    vectorCompatibility &&
+    !isVectorCompatibilitySearchable(vectorCompatibility)
+  ) {
+    console.error(
+      `[AI] searchByText blocked by vector compatibility: ${vectorCompatibility}`
+    );
+    return {
+      candidateDepth: 0,
+      consensusCutoff: 0,
+      cutoffReason: `vector-${vectorCompatibility}`,
+      finalCutoff: 0,
+      hasMore: false,
+      plan: await prepareSemanticQueryPlan(query, {
+        translate: async () => "",
+      }),
+      promptGroupCount: 0,
+      rejectedWeak: 0,
+      results: [],
+      supportCandidates: [],
+      supportCutoff: 0,
+      strongAccepted: 0,
+      strongCutoff: 0,
+      supportedAccepted: 0,
+      topSimilarity: 0,
+    };
+  }
+
+  if (!(embeddingModel && photoTable)) {
+    console.warn("[AI] searchByText: AI not initialized");
+    return {
+      candidateDepth: 0,
+      consensusCutoff: 0,
+      cutoffReason: "ai-not-initialized",
+      finalCutoff: 0,
+      hasMore: false,
+      plan: await prepareSemanticQueryPlan(query, {
+        translate: async () => "",
+      }),
+      promptGroupCount: 0,
+      rejectedWeak: 0,
+      results: [],
+      supportCandidates: [],
+      supportCutoff: 0,
+      strongAccepted: 0,
+      strongCutoff: 0,
+      supportedAccepted: 0,
+      topSimilarity: 0,
+    };
+  }
+
+  const parseStartedAt = Date.now();
+  const plan = await getSemanticQueryPlan(query);
+  const parseMs = Date.now() - parseStartedAt;
+  const effectiveCacheKey = semanticQueryPlanCacheKey(
+    plan,
+    getActiveEmbeddingFingerprint(),
+    limit,
+    getTranslationModelVersion(),
+    sensitivity
+  );
+  const planCached = getCachedSearch(effectiveCacheKey);
+  if (planCached) {
+    setCachedSearch(cacheKey, planCached);
+    return planCached;
+  }
+  const semanticSearch =
+    plan.prompts.length > 0
+      ? await multiPromptSearch(plan, limit, timings, sensitivity)
+      : {
+          candidateMinimum: 0,
+          candidateDepth: 0,
+          consensusCutoff: 0,
+          cutoffReason: "no-prompts",
+          finalCutoff: 0,
+          hasMore: false,
+          promptGroupCount: 0,
+          rejectedWeak: 0,
+          results: [],
+          supportCandidates: [],
+          supportCutoff: 0,
+          strongAccepted: 0,
+          strongCutoff: 0,
+          supportedAccepted: 0,
+          topSimilarity: 0,
+        };
+  const searchResult = {
+    plan,
+    ...semanticSearch,
+    sensitivity,
+    sensitivityMultiplier: getSensitivityMultiplier(sensitivity),
+  };
+
+  setCachedSearch(cacheKey, searchResult);
+  if (effectiveCacheKey !== cacheKey) {
+    setCachedSearch(effectiveCacheKey, searchResult);
+  }
+  searchCacheModel = embeddingModel;
+  searchCacheTable = photoTable;
+  warmedModel = embeddingModel;
+  warmedTable = photoTable;
+  console.log(
+    `[AI] searchByText timing: language=${plan.language} intent=${plan.intent} translation=${plan.translationMode} coverage=${Math.round(plan.coverage * 100)} prompts=${plan.rawPromptCount}->${plan.prompts.length} groups=${semanticSearch.promptGroupCount} negatives=${plan.negativePrompts.length} results=${semanticSearch.results.length} init=${initMs}ms parse=${parseMs}ms embed=${timings.embedMs}ms vector=${timings.vectorMs}ms total=${Date.now() - totalStartedAt}ms`
+  );
+  return searchResult;
+}
+
+let warmupPromise: Promise<void> | null = null;
+
+export function warmupAiSearch(): Promise<void> {
+  if (!warmupPromise) {
+    warmupPromise = (async () => {
+      const startedAt = Date.now();
+      await loadModel();
+      await initVectorDB();
+      const vectorCompatibility = getEffectiveVectorCompatibility();
+      if (
+        vectorCompatibility &&
+        !isVectorCompatibilitySearchable(vectorCompatibility)
+      ) {
+        throw new Error(
+          `Vector store is incompatible with active embedding model (${vectorCompatibility})`
+        );
+      }
+      if (!(embeddingModel && photoTable)) {
+        return;
+      }
+
+      const timings: SearchTimings = { embedMs: 0, vectorMs: 0 };
+      const [vector] = await embedSearchTexts(["a photo"], timings);
+      const rowCount = await photoTable.countRows();
+      if (vector && rowCount > 0) {
+        await photoTable
+          .vectorSearch(vector)
+          .distanceType("cosine")
+          .limit(1)
+          .toArray();
+      }
+      warmedModel = embeddingModel;
+      warmedTable = photoTable;
+      if (_localModelPath) {
+        warmupTranslationWorker(_localModelPath).catch(() => undefined);
+      }
+      console.log(
+        `[AI] Semantic search warmup completed in ${Date.now() - startedAt}ms`
+      );
+    })().finally(() => {
+      warmupPromise = null;
+    });
+  }
+
+  return warmupPromise;
+}
+
+/**
+ * 自用新增：用 WD14 的 768 维动漫特征做「以图搜图」。
+ *
+ * 实测区分"同一个角色"的能力约为 SigLIP 的 2.7 倍。
+ * 返回 `null` = 这条链路当前不可用（未开启 / 特征表还空 / worker 起不来），
+ * 调用方回退到原来的 SigLIP 路径；返回数组（可能为空）= 已有结果。
+ */
+async function searchByWd14Image(
+  imagePath: string,
+  limit: number
+): Promise<Array<{ photoId: number; similarity: number }> | null> {
+  if (!PRIVATE_BUILD.useWd14ImageSearch) {
+    return null;
+  }
+  try {
+    const { getWd14VectorCount, searchByWd14Vector } = await import(
+      "./vector-db"
+    );
+    // 特征表还没数据（例如刚装好、还没打标）→ 直接用 SigLIP，避免"搜不到任何东西"
+    if ((await getWd14VectorCount()) === 0) {
+      return null;
+    }
+
+    const { initWd14Tagger, isWd14TaggerReady, tagPhotoBatch } = await import(
+      "./wd14-tagger-client"
+    );
+    let modelsDir = _localModelPath;
+    if (!modelsDir) {
+      modelsDir = await ensureLocalModel();
+      setLocalModelPath(modelsDir);
+    }
+    if (!isWd14TaggerReady()) {
+      // 自用修复：与 runWd14Tagging 保持一致，读应用里的「GPU 加速」设置。
+      // 这里原来是写死的 false → 以图搜图第一次触发时会把 WD14 worker 初始化在 CPU 上。
+      const { getSetting } = await import("@/services/settings-manager");
+      await initWd14Tagger(modelsDir, getSetting("gpu.enabled") === "true");
+    }
+
+    // 查询图走的是与打标完全相同的预处理（白底补方 + BGR + 原始 0-255）
+    const [result] = await tagPhotoBatch([{ id: 0, path: imagePath }], {
+      includeEmbedding: true,
+    });
+    const vector = result?.embedding;
+    if (!vector || vector.length === 0) {
+      return null;
+    }
+
+    const hits = await searchByWd14Vector(vector, limit);
+    if (!hits || hits.length === 0) {
+      return null;
+    }
+    // 与 SigLIP 分支保持同一输出形状：distance 是余弦距离。
+    // worker 里已做 L2 归一化 → d² = 2 - 2cos，所以 cos 距离 = d²/2 = 1 - similarity。
+    return filterCosineSearchResults(
+      hits.map((hit) => ({
+        distance: Math.max(0, 1 - hit.similarity),
+        photoId: hit.photoId,
+      })),
+      Number.POSITIVE_INFINITY,
+      limit
+    );
+  } catch (error: unknown) {
+    console.warn(
+      "[AI] WD14 image search unavailable, falling back to SigLIP:",
+      getErrorMessage(error)
+    );
+    return null;
+  }
+}
+
+/**
+ * NEXT（2026-10）：以图搜图优先走 **PixAI Tagger v1.0 的 1024 维动漫特征**。
+ *
+ * 与 WD14 那套同样的契约：返回 `null` = 这条链路当前不可用（特征表还空 / worker 起不来），
+ * 调用方回退；返回数组（可能为空）= 已有结果。
+ *
+ * 与 WD14 的差别：查询图的**预处理完全不同**（PixAI 是 1008×1008 NCHW、RGB、-1..1、黑边），
+ * 但那是 worker 内部的事，这里只管拿 1024 维向量。
+ */
+async function searchByPixaiImage(
+  imagePath: string,
+  limit: number
+): Promise<Array<{ photoId: number; similarity: number }> | null> {
+  try {
+    const { getPixaiVectorCount, searchByPixaiVector } = await import(
+      "./vector-db"
+    );
+    // 特征表还没数据（例如刚装好、还没打标）→ 回退，避免"搜不到任何东西"
+    if ((await getPixaiVectorCount()) === 0) {
+      return null;
+    }
+
+    const { initPixaiTagger, isPixaiTaggerReady, tagPhotoBatchPixai } =
+      await import("./pixai-tagger-client");
+    let modelsDir = _localModelPath;
+    if (!modelsDir) {
+      modelsDir = await ensureLocalModel();
+      setLocalModelPath(modelsDir);
+    }
+    if (!isPixaiTaggerReady()) {
+      // 查询图这条路走 CPU：单张约 6.5 秒可以接受，而 DirectML 有原生崩溃风险
+      // （见 scripts/pixai-tagger-worker.mjs 顶部与 bench_one.cjs 的注释）。
+      await initPixaiTagger(modelsDir, false);
+    }
+
+    const [result] = await tagPhotoBatchPixai([{ id: 0, path: imagePath }], {
+      includeEmbedding: true,
+    });
+    const vector = result?.embedding;
+    if (!vector || vector.length === 0) {
+      return null;
+    }
+
+    const hits = await searchByPixaiVector(vector, limit);
+    if (!hits || hits.length === 0) {
+      return null;
+    }
+    // 与 SigLIP 分支保持同一输出形状：distance 是余弦距离。
+    // worker 里已做 L2 归一化 → cos 距离 = 1 - similarity。
+    return filterCosineSearchResults(
+      hits.map((hit) => ({
+        distance: Math.max(0, 1 - hit.similarity),
+        photoId: hit.photoId,
+      })),
+      Number.POSITIVE_INFINITY,
+      limit
+    );
+  } catch (error: unknown) {
+    console.warn(
+      "[AI] PixAI image search unavailable, falling back to SigLIP:",
+      getErrorMessage(error)
+    );
+    return null;
+  }
+}
+
+export function searchByImage(
+  imagePath: string,
+  limit = 20
+): Promise<Array<{ photoId: number; similarity: number }>> {  return initVectorDB().then(() =>
+    withVectorDbOperation(() => performSearchByImage(imagePath, limit))
+  );
+}
+
+async function performSearchByImage(
+  imagePath: string,
+  limit: number
+): Promise<Array<{ photoId: number; similarity: number }>> {
+  if (!(imagePath && fs.existsSync(imagePath))) {
+    console.warn("[AI] searchByImage: image file not found:", imagePath);
+    return [];
+  }
+
+  const vectorCompatibility = getEffectiveVectorCompatibility();
+  if (
+    vectorCompatibility &&
+    !isVectorCompatibilitySearchable(vectorCompatibility)
+  ) {
+    console.error(
+      `[AI] searchByImage blocked by vector compatibility: ${vectorCompatibility}`
+    );
+    return [];
+  }
+
+  if (!photoTable) {
+    console.warn("[AI] searchByImage: AI not initialized");
+    return [];
+  }
+
+  // NEXT：PixAI 的 1024 维动漫特征优先（动漫区分度高于 SigLIP）。
+  // ⚠️ 完全替换语义：PixAI 生效时**不再**回退到 WD14 的旧特征（模型不同、维度不同，
+  //    混用只会给出看似有结果、其实不可比的排序）；它的表空就直接落到 SigLIP。
+  if (getActiveTagger() === "pixai") {
+    const pixaiResults = await searchByPixaiImage(imagePath, limit);
+    if (pixaiResults !== null) {
+      return pixaiResults;
+    }
+  } else {
+    // 自用新增：优先走 WD14 动漫特征（区分度约为 SigLIP 的 2.7 倍）。
+    // 不可用时返回 null，下面照常走原来的 SigLIP 路径。
+    const wd14Results = await searchByWd14Image(imagePath, limit);
+    if (wd14Results !== null) {
+      return wd14Results;
+    }
+  }
+
+  let localModelPath = _localModelPath;
+  if (!localModelPath) {
+    localModelPath = await ensureLocalModel();
+    setLocalModelPath(localModelPath);
+  }
+
+  let queryVector: number[];
+  try {
+    const { embedSingleImage, isPoolReady } = await import(
+      "@/services/embed-worker-pool"
+    );
+    if (isPoolReady()) {
+      queryVector = await embedSingleImage(imagePath, localModelPath);
+    } else {
+      queryVector = await embedImageInWorker(imagePath, localModelPath);
+    }
+  } catch {
+    try {
+      queryVector = await embedImageInWorker(imagePath, localModelPath);
+    } catch (fallbackErr: unknown) {
+      console.error(
+        "[AI] searchByImage: image embedding failed:",
+        getErrorMessage(fallbackErr)
+      );
+      return [];
+    }
+  }
+
+  const model = getActiveEmbeddingModel();
+  if (!isValidEmbeddingVector(queryVector, model)) {
+    console.error(
+      `[AI] searchByImage rejected invalid ${model.displayName} query vector: expected=${model.vectorDimensions} actual=${queryVector.length}`
+    );
+    return [];
+  }
+
+  const rowCount = await photoTable.countRows();
+  const adaptiveRefine = Math.min(
+    10,
+    Math.max(3, Math.ceil(100 / Math.sqrt(Math.max(rowCount, 1))))
+  );
+  let rawResults: Record<string, unknown>[] = [];
+
+  try {
+    const vq = photoTable
+      .vectorSearch(queryVector)
+      .distanceType("cosine")
+      .refineFactor(adaptiveRefine)
+      .limit(limit);
+    rawResults = (await vq.toArray()) as Record<string, unknown>[];
+  } catch (err: unknown) {
+    console.error(
+      "[AI] searchByImage vectorSearch failed:",
+      getErrorMessage(err)
+    );
+  }
+
+  if (rawResults.length === 0) {
+    return fallbackSearch(queryVector, limit);
+  }
+
+  return filterCosineSearchResults(
+    rawResults.map((result) => ({
+      distance: result._distance as number,
+      photoId: result.photo_id as number,
+    })),
+    Number.POSITIVE_INFINITY,
+    limit
+  );
+}

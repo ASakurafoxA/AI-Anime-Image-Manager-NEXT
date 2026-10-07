@@ -1,0 +1,1399 @@
+// biome-ignore-all lint/a11y/noNoninteractiveElementInteractions: scoped component lint cleanup preserves existing UI behavior
+// biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: scoped component lint cleanup preserves existing UI behavior
+// biome-ignore-all lint/style/noNestedTernary: scoped component lint cleanup preserves existing UI behavior
+// biome-ignore-all lint/a11y/noStaticElementInteractions: scoped component lint cleanup preserves existing UI behavior
+
+import {
+  ArrowLeft,
+  ChevronDown,
+  ChevronUp,
+  FolderOpen,
+  Plus,
+  Sparkles,
+  Star,
+  X,
+} from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
+import {
+  readPhotoDetailAdvancedMetadataExpanded,
+  savePhotoDetailAdvancedMetadataExpanded,
+} from "@/actions/photo-detail-panel-preferences";
+import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { PRIVATE_BUILD } from "@/config/private-build";
+import { SmoothInput } from "@/components/ui/smooth-input";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { ipc } from "@/ipc/manager";
+import { getTagDisplayName } from "@/localization/tag-display";
+import { getDateLocale } from "@/utils/date-locale";
+import { toLocalMediaUrl } from "@/utils/local-media-url";
+
+interface PhotoDetail {
+  filename: string;
+  fileSize: number;
+  format?: string;
+  height: number;
+  id: number;
+  path: string;
+  thumbnailPath?: string | null;
+  width: number;
+}
+
+const DIRECTORY_PATH_REGEX = /[/\\][^/\\]+$/;
+
+interface ExifData {
+  advanced?: {
+    autofocus: Record<string, unknown>;
+    capture: Record<string, unknown>;
+    processing: Record<string, unknown>;
+    provenance: Record<string, unknown> & { status?: string };
+    standard: Record<string, unknown>;
+    vendor: string | null;
+    vendorRaw: Record<string, unknown>;
+    workflow: Record<string, unknown>;
+  } | null;
+  advancedStatus?: string;
+  aperture: number | null;
+  cameraMake: string | null;
+  cameraModel: string | null;
+  dateTaken: number | null;
+  focalLength: string | null;
+  gpsLatitude: number | null;
+  gpsLongitude: number | null;
+  iso: number | null;
+  lensMake: string | null;
+  lensModel: string | null;
+  orientation: number | null;
+  shutterSpeed: string | null;
+  software: string | null;
+}
+
+interface TagInfo {
+  color: string | null;
+  confidence: number | null;
+  id: number;
+  isConfirmed: boolean | null;
+  name: string;
+  parentId?: number | null;
+  photoCount?: number;
+}
+
+interface PhotoDetailPanelProps {
+  onClose: () => void;
+  onNavigate?: (direction: "prev" | "next") => void;
+  onOpenExplorer: (path: string) => void;
+  onReturnToSequence?: () => void;
+  onWidthChange?: (width: number) => void;
+  photo: PhotoDetail | null;
+}
+
+const PANEL_WIDTH_KEY = "detail_panel_width";
+const MIN_PANEL_WIDTH = 280;
+const MAX_PANEL_WIDTH = 480;
+const DEFAULT_PANEL_WIDTH = 300;
+const SUGGESTION_CACHE_MAX = 20;
+
+// Module-level cache so AI suggestions survive panel close/reopen and lightbox navigation
+const suggestionCache = new Map<
+  number,
+  Array<{ tag: string; confidence: number }>
+>();
+
+export function loadPhotoDetailPanelWidth(): number {
+  try {
+    const saved = localStorage.getItem(PANEL_WIDTH_KEY);
+    if (saved) {
+      return Math.max(
+        MIN_PANEL_WIDTH,
+        Math.min(MAX_PANEL_WIDTH, Number(saved))
+      );
+    }
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_PANEL_WIDTH;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+export function PhotoDetailPanel({
+  photo,
+  onClose,
+  onNavigate,
+  onOpenExplorer,
+  onReturnToSequence,
+  onWidthChange,
+}: PhotoDetailPanelProps) {
+  const { t, i18n } = useTranslation();
+  const [exif, setExif] = useState<ExifData | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [photoTags, setPhotoTags] = useState<TagInfo[]>([]);
+  const [allTags, setAllTags] = useState<TagInfo[]>([]);
+  const [showTagInput, setShowTagInput] = useState(false);
+  const [newTagName, setNewTagName] = useState("");
+  const [showAllTags, setShowAllTags] = useState(false);
+  const [advancedMetadataExpanded, setAdvancedMetadataExpanded] = useState(
+    readPhotoDetailAdvancedMetadataExpanded
+  );
+  const [aiSuggestions, setAiSuggestions] = useState<Array<{
+    tag: string;
+    confidence: number;
+  }> | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiTagTaskState, setAiTagTaskState] = useState<
+    "checking" | "ready" | "indexing" | "tagging" | "busy" | "unavailable"
+  >("checking");
+  const [loadedPreviewId, setLoadedPreviewId] = useState<number | null>(null);
+  const [panelWidth, setPanelWidth] = useState(loadPhotoDetailPanelWidth);
+  const [resizing, setResizing] = useState(false);
+  const resizeStartX = useRef(0);
+  const resizeStartWidth = useRef(0);
+  const currentWidth = useRef(panelWidth);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const tagInputRef = useRef<HTMLInputElement>(null);
+  const contentScrollRef = useRef<HTMLDivElement>(null);
+  const photoRequestRef = useRef(0);
+  const aiStatusRequestRef = useRef(0);
+  const aiSuggestionRequestRef = useRef(0);
+  const [visible, setVisible] = useState(false);
+  const [hasMoreBelow, setHasMoreBelow] = useState(false);
+  const lastPhotoRef = useRef<PhotoDetail | null>(null);
+
+  if (photo) {
+    lastPhotoRef.current = photo;
+  }
+
+  const displayPhoto = photo ?? lastPhotoRef.current;
+  const hasPhoto = Boolean(photo);
+
+  // Commit the panel width before paint so the masonry grid never shows an
+  // intermediate full-width frame while the detail panel is opening.
+  useLayoutEffect(() => {
+    setVisible(hasPhoto);
+  }, [hasPhoto]);
+
+  useEffect(() => {
+    aiSuggestionRequestRef.current += 1;
+    const cached = photo ? suggestionCache.get(photo.id) : undefined;
+    if (cached) {
+      setAiSuggestions(cached);
+    } else {
+      setAiSuggestions(null);
+    }
+    setAiLoading(false);
+    setNewTagName("");
+    setShowTagInput(false);
+    setShowAllTags(false);
+  }, [photo?.id, photo]);
+
+  // Keyboard navigation (↑/↓) when panel is visible
+  useEffect(() => {
+    if (!(photo && onNavigate)) {
+      return;
+    }
+    function handleKeyDown(e: KeyboardEvent) {
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement
+      ) {
+        return;
+      }
+      if (e.key === "ArrowUp" || e.key === "k") {
+        e.preventDefault();
+        onNavigate?.("prev");
+      } else if (e.key === "ArrowDown" || e.key === "j") {
+        e.preventDefault();
+        onNavigate?.("next");
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [photo, onNavigate]);
+
+  // Keep ref in sync for resize callback closure
+  useEffect(() => {
+    currentWidth.current = panelWidth;
+    onWidthChange?.(panelWidth);
+  }, [onWidthChange, panelWidth]);
+
+  // Resize handling
+  useEffect(() => {
+    if (!resizing) {
+      return;
+    }
+
+    function handleMouseMove(e: MouseEvent) {
+      const delta = resizeStartX.current - e.clientX;
+      const newWidth = Math.max(
+        MIN_PANEL_WIDTH,
+        Math.min(MAX_PANEL_WIDTH, resizeStartWidth.current + delta)
+      );
+      currentWidth.current = newWidth;
+      setPanelWidth(newWidth);
+    }
+
+    function handleMouseUp() {
+      setResizing(false);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      try {
+        localStorage.setItem(PANEL_WIDTH_KEY, String(currentWidth.current));
+      } catch {
+        /* ignore */
+      }
+    }
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [resizing]);
+
+  function handleResizeStart(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setResizing(true);
+    resizeStartX.current = e.clientX;
+    resizeStartWidth.current = currentWidth.current;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }
+
+  const updateBottomFade = useCallback(() => {
+    const element = contentScrollRef.current;
+    if (!element) {
+      setHasMoreBelow(false);
+      return;
+    }
+    setHasMoreBelow(
+      element.scrollHeight - element.scrollTop - element.clientHeight > 2
+    );
+  }, []);
+
+  useEffect(() => {
+    const element = contentScrollRef.current;
+    if (!element) {
+      return;
+    }
+    updateBottomFade();
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(updateBottomFade);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [updateBottomFade]);
+
+  const loadTags = useCallback(
+    async (requestId = photoRequestRef.current) => {
+      if (!photo) {
+        return;
+      }
+      const photoId = photo.id;
+      try {
+        const [pTags, aTags] = await Promise.all([
+          ipc.client.photos.getPhotoTags({ id: photoId }),
+          ipc.client.photos.getTags({}),
+        ]);
+        if (photoRequestRef.current !== requestId) {
+          return;
+        }
+        setPhotoTags((pTags as TagInfo[]) || []);
+        setAllTags((aTags as unknown as TagInfo[]) || []);
+      } catch (err) {
+        console.error("[loadTags] failed:", err);
+      }
+    },
+    [photo]
+  );
+
+  useEffect(() => {
+    const requestId = ++aiStatusRequestRef.current;
+    if (!photo) {
+      setAiTagTaskState("unavailable");
+      return;
+    }
+    let active = true;
+    let previousState:
+      | "checking"
+      | "ready"
+      | "indexing"
+      | "tagging"
+      | "busy"
+      | "unavailable" = "checking";
+    const refresh = async () => {
+      try {
+        const result = (await ipc.client.photos.getPhotoTagAnalysisStatus({
+          id: photo.id,
+        })) as {
+          state: "ready" | "indexing" | "tagging" | "busy" | "unavailable";
+        };
+        if (!active || aiStatusRequestRef.current !== requestId) {
+          return;
+        }
+        if (
+          (previousState === "indexing" ||
+            previousState === "tagging" ||
+            previousState === "busy") &&
+          result.state === "ready"
+        ) {
+          await loadTags(photoRequestRef.current);
+          if (!active || aiStatusRequestRef.current !== requestId) {
+            return;
+          }
+          window.dispatchEvent(new CustomEvent("tags-changed"));
+        }
+        previousState = result.state;
+        setAiTagTaskState(result.state);
+      } catch {
+        if (active && aiStatusRequestRef.current === requestId) {
+          setAiTagTaskState("unavailable");
+        }
+      }
+    };
+    setAiTagTaskState("checking");
+    refresh();
+    const interval = setInterval(refresh, 2000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [photo?.id, loadTags, photo]);
+
+  useEffect(() => {
+    if (!photo) {
+      photoRequestRef.current += 1;
+      return;
+    }
+    const requestId = ++photoRequestRef.current;
+    setLoading(true);
+    setExif(null);
+    setPhotoTags([]);
+    ipc.client.photos
+      .getPhotoExif({ id: photo.id })
+      .then((result) => {
+        if (photoRequestRef.current === requestId) {
+          setExif(result as ExifData | null);
+        }
+      })
+      .catch(() => {
+        if (photoRequestRef.current === requestId) {
+          setExif(null);
+        }
+      })
+      .finally(() => {
+        if (photoRequestRef.current === requestId) {
+          setLoading(false);
+        }
+      });
+    loadTags(requestId);
+  }, [photo?.id, loadTags, photo]);
+
+  useEffect(() => {
+    if (showTagInput && tagInputRef.current) {
+      tagInputRef.current.focus();
+    }
+  }, [showTagInput]);
+
+  async function handleAddTag(tagId: number) {
+    if (!photo) {
+      return;
+    }
+    try {
+      await ipc.client.photos.setPhotoTag({ photoId: photo.id, tagId });
+      loadTags();
+      window.dispatchEvent(new CustomEvent("tags-changed"));
+    } catch {
+      toast.error(t("addTagFailed"));
+    }
+  }
+
+  async function handleRemoveTag(tagId: number) {
+    if (!photo) {
+      return;
+    }
+    try {
+      await ipc.client.photos.removePhotoTag({ photoId: photo.id, tagId });
+      loadTags();
+      window.dispatchEvent(new CustomEvent("tags-changed"));
+    } catch {
+      toast.error(t("removeTagFailed"));
+    }
+  }
+
+  async function handleConfirmTag(tagId: number) {
+    if (!photo) {
+      return;
+    }
+    try {
+      await ipc.client.photos.confirmPhotoTag({ photoId: photo.id, tagId });
+      loadTags();
+    } catch {
+      toast.error(t("confirmTagFailed"));
+    }
+  }
+
+  async function handleCreateTag() {
+    const name = newTagName.trim();
+    if (!(name && photo)) {
+      return;
+    }
+    try {
+      const created = await ipc.client.photos.addTag({
+        name,
+        color: getTagColor(name),
+      });
+      const tag = created as TagInfo;
+      await ipc.client.photos.setPhotoTag({
+        photoId: photo.id,
+        tagId: tag.id,
+      });
+      setNewTagName("");
+      setShowTagInput(false);
+      setShowAllTags(false);
+      loadTags();
+      window.dispatchEvent(new CustomEvent("tags-changed"));
+    } catch {
+      toast.error(t("createTagFailed"));
+    }
+  }
+
+  async function handleAiSuggest() {
+    if (!photo) {
+      return;
+    }
+    const requestId = ++aiSuggestionRequestRef.current;
+    const photoId = photo.id;
+    setAiLoading(true);
+    setAiSuggestions(null);
+    try {
+      const result = await ipc.client.photos.suggestTags({ id: photoId });
+      if (aiSuggestionRequestRef.current !== requestId) {
+        return;
+      }
+      const taskResult = result as {
+        busy?: boolean;
+        reason?: "indexing" | "tagging" | "busy";
+      };
+      if (taskResult.busy) {
+        setAiTagTaskState(taskResult.reason ?? "indexing");
+        return;
+      }
+      const suggestions =
+        (result as { suggestions?: Array<{ tag: string; confidence: number }> })
+          ?.suggestions || [];
+      setAiSuggestions(suggestions);
+      // Cache the result
+      if (suggestions.length > 0) {
+        suggestionCache.set(photoId, suggestions);
+        // Limit cache size to 20
+        if (suggestionCache.size > SUGGESTION_CACHE_MAX) {
+          const firstKey = suggestionCache.keys().next().value;
+          if (firstKey !== undefined) {
+            suggestionCache.delete(firstKey);
+          }
+        }
+      }
+    } catch {
+      if (aiSuggestionRequestRef.current === requestId) {
+        toast.error(t("aiSuggestFailed"));
+        setAiSuggestions([]);
+      }
+    } finally {
+      if (aiSuggestionRequestRef.current === requestId) {
+        setAiLoading(false);
+      }
+    }
+  }
+
+  async function handleApplySuggestion(tagName: string) {
+    if (!photo) {
+      return;
+    }
+    const requestId = ++aiSuggestionRequestRef.current;
+    const photoId = photo.id;
+    try {
+      const existing = allTags.find((t) => t.name === tagName);
+      if (existing) {
+        if (!photoTagIds.has(existing.id)) {
+          await ipc.client.photos.setPhotoTag({
+            photoId,
+            tagId: existing.id,
+          });
+        }
+      } else {
+        const created = await ipc.client.photos.addTag({
+          name: tagName,
+          color: getTagColor(tagName),
+        });
+        const tag = created as TagInfo;
+        await ipc.client.photos.setPhotoTag({
+          photoId,
+          tagId: tag.id,
+        });
+      }
+      if (aiSuggestionRequestRef.current !== requestId) {
+        return;
+      }
+      loadTags();
+      window.dispatchEvent(new CustomEvent("tags-changed"));
+      setAiSuggestions((prev) =>
+        prev ? prev.filter((s) => s.tag !== tagName) : null
+      );
+    } catch {
+      if (aiSuggestionRequestRef.current === requestId) {
+        toast.error(t("applySuggestionFailed"));
+      }
+    }
+  }
+
+  function handleTagInputKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      handleCreateTag();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setShowTagInput(false);
+      setNewTagName("");
+      setShowAllTags(false);
+    }
+  }
+
+  const sortedTags = [...allTags].sort(
+    (a, b) =>
+      (b.photoCount ?? 0) - (a.photoCount ?? 0) || a.name.localeCompare(b.name)
+  );
+  const photoTagIds = new Set(photoTags.map((t) => t.id));
+  const unassignedTags = sortedTags.filter((tag) => !photoTagIds.has(tag.id));
+  const parentTagIds = new Set(
+    allTags.flatMap((tag) => (tag.parentId == null ? [] : [tag.parentId]))
+  );
+  const unassignedLeafTags = unassignedTags.filter(
+    (tag) => !parentTagIds.has(tag.id)
+  );
+  const normalizedTagQuery = newTagName.trim().toLocaleLowerCase();
+  const matchingTags = normalizedTagQuery
+    ? sortedTags
+        .filter((tag) => {
+          const rawName = tag.name.toLocaleLowerCase();
+          const displayName = getTagDisplayName(
+            tag.name,
+            i18n.language
+          ).toLocaleLowerCase();
+          return (
+            rawName.includes(normalizedTagQuery) ||
+            displayName.includes(normalizedTagQuery)
+          );
+        })
+        .sort((a, b) => {
+          const getMatchRank = (tag: TagInfo) => {
+            const names = [
+              tag.name.toLocaleLowerCase(),
+              getTagDisplayName(tag.name, i18n.language).toLocaleLowerCase(),
+            ];
+            if (names.some((name) => name === normalizedTagQuery)) {
+              return 0;
+            }
+            if (names.some((name) => name.startsWith(normalizedTagQuery))) {
+              return 1;
+            }
+            return 2;
+          };
+          return (
+            getMatchRank(a) - getMatchRank(b) ||
+            (b.photoCount ?? 0) - (a.photoCount ?? 0) ||
+            a.name.localeCompare(b.name)
+          );
+        })
+    : [];
+  const tagCandidates = normalizedTagQuery
+    ? matchingTags
+    : showAllTags
+      ? unassignedTags
+      : unassignedLeafTags;
+  const visibleTagCandidates = showAllTags
+    ? tagCandidates
+    : tagCandidates.slice(0, 8);
+  const canExpandTags = normalizedTagQuery
+    ? matchingTags.length > 8
+    : unassignedTags.length > Math.min(unassignedLeafTags.length, 8);
+  const expandedTagCount = normalizedTagQuery
+    ? matchingTags.length
+    : unassignedTags.length;
+  let aiTagTaskLabel = t("tagAnalysisIndexing");
+  if (aiTagTaskState === "tagging") {
+    aiTagTaskLabel = t("tagAnalysisRunning");
+  } else if (aiTagTaskState === "busy") {
+    aiTagTaskLabel = t("tagAnalysisBusy");
+  }
+
+  if (!displayPhoto) {
+    return null;
+  }
+
+  const dateStr = exif?.dateTaken
+    ? new Date(exif.dateTaken).toLocaleDateString(
+        getDateLocale(i18n.language),
+        {
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+        }
+      )
+    : null;
+
+  const dirPath = displayPhoto.path.replace(DIRECTORY_PATH_REGEX, "");
+
+  return (
+    <div
+      className="photo-detail-panel-shell h-full shrink-0 overflow-hidden"
+      style={{ width: visible ? panelWidth : 0 }}
+    >
+      <div
+        className={`glass-surface-heavy relative flex h-full flex-col border-border border-l transition-all duration-300 ${
+          visible ? "translate-x-0 opacity-100" : "translate-x-12 opacity-0"
+        }`}
+        data-surface="inspector"
+        ref={panelRef}
+        style={{
+          width: panelWidth,
+          transitionTimingFunction: "cubic-bezier(0.16, 1, 0.3, 1)",
+        }}
+      >
+        {/* Resize handle — drag left edge to resize */}
+        <div
+          className={`photo-detail-panel-resize-handle absolute top-0 -left-0.5 z-10 h-full w-1 cursor-col-resize transition-colors ${
+            resizing ? "bg-primary" : "hover:bg-primary/50"
+          }`}
+          onMouseDown={handleResizeStart}
+        />
+        {/* Header */}
+        <div className="flex items-center justify-between border-border border-b px-4 py-3">
+          <h3 className="font-semibold text-[14px] text-foreground">
+            {t("photoDetail")}
+          </h3>
+          <div className="flex items-center gap-1">
+            {onReturnToSequence && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    aria-label={t("returnToSequence")}
+                    className="flex h-6 w-6 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+                    onClick={onReturnToSequence}
+                    type="button"
+                  >
+                    <ArrowLeft className="h-4 w-4" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>{t("returnToSequence")}</TooltipContent>
+              </Tooltip>
+            )}
+            {onNavigate && (
+              <>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      aria-label={t("previousPhoto")}
+                      className="flex h-6 w-6 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+                      onClick={() => onNavigate("prev")}
+                      type="button"
+                    >
+                      <ChevronUp className="h-4 w-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("previousPhoto")}</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      aria-label={t("nextPhoto")}
+                      className="flex h-6 w-6 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+                      onClick={() => onNavigate("next")}
+                      type="button"
+                    >
+                      <ChevronDown className="h-4 w-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("nextPhoto")}</TooltipContent>
+                </Tooltip>
+              </>
+            )}
+            <button
+              className="flex h-6 w-6 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+              onClick={onClose}
+              type="button"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Preview image */}
+        <div
+          className="border-border border-b bg-background p-4"
+          data-surface="media-well"
+        >
+          <div className="photo-detail-preview flex h-[200px] items-center justify-center overflow-hidden rounded-[6px] bg-muted">
+            <img
+              alt={displayPhoto.filename}
+              className={`max-h-full max-w-full object-contain transition-opacity duration-150 ${
+                loadedPreviewId === displayPhoto.id
+                  ? "opacity-100"
+                  : "opacity-0"
+              }`}
+              height={displayPhoto.height || undefined}
+              key={displayPhoto.id}
+              onLoad={() => setLoadedPreviewId(displayPhoto.id)}
+              src={toLocalMediaUrl(
+                displayPhoto.thumbnailPath ?? displayPhoto.path
+              )}
+              width={displayPhoto.width || undefined}
+            />
+          </div>
+        </div>
+
+        {/* Content */}
+        <div
+          className="resource-tree-scroll flex-1 space-y-4 overflow-y-auto p-4"
+          data-bottom-fade={hasMoreBelow}
+          onScroll={updateBottomFade}
+          ref={contentScrollRef}
+        >
+          {/* Basic Info */}
+          <section>
+            <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
+              {t("photoInfo")}
+            </h4>
+            <div className="space-y-1.5">
+              <InfoRow label={t("filePath")} value={displayPhoto.filename} />
+              <InfoRow
+                label={t("dimensions")}
+                value={`${displayPhoto.width} × ${displayPhoto.height}`}
+              />
+              <InfoRow
+                label={t("fileSize")}
+                value={formatFileSize(displayPhoto.fileSize)}
+              />
+              {dateStr && <InfoRow label={t("dateTaken")} value={dateStr} />}
+            </div>
+          </section>
+
+          {/* Tags */}
+          <section>
+            <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
+              {t("sidebarTags")}
+            </h4>
+            <div className="flex flex-wrap gap-1.5">
+              {photoTags.map((tag) => {
+                const unconfirmed = tag.isConfirmed === false;
+                return (
+                  <span
+                    className="group relative flex items-center gap-0.5"
+                    key={tag.id}
+                  >
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          aria-label={
+                            unconfirmed
+                              ? t("aiSuggestionConfirm", {
+                                  confidence: tag.confidence
+                                    ? `${Math.round(tag.confidence * 100)}%`
+                                    : "",
+                                })
+                              : t("clickToRemove")
+                          }
+                          className={`flex items-center gap-0.5 rounded-[4px] px-1.5 py-0.5 text-[11px] ${
+                            unconfirmed
+                              ? "border border-foreground/30 border-dashed bg-foreground/5 text-foreground"
+                              : "text-white/90 hover:opacity-80"
+                          }`}
+                          onClick={() =>
+                            unconfirmed
+                              ? handleConfirmTag(tag.id)
+                              : handleRemoveTag(tag.id)
+                          }
+                          style={
+                            unconfirmed
+                              ? undefined
+                              : { background: tag.color || "var(--primary)" }
+                          }
+                          type="button"
+                        >
+                          {getTagDisplayName(tag.name, i18n.language)}
+                          {unconfirmed ? (
+                            <span className="ml-0.5 text-[10px] opacity-60">
+                              ?
+                            </span>
+                          ) : (
+                            <X className="h-2.5 w-2.5 opacity-60" />
+                          )}
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {unconfirmed
+                          ? t("aiSuggestionConfirm", {
+                              confidence: tag.confidence
+                                ? `${Math.round(tag.confidence * 100)}%`
+                                : "",
+                            })
+                          : t("clickToRemove")}
+                      </TooltipContent>
+                    </Tooltip>
+                    {unconfirmed && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button
+                            aria-label={t("remove")}
+                            className="absolute -top-1 -right-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-muted text-muted-foreground/70 opacity-0 transition-opacity hover:bg-destructive hover:text-white group-hover:opacity-100"
+                            onClick={() => handleRemoveTag(tag.id)}
+                            type="button"
+                          >
+                            <X className="h-2 w-2" />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent>{t("remove")}</TooltipContent>
+                      </Tooltip>
+                    )}
+                  </span>
+                );
+              })}
+              <button
+                className="rounded-[4px] border border-input border-dashed px-1.5 py-0.5 text-[11px] text-muted-foreground/70 hover:border-muted-foreground hover:text-muted-foreground"
+                onClick={() => {
+                  setShowTagInput(true);
+                  setShowAllTags(false);
+                }}
+                type="button"
+              >
+                + {t("addTag")}
+              </button>
+            </div>
+            <p className="mt-2 text-[10px] text-muted-foreground/60 [overflow-wrap:anywhere]">
+              {t("photoTagsLocalOnly")}
+            </p>
+
+            {/* Tag suggestions / create new */}
+            {showTagInput && (
+              <div className="mt-2">
+                {normalizedTagQuery && (
+                  <p
+                    aria-live="polite"
+                    className="mb-1.5 text-[10px] text-muted-foreground/70"
+                  >
+                    {matchingTags.length > 0
+                      ? t("tagPickerMatches", {
+                          count: matchingTags.length,
+                        })
+                      : t("tagPickerNoMatches")}
+                  </p>
+                )}
+                {visibleTagCandidates.length > 0 && (
+                  <div className="mb-2 flex flex-wrap gap-1">
+                    {visibleTagCandidates.map((tag) => {
+                      const isAlreadyAdded = photoTagIds.has(tag.id);
+                      return (
+                        <button
+                          aria-disabled={isAlreadyAdded}
+                          className={`rounded-[4px] px-1.5 py-0.5 text-[10px] text-white/70 ${
+                            isAlreadyAdded
+                              ? "cursor-default opacity-50"
+                              : "hover:opacity-90"
+                          }`}
+                          key={tag.id}
+                          onClick={() => {
+                            if (isAlreadyAdded) {
+                              return;
+                            }
+                            handleAddTag(tag.id);
+                            setShowTagInput(false);
+                            setShowAllTags(false);
+                          }}
+                          style={{
+                            background: tag.color
+                              ? `${tag.color}66`
+                              : "rgba(94,106,210,0.4)",
+                          }}
+                          type="button"
+                        >
+                          {getTagDisplayName(tag.name, i18n.language)}
+                          {normalizedTagQuery && isAlreadyAdded && (
+                            <span className="ml-1 opacity-80">
+                              · {t("tagPickerAlreadyAdded")}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                    {canExpandTags && (
+                      <button
+                        className="rounded-[4px] border border-input border-dashed px-1.5 py-0.5 text-[10px] text-muted-foreground/70 hover:border-muted-foreground hover:text-muted-foreground"
+                        onClick={() => setShowAllTags((previous) => !previous)}
+                        type="button"
+                      >
+                        {showAllTags
+                          ? t("tagPickerCollapse")
+                          : t("tagPickerViewAll", {
+                              count: expandedTagCount,
+                            })}
+                      </button>
+                    )}
+                  </div>
+                )}
+                <div className="flex items-center gap-1">
+                  <SmoothInput
+                    className="h-7 rounded-[4px] border border-input bg-card px-2 text-[12px] text-foreground outline-none placeholder:text-muted-foreground/70 focus:border-primary"
+                    onChange={(e) => {
+                      setNewTagName(e.target.value);
+                      setShowAllTags(false);
+                    }}
+                    onKeyDown={handleTagInputKeyDown}
+                    placeholder={t("newTagPlaceholder")}
+                    ref={tagInputRef}
+                    value={newTagName}
+                    wrapperClassName="flex-1"
+                  />
+                  <button
+                    aria-label={t("addTag")}
+                    className="flex h-7 w-7 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-foreground/5 hover:text-foreground disabled:opacity-30"
+                    disabled={!newTagName.trim()}
+                    onClick={handleCreateTag}
+                    type="button"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+
+          {/* AI Tag Suggestions */}
+          <section>
+            <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
+              {t("aiSuggestionTitle")}
+            </h4>
+            {aiTagTaskState === "checking" ||
+            aiTagTaskState === "indexing" ||
+            aiTagTaskState === "tagging" ||
+            aiTagTaskState === "busy" ? (
+              <div className="flex items-center gap-2 py-2">
+                <LoadingSpinner size="sm" />
+                <span className="text-[11px] text-muted-foreground/70">
+                  {aiTagTaskLabel}
+                </span>
+              </div>
+            ) : aiSuggestions === null && !aiLoading ? (
+              <button
+                className="flex items-center gap-1.5 rounded-[6px] border border-input px-3 py-1.5 text-[12px] text-muted-foreground transition-colors hover:border-primary/40 hover:text-primary"
+                onClick={handleAiSuggest}
+                type="button"
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                {t("analyzeSuggestedTags")}
+              </button>
+            ) : aiLoading ? (
+              <div className="flex items-center gap-2 py-2">
+                <LoadingSpinner size="sm" />
+                <span className="text-[11px] text-muted-foreground/70">
+                  {t("aiAnalyzing")}
+                </span>
+              </div>
+            ) : aiSuggestions?.length === 0 ? (
+              <div className="flex items-center gap-2">
+                <p className="text-[11px] text-muted-foreground/70">
+                  {t("noSuggestedTags")}
+                </p>
+                <button
+                  className="text-[11px] text-primary hover:underline"
+                  onClick={() => {
+                    setAiSuggestions(null);
+                  }}
+                  type="button"
+                >
+                  {t("retry")}
+                </button>
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {aiSuggestions?.map((s) => {
+                  const alreadyApplied = photoTagIds.has(
+                    allTags.find((t) => t.name === s.tag)?.id ?? -1
+                  );
+                  return (
+                    <Tooltip key={s.tag}>
+                      <TooltipTrigger asChild>
+                        <button
+                          aria-label={t("confidence", {
+                            value: Math.round(s.confidence * 100),
+                          })}
+                          className={`rounded-[4px] px-1.5 py-0.5 text-[11px] transition-opacity hover:opacity-80 ${alreadyApplied ? "cursor-default opacity-30" : ""}`}
+                          disabled={alreadyApplied}
+                          onClick={() => handleApplySuggestion(s.tag)}
+                          type="button"
+                        >
+                          <span
+                            className="rounded-[4px] px-1 py-0.5"
+                            style={{
+                              background: alreadyApplied
+                                ? "rgba(255,255,255,0.08)"
+                                : `rgba(94,106,210,${0.3 + s.confidence * 0.6})`,
+                            }}
+                          >
+                            {getTagDisplayName(s.tag, i18n.language)}
+                          </span>
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {t("confidence", {
+                          value: Math.round(s.confidence * 100),
+                        })}
+                      </TooltipContent>
+                    </Tooltip>
+                  );
+                })}
+              </div>
+            )}
+            <p className="mt-2 text-[10px] text-muted-foreground/50">
+              {t("aiTagDisclaimer")}
+            </p>
+          </section>
+
+          {/* EXIF and maker metadata */}
+          {/* 自用精简版：隐藏照片详情里的 EXIF 区块（见 src/config/private-build.ts） */}
+          {!PRIVATE_BUILD.hideExifFilter && (loading ? (
+            <section>
+              <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
+                {t("exifInfo")}
+              </h4>
+              <div className="flex items-center justify-center py-6">
+                <LoadingSpinner size="md" />
+              </div>
+            </section>
+          ) : exif ? (
+            <section>
+              <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
+                {t("exifInfo")}
+              </h4>
+              <div className="space-y-1.5">
+                {exif.cameraModel && (
+                  <InfoRow
+                    label={t("camera")}
+                    value={
+                      exif.cameraMake
+                        ? `${exif.cameraMake} ${exif.cameraModel}`
+                        : exif.cameraModel
+                    }
+                  />
+                )}
+                {(exif.lensModel || exif.lensMake) && (
+                  <InfoRow
+                    label={t("lens")}
+                    value={
+                      [exif.lensMake, exif.lensModel]
+                        .filter(Boolean)
+                        .join(" ") || "—"
+                    }
+                  />
+                )}
+                {exif.focalLength && (
+                  <InfoRow
+                    label={t("focalLength")}
+                    value={`${exif.focalLength}mm`}
+                  />
+                )}
+                {exif.aperture && (
+                  <InfoRow label={t("aperture")} value={`f/${exif.aperture}`} />
+                )}
+                {exif.shutterSpeed && (
+                  <InfoRow
+                    label={t("shutter")}
+                    value={`${exif.shutterSpeed}s`}
+                  />
+                )}
+                {exif.iso && (
+                  <InfoRow label={t("iso")} value={exif.iso.toString()} />
+                )}
+                {exif.gpsLatitude && exif.gpsLongitude && (
+                  <InfoRow
+                    label="GPS"
+                    value={`${exif.gpsLatitude.toFixed(4)}, ${exif.gpsLongitude.toFixed(4)}`}
+                  />
+                )}
+                {exif.software && (
+                  <InfoRow label="Software" value={exif.software} />
+                )}
+              </div>
+              {exif.advanced && (
+                <details
+                  className="mt-4 border-border border-t pt-4"
+                  onToggle={(event) => {
+                    const expanded = event.currentTarget.open;
+                    setAdvancedMetadataExpanded(expanded);
+                    savePhotoDetailAdvancedMetadataExpanded(expanded);
+                  }}
+                  open={advancedMetadataExpanded}
+                >
+                  <summary className="flex cursor-pointer select-none list-none items-center justify-between gap-2">
+                    <span className="font-medium text-[11px] text-foreground">
+                      {t("advancedMetadata")}
+                    </span>
+                    <span className="flex items-center gap-2">
+                      {exif.advanced.vendor && (
+                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[9px] text-primary">
+                          {exif.advanced.vendor} MakerNote
+                        </span>
+                      )}
+                      <ChevronDown
+                        aria-hidden="true"
+                        className={`h-3.5 w-3.5 transition-transform ${advancedMetadataExpanded ? "rotate-180" : ""}`}
+                      />
+                    </span>
+                  </summary>
+                  <div className="mt-4 space-y-4">
+                    <MetadataGroup
+                      data={{
+                        ...exif.advanced.standard,
+                        ...exif.advanced.capture,
+                      }}
+                      title={t("metadataCapture")}
+                    />
+                    <MetadataGroup
+                      data={exif.advanced.autofocus}
+                      title={t("metadataAutofocus")}
+                    />
+                    <MetadataGroup
+                      data={exif.advanced.processing}
+                      title={t("metadataProcessing")}
+                    />
+                    <MetadataGroup
+                      data={exif.advanced.workflow}
+                      title={t("metadataWorkflow")}
+                    />
+                    <MetadataGroup
+                      data={exif.advanced.provenance}
+                      provenance
+                      title={t("metadataProvenance")}
+                    />
+                  </div>
+                </details>
+              )}
+            </section>
+          ) : (
+            <section>
+              <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
+                {t("exifInfo")}
+              </h4>
+              <p className="text-[12px] text-muted-foreground/70">
+                {t("noExifData")}
+              </p>
+            </section>
+          ))}
+
+          {/* File Location */}
+          <section>
+            <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
+              {t("filePath")}
+            </h4>
+            <p className="mb-2 truncate text-[11px] text-muted-foreground">
+              {dirPath}
+            </p>
+            <button
+              className="flex min-w-0 max-w-full items-center gap-1.5 rounded-[6px] border border-input px-3 py-1.5 text-[12px] text-muted-foreground transition-colors hover:border-muted-foreground hover:text-foreground"
+              onClick={() => onOpenExplorer(displayPhoto.path)}
+              type="button"
+            >
+              <FolderOpen className="h-3.5 w-3.5" />
+              {t("openInExplorer")}
+            </button>
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex min-w-0 items-start justify-between gap-2">
+      <span className="flex-shrink-0 text-[11px] text-muted-foreground/70">
+        {label}
+      </span>
+      <span className="min-w-0 truncate text-right text-[11px] text-muted-foreground">
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function getStarRating(value: unknown): number {
+  const rating = Number.parseFloat(String(value));
+  if (!Number.isFinite(rating) || rating <= 0) {
+    return 0;
+  }
+  if (rating <= 5) {
+    return Math.min(5, Math.round(rating));
+  }
+  if (rating >= 99) {
+    return 5;
+  }
+  if (rating >= 75) {
+    return 4;
+  }
+  if (rating >= 50) {
+    return 3;
+  }
+  if (rating >= 25) {
+    return 2;
+  }
+  return 1;
+}
+
+function RatingStars({ value }: { value: unknown }) {
+  const rating = getStarRating(value);
+  return (
+    <span
+      aria-label={`${rating} / 5`}
+      className="flex items-center gap-0.5 text-amber-400"
+      role="img"
+    >
+      {[1, 2, 3, 4, 5].map((star) => (
+        <Star
+          aria-hidden="true"
+          className="h-3 w-3"
+          fill={star <= rating ? "currentColor" : "none"}
+          key={star}
+        />
+      ))}
+    </span>
+  );
+}
+
+const METADATA_LABEL_KEYS: Record<string, string> = {
+  burstSequence: "metadataBurstSequence",
+  captureMode: "metadataCaptureMode",
+  computationalMode: "metadataComputationalMode",
+  copyright: "metadataCopyright",
+  driveMode: "metadataDriveMode",
+  exposureProgram: "metadataExposureProgram",
+  eyeDetection: "metadataEyeDetection",
+  flashMode: "metadataFlashMode",
+  focusArea: "metadataFocusArea",
+  focusMode: "metadataFocusMode",
+  inCameraLook: "metadataInCameraLook",
+  issuer: "metadataIssuer",
+  lensCorrection: "metadataLensCorrection",
+  meteringMode: "metadataMeteringMode",
+  protection: "metadataProtection",
+  rating: "metadataRating",
+  software: "metadataSoftware",
+  stabilizationMode: "metadataStabilization",
+  status: "metadataCredentialStatus",
+  subjectTarget: "metadataSubjectTarget",
+  tracking: "metadataTracking",
+  whiteBalance: "metadataWhiteBalance",
+};
+
+function formatMetadataValue(value: unknown): string {
+  if (typeof value === "boolean") {
+    return value ? "✓" : "—";
+  }
+  if (value == null) {
+    return "—";
+  }
+  if (typeof value === "object") {
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function MetadataGroup({
+  data,
+  provenance = false,
+  title,
+}: {
+  data: Record<string, unknown>;
+  provenance?: boolean;
+  title: string;
+}) {
+  const { t } = useTranslation();
+  const rows = Object.entries(data).filter(
+    ([, value]) => value !== null && value !== undefined && value !== ""
+  );
+  if (rows.length === 0) {
+    return null;
+  }
+  return (
+    <section>
+      <h5 className="mb-1.5 font-medium text-[10px] text-muted-foreground/70 uppercase tracking-wider">
+        {title}
+      </h5>
+      <div className="space-y-1.5">
+        {rows.map(([key, value]) => {
+          let displayValue: React.ReactNode = formatMetadataValue(value);
+          if (key === "rating") {
+            displayValue = <RatingStars value={value} />;
+          } else if (provenance && key === "status") {
+            displayValue = t(`metadataProvenance_${String(value)}`);
+          }
+          return (
+            <InfoRow
+              key={key}
+              label={t(METADATA_LABEL_KEYS[key] ?? key)}
+              value={displayValue}
+            />
+          );
+        })}
+      </div>
+      {provenance && data.status === "present_unverified" && (
+        <p className="mt-2 text-[9px] text-warning">
+          {t("metadataProvenanceDisclaimer")}
+        </p>
+      )}
+    </section>
+  );
+}
+
+// Deterministic color from tag name
+function getTagColor(name: string): string {
+  const colors = [
+    "#5e6ad2",
+    "#46a758",
+    "#ffb224",
+    "#e5484d",
+    "#7c7fe0",
+    "#3b9ec6",
+    "#d97a3e",
+    "#a855f7",
+  ];
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + hash * 31;
+  }
+  return colors[Math.abs(hash) % colors.length];
+}

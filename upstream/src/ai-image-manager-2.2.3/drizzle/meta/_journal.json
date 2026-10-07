@@ -1,0 +1,377 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1778334717065,
+      "tag": "0000_green_tempest",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1778500167933,
+      "tag": "0001_red_rawhide_kid",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1778501067543,
+      "tag": "0002_amused_nehzno",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1778630607370,
+      "tag": "0003_fair_shaman",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1778666018066,
+      "tag": "0004_ancient_lady_deathstrike",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1778674101634,
+      "tag": "0005_bizarre_colonel_america",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1778681515082,
+      "tag": "0006_bright_loners",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1778751557915,
+      "tag": "0007_yummy_spiral",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1778814654255,
+      "tag": "0008_organic_skreet",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1778815323011,
+      "tag": "0009_thick_robbie_robertson",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1779597075986,
+      "tag": "0010_zippy_azazel",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1779861876715,
+      "tag": "0011_robust_eternity",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1779993600000,
+      "tag": "0012_add_cull_pk_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1780100000000,
+      "tag": "0013_add_sort_strategy",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1785000000000,
+      "tag": "0014_add_cull_composite_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1785100000000,
+      "tag": "0015_add_face_processed",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1785200000000,
+      "tag": "0016_add_face_vectors_is_rejected",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1785300000000,
+      "tag": "0017_add_exif_perf_indexes",
+      "breakpoints": false
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1785400000000,
+      "tag": "0018_normalize_exif_numeric",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1785500000000,
+      "tag": "0019_add_exif_composite_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1785600000000,
+      "tag": "0020_add_dominant_colors",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1785700000000,
+      "tag": "0021_add_folder_parent_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1785800000000,
+      "tag": "0022_fix_raw_format",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1785900000000,
+      "tag": "0023_fix_shutter_speed_num",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1786000000000,
+      "tag": "0024_fix_orientation_dimensions",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1786100000000,
+      "tag": "0025_add_face_perf_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1786200000000,
+      "tag": "0026_add_duel_preview_path",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1786300000000,
+      "tag": "0027_backfill_camera_model",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1786400000000,
+      "tag": "0028_backfill_camera_make",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1786500000000,
+      "tag": "0029_add_photos_composite_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1786500000001,
+      "tag": "0030_add_search_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1786500000002,
+      "tag": "0031_add_color_bucket",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1786500000003,
+      "tag": "0032_familiar_bulldozer",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1786500000004,
+      "tag": "0033_keen_dakota_north",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1786500000010,
+      "tag": "0034_add_photo_sequences",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "6",
+      "when": 1786500000011,
+      "tag": "0035_add_photo_sequence_suggestions",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1786500000012,
+      "tag": "0036_add_photo_tag_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1786500000013,
+      "tag": "0037_add_face_identity_exclusions",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1786500000014,
+      "tag": "0038_add_hidden_face_identities",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "6",
+      "when": 1786500000015,
+      "tag": "0039_add_face_review_decisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "6",
+      "when": 1786500000016,
+      "tag": "0040_unique_face_identity_member_vector",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "6",
+      "when": 1786500000017,
+      "tag": "0041_add_face_processing_error",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "6",
+      "when": 1786500000018,
+      "tag": "0042_add_photo_view_stats",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1786500000019,
+      "tag": "0043_repair_fts5_search",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "6",
+      "when": 1787714603153,
+      "tag": "0044_add_plugin_persistence",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "6",
+      "when": 1789732677107,
+      "tag": "0045_duplicate_photo_fingerprints",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "6",
+      "when": 1789733560276,
+      "tag": "0046_duplicate_review_state",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "6",
+      "when": 1789734071284,
+      "tag": "0047_duplicate_cleanup_plans",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "6",
+      "when": 1789789489050,
+      "tag": "0048_duplicate_cleanup_plan_audit_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "6",
+      "when": 1789813021191,
+      "tag": "0049_duplicate_cleanup_plan_match_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "6",
+      "when": 1789815250774,
+      "tag": "0050_duplicate_detection_runs",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "6",
+      "when": 1789815818967,
+      "tag": "0051_duplicate_deletion_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "6",
+      "when": 1789816495406,
+      "tag": "0052_duplicate_run_fingerprint",
+      "breakpoints": true
+    }
+  ]
+}

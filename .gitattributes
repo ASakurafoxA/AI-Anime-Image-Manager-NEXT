@@ -1,0 +1,40 @@
+# 换行与二进制：统一按内容自动判断，文本一律 LF 存储
+# （这套自用改动是在 Windows 上做的，曾经因为一行 CRLF 导致补丁验收 71/72 不一致，
+#   所以这里显式钉死，避免换行风格漂移）
+* text=auto eol=lf
+
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+*.css  text eol=lf
+*.md   text eol=lf
+*.py   text eol=lf
+*.patch text eol=lf
+
+# 二进制（不做换行转换，也不参与 diff）
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.webp   binary
+*.gif    binary
+*.ico    binary
+*.icns   binary
+*.bmp    binary
+*.onnx   binary
+*.bin    binary
+*.zip    binary
+*.7z     binary
+*.msi    binary
+*.nupkg  binary
+*.exe    binary
+*.dll    binary
+*.node   binary
+*.dylib  binary
+*.so     binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary
+*.otf    binary

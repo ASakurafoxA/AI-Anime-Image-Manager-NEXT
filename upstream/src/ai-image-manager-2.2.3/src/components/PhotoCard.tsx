@@ -1,0 +1,687 @@
+// biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: scoped component lint cleanup preserves existing UI behavior
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import type { SearchMatch } from "@/types/photo";
+import { PRIVATE_BUILD } from "@/config/private-build";
+import { recordGalleryMediaStat } from "@/utils/gallery-perf";
+import { toLocalMediaUrl } from "@/utils/local-media-url";
+import { RecentlyViewedBadge } from "./RecentlyViewedBadge";
+
+export interface FaceOverlay {
+  height: number;
+  label?: string;
+  width: number;
+  x: number;
+  y: number;
+}
+
+export function getFaceOverlayStyle(
+  faceOverlay: FaceOverlay,
+  photoWidth: number,
+  photoHeight: number,
+  containerAspect: number
+): React.CSSProperties {
+  const imageAspect = photoWidth / Math.max(photoHeight, 1);
+  if (imageAspect > containerAspect) {
+    const renderedWidth = imageAspect / containerAspect;
+    const crop = (renderedWidth - 1) / 2;
+    return {
+      height: `${Math.max(0, faceOverlay.height) * 100}%`,
+      left: `${(faceOverlay.x * renderedWidth - crop) * 100}%`,
+      top: `${Math.max(0, faceOverlay.y) * 100}%`,
+      width: `${Math.max(0, faceOverlay.width) * renderedWidth * 100}%`,
+    };
+  }
+  const renderedHeight = containerAspect / imageAspect;
+  const crop = (renderedHeight - 1) / 2;
+  return {
+    height: `${Math.max(0, faceOverlay.height) * renderedHeight * 100}%`,
+    left: `${Math.max(0, faceOverlay.x) * 100}%`,
+    top: `${(faceOverlay.y * renderedHeight - crop) * 100}%`,
+    width: `${Math.max(0, faceOverlay.width) * 100}%`,
+  };
+}
+
+interface PhotoCardProps {
+  deleting?: boolean;
+  disableDrag?: boolean;
+  dominantColors?: string | null;
+  faceOverlay?: FaceOverlay;
+  faceOverlays?: FaceOverlay[];
+  faceOverlaysVisible?: boolean;
+  filename: string;
+  getDragIds?: (id: number) => number[];
+  height: number;
+  id: number;
+  isFavorite?: boolean;
+  isSelected: boolean;
+  loading?: "eager" | "lazy";
+  match?: SearchMatch;
+  onClick: (id: number, event: React.MouseEvent) => void;
+  onDoubleClick: (id: number) => void;
+  onNameFace?: (id: number) => void;
+  onToggleFavorite?: (id: number) => void;
+  path: string;
+  recentlyViewed?: boolean;
+  recentlyViewedPulseActive?: boolean;
+  recentlyViewedPulseKey?: number;
+  renderImage?: boolean;
+  searchQuery?: string;
+  selectionInset?: boolean;
+  /** 本次语义搜索最佳匹配的原始余弦相似度，用于把 score 归一化为相对百分比（最佳=100%） */
+  semanticTopSimilarity?: number;
+  thumbnailPath: string | null;
+  thumbnailSmallPath?: string | null;
+  width: number;
+}
+
+interface PhotoCardImageProps {
+  draggable?: boolean;
+  filename: string;
+  hasThumbnail: boolean;
+  height: number;
+  loading: "eager" | "lazy";
+  onError: () => void;
+  renderImage: boolean;
+  srcSet?: string;
+  url: string;
+  width: number;
+}
+
+const SINGLE_CLICK_DELAY_MS = 250;
+
+/**
+ * 向后兼容的无操作函数。
+ *
+ * 旧版 PhotoCard 使用自定义 imageLoadState 缓存来控制图片加载状态；
+ * 重构后完全依赖浏览器原生 HTTP 缓存和 <img> 生命周期。
+ * 保留此导出以避免现有 import 语句编译报错。
+ * 缓存刷新由 HTTP Cache-Control 头和 TanStack Query 的数据失效机制接管。
+ */
+export function clearImageLoadCache(): void {
+  // no-op：缓存由浏览器原生层和 QueryClient 管理
+}
+
+function HighlightText({ text, query }: { text: string; query?: string }) {
+  if (!query) {
+    return <>{text}</>;
+  }
+  const idx = text.toLowerCase().indexOf(query.toLowerCase());
+  if (idx === -1) {
+    return <>{text}</>;
+  }
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark className="rounded-[4px] bg-primary/40 text-foreground">
+        {text.slice(idx, idx + query.length)}
+      </mark>
+      {text.slice(idx + query.length)}
+    </>
+  );
+}
+
+function FaceOverlayBox({
+  containerAspect,
+  faceOverlay,
+  faceOverlaysVisible,
+  photoHeight,
+  photoWidth,
+}: {
+  containerAspect: number;
+  faceOverlay: FaceOverlay;
+  faceOverlaysVisible: boolean;
+  photoHeight: number;
+  photoWidth: number;
+}) {
+  return (
+    <div
+      aria-label={faceOverlay.label ?? "人脸位置"}
+      className={`pointer-events-none absolute rounded border-2 border-primary shadow-[0_0_0_1px_rgba(255,255,255,0.5)] transition-opacity duration-200 ${faceOverlaysVisible ? "opacity-100" : "opacity-0"}`}
+      role="img"
+      style={getFaceOverlayStyle(
+        faceOverlay,
+        photoWidth,
+        photoHeight,
+        containerAspect
+      )}
+    >
+      {faceOverlay.label && (
+        <span className="absolute -top-5 left-0 whitespace-nowrap rounded bg-primary px-1.5 py-0.5 text-[10px] text-primary-foreground">
+          {faceOverlay.label}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function PhotoCardImage({
+  draggable,
+  filename,
+  hasThumbnail,
+  height,
+  loading,
+  onError,
+  renderImage,
+  srcSet,
+  url,
+  width,
+}: PhotoCardImageProps) {
+  const [loaded, setLoaded] = useState(false);
+
+  if (!(hasThumbnail && renderImage)) {
+    return (
+      <div className="absolute inset-0 bg-muted/70">
+        <div className="absolute inset-0 bg-gradient-to-br from-foreground/[0.03] to-transparent" />
+      </div>
+    );
+  }
+
+  return (
+    // biome-ignore lint/a11y/noNoninteractiveElementInteractions: image load state controls the thumbnail reveal transition
+    <img
+      alt={filename}
+      className={`h-full w-full object-cover transition-opacity duration-150 motion-reduce:transition-none ${
+        loaded ? "opacity-100" : "opacity-0"
+      }`}
+      data-load-state={loaded ? "loaded" : "loading"}
+      decoding="async"
+      draggable={draggable}
+      fetchPriority={loading === "eager" ? "high" : "auto"}
+      height={height || undefined}
+      loading={loading}
+      onError={onError}
+      onLoad={() => setLoaded(true)}
+      sizes="(max-width: 900px) 160px, 220px"
+      src={url}
+      srcSet={srcSet}
+      width={width || undefined}
+    />
+  );
+}
+
+export const PhotoCard = memo(function PhotoCard({
+  id,
+  path,
+  disableDrag = false,
+  thumbnailPath,
+  thumbnailSmallPath,
+  loading = "lazy",
+  dominantColors,
+  filename,
+  width,
+  height,
+  isSelected,
+  getDragIds,
+  isFavorite,
+  deleting,
+  faceOverlay,
+  faceOverlays,
+  faceOverlaysVisible = true,
+  searchQuery,
+  selectionInset = false,
+  match,
+  semanticTopSimilarity,
+  renderImage = true,
+  recentlyViewed = false,
+  recentlyViewedPulseActive = false,
+  recentlyViewedPulseKey = 0,
+  onClick,
+  onDoubleClick,
+  onNameFace,
+  onToggleFavorite,
+}: PhotoCardProps) {
+  const { t } = useTranslation();
+  const hasThumbnail = Boolean(thumbnailPath);
+
+  // ── URL 计算 ──────────────────────────────────────────────────────
+  // toLocalMediaUrl 现在是同步函数（端口由 preload 在窗口创建时注入），
+  // URL 在组件生命周期内稳定不变。
+  const [retryCount, setRetryCount] = useState(0);
+  const url = useMemo(() => {
+    const base = thumbnailPath ? toLocalMediaUrl(thumbnailPath) : "";
+    return retryCount > 0 ? `${base}?retry=${retryCount}` : base;
+  }, [thumbnailPath, retryCount]);
+  const srcSet = useMemo(() => {
+    if (!(thumbnailSmallPath && thumbnailPath)) {
+      return undefined;
+    }
+    const smallUrl = toLocalMediaUrl(thumbnailSmallPath);
+    const mediumUrl = toLocalMediaUrl(thumbnailPath);
+    return `${smallUrl} 256w, ${mediumUrl} 512w`;
+  }, [thumbnailSmallPath, thumbnailPath]);
+
+  const [imgError, setImgError] = useState(false);
+  const [isRecentlyViewedPulseActive, setIsRecentlyViewedPulseActive] =
+    useState(false);
+
+  useEffect(() => {
+    const shouldPulse =
+      recentlyViewed &&
+      recentlyViewedPulseActive &&
+      recentlyViewedPulseKey >= 0;
+    if (!shouldPulse) {
+      setIsRecentlyViewedPulseActive(false);
+      return;
+    }
+
+    setIsRecentlyViewedPulseActive(true);
+    const timeout = window.setTimeout(() => {
+      setIsRecentlyViewedPulseActive(false);
+    }, 1500);
+    return () => window.clearTimeout(timeout);
+  }, [recentlyViewed, recentlyViewedPulseActive, recentlyViewedPulseKey]);
+
+  // ── 主色提取 ──────────────────────────────────────────────────────
+  const bgColor = useMemo(() => {
+    if (!dominantColors) {
+      return undefined;
+    }
+    try {
+      const colors: { hex: string; weight: number }[] =
+        JSON.parse(dominantColors);
+      if (colors.length > 0) {
+        return colors[0].hex;
+      }
+    } catch {
+      /* corrupt JSON — fall back */
+    }
+    return undefined;
+  }, [dominantColors]);
+
+  const searchMatchLabel = useMemo(() => {
+    if (!match) {
+      return null;
+    }
+    // 相对本次搜索最佳匹配归一化（最佳=100%），避免 SigLIP 原始余弦
+    // 绝对分数偏低带来的"才 40% 匹配？"误解。无有效 topSimilarity 时回退 null。
+    const semanticPercentOf = (score: number): string | null => {
+      if (
+        semanticTopSimilarity &&
+        semanticTopSimilarity > 0 &&
+        score <= semanticTopSimilarity
+      ) {
+        return t("searchMatchSemanticPercent", {
+          value: Math.max(1, Math.round((score / semanticTopSimilarity) * 100)),
+        });
+      }
+      return null;
+    };
+    if (match.kind === "color") {
+      return t("searchMatchColor", { value: Math.round(match.score * 100) });
+    }
+    if (match.kind === "semantic") {
+      return semanticPercentOf(match.score) ?? t("searchMatchSemantic");
+    }
+    if (match.kind === "hybrid") {
+      // 只要带语义证据就优先显示匹配百分比；回退时保留「语义 + 标签」等文案。
+      if (match.evidence.includes("semantic")) {
+        const percent =
+          match.score === undefined ? null : semanticPercentOf(match.score);
+        if (percent) {
+          return percent;
+        }
+        return match.evidence.includes("tag")
+          ? t("searchMatchHybrid")
+          : t("searchMatchSemantic");
+      }
+      return t("searchMatchExactTag");
+    }
+    if (match.kind === "tagFilter") {
+      // 自用（方案 A）：角标显示"这张图命中了你所选标签中的哪几个"，最多 3 个，
+      // 而不是笼统的「AI 标签」。这样能一眼看出某张图为什么被筛出来。
+      const matchedNames = match.tagNames ?? [];
+      if (matchedNames.length > 0) {
+        return matchedNames.slice(0, 3).join(" · ");
+      }
+      // 拿不到标签名时退回原来的文案（并按 hideAiTagUi 决定是否隐藏）
+      if (PRIVATE_BUILD.hideAiTagUi && match.origin === "auto") {
+        return null;
+      }
+      return match.origin === "auto"
+        ? t("searchMatchAutoTag")
+        : t("searchMatchExactTag");
+    }
+    if (match.kind === "image") {
+      return t("searchMatchSimilarity", {
+        value: Math.round(match.score * 100),
+      });
+    }
+    if (match.source === "person") {
+      return t("searchMatchExactPerson");
+    }
+    if (match.source === "tag") {
+      return t("searchMatchExactTag");
+    }
+    return t("searchMatchExactFilename");
+  }, [match, semanticTopSimilarity, t]);
+
+  // ── 事件处理 ──────────────────────────────────────────────────────
+  const starRef = useRef<HTMLButtonElement>(null);
+  const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelPendingClick = useCallback(() => {
+    if (clickTimerRef.current !== null) {
+      clearTimeout(clickTimerRef.current);
+      clickTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => cancelPendingClick, [cancelPendingClick]);
+
+  const handleDragStart = useCallback(
+    (e: React.DragEvent) => {
+      // Ctrl+drag → native file drag to desktop
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        window.electronAPI?.startDrag?.(path);
+        return;
+      }
+      const ids = getDragIds?.(id) ?? [id];
+      e.dataTransfer.setData("application/x-photo-ids", JSON.stringify(ids));
+      e.dataTransfer.effectAllowed = "move";
+
+      // Custom drag ghost with count badge
+      if (ids.length > 1) {
+        const ghost = document.createElement("div");
+        ghost.style.cssText =
+          "position:fixed;top:-200px;left:-200px;display:flex;align-items:center;gap:6px;padding:6px 10px;background:rgba(30,30,34,0.92);border-radius:8px;border:1px solid rgba(255,255,255,0.1);backdrop-filter:blur(4px);color:#f7f8f8;font-size:12px;font-weight:510;white-space:nowrap;";
+        ghost.textContent = t("photoCountLabel", { count: ids.length });
+        document.body.appendChild(ghost);
+        e.dataTransfer.setDragImage(ghost, 0, 0);
+        requestAnimationFrame(() => document.body.removeChild(ghost));
+      }
+    },
+    [id, path, getDragIds, t]
+  );
+
+  const handleClick = useCallback(
+    (e: React.MouseEvent) => {
+      cancelPendingClick();
+      if (e.detail > 1) {
+        return;
+      }
+      clickTimerRef.current = setTimeout(() => {
+        clickTimerRef.current = null;
+        onClick(id, e);
+      }, SINGLE_CLICK_DELAY_MS);
+    },
+    [cancelPendingClick, id, onClick]
+  );
+
+  const handleDoubleClick = useCallback(() => {
+    cancelPendingClick();
+    onDoubleClick(id);
+  }, [cancelPendingClick, id, onDoubleClick]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        onDoubleClick(id);
+      } else if (e.key === " ") {
+        e.preventDefault();
+        onClick(id, e as unknown as React.MouseEvent);
+      }
+    },
+    [id, onClick, onDoubleClick]
+  );
+
+  const handleImageError = useCallback(() => {
+    recordGalleryMediaStat("photoCardImageError");
+    setImgError(true);
+  }, []);
+
+  // Clamp extreme aspect ratios for visual consistency
+  const rawAspect = width && height ? width / height : 4 / 3;
+  const aspectRatio = Math.max(0.6, Math.min(rawAspect, 3.0));
+  let cardStateClass =
+    "hover:-translate-y-0.5 hover:shadow-lg hover:ring-1 hover:ring-foreground/10 hover:brightness-110";
+  if (deleting) {
+    cardStateClass = "scale-95 opacity-0 duration-180";
+  } else if (isSelected) {
+    cardStateClass = selectionInset
+      ? "ring-2 ring-primary ring-inset"
+      : "ring-2 ring-primary ring-offset-1 ring-offset-background";
+  }
+
+  const recentlyViewedBadge = recentlyViewed ? <RecentlyViewedBadge /> : null;
+
+  const recentlyViewedClass = isRecentlyViewedPulseActive
+    ? "photo-card-recently-viewed-pulse"
+    : "";
+  const hoverOverlayBottomClass = recentlyViewed ? "bottom-6" : "bottom-0";
+  const hoverGradientHeightClass = recentlyViewed ? "h-20" : "h-16";
+
+  if (!renderImage) {
+    return (
+      <div
+        aria-hidden="true"
+        className={`relative w-full overflow-hidden rounded-[8px] bg-muted ${recentlyViewedClass}`}
+        data-photo-id={id}
+        data-photo-path={path}
+        data-recently-viewed={recentlyViewed ? "true" : undefined}
+        style={{
+          aspectRatio,
+          ...(bgColor ? { backgroundColor: bgColor } : {}),
+        }}
+      >
+        {recentlyViewedBadge}
+      </div>
+    );
+  }
+
+  // ── 错误状态 ──────────────────────────────────────────────────────
+  if (imgError) {
+    return (
+      <div
+        aria-selected={isSelected}
+        className={`group relative flex w-full flex-col items-center justify-center gap-2 overflow-hidden rounded-[8px] bg-muted ${recentlyViewedClass}`}
+        data-photo-id={id}
+        data-photo-path={path}
+        data-recently-viewed={recentlyViewed ? "true" : undefined}
+        role="option"
+        style={{ aspectRatio }}
+        tabIndex={-1}
+      >
+        <svg
+          aria-hidden="true"
+          fill="none"
+          height="32"
+          stroke="#6b6b75"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth="1.5"
+          viewBox="0 0 24 24"
+          width="32"
+        >
+          <rect height="18" rx="2" ry="2" width="18" x="3" y="3" />
+          <circle cx="8.5" cy="8.5" r="1.5" />
+          <polyline points="21 15 16 10 5 21" />
+        </svg>
+        <span className="max-w-full truncate px-2 text-[10px] text-muted-foreground/70">
+          {filename}
+        </span>
+        <button
+          className="rounded-[4px] bg-primary/10 px-2 py-0.5 text-[10px] text-primary hover:bg-primary/20"
+          onClick={(e) => {
+            e.stopPropagation();
+            setImgError(false);
+            setRetryCount((c) => c + 1);
+          }}
+          type="button"
+        >
+          {t("retry")}
+        </button>
+        {recentlyViewedBadge}
+      </div>
+    );
+  }
+
+  // ── 正常渲染 ──────────────────────────────────────────────────────
+  return (
+    <div
+      aria-selected={isSelected}
+      className={`group relative w-full cursor-pointer overflow-hidden rounded-[8px] bg-muted transition-[transform,opacity,box-shadow] duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 ${cardStateClass} ${recentlyViewedClass}
+      `}
+      data-photo-id={id}
+      data-photo-path={path}
+      data-recently-viewed={recentlyViewed ? "true" : undefined}
+      draggable={!disableDrag}
+      onClick={handleClick}
+      onContextMenu={undefined}
+      onDoubleClick={handleDoubleClick}
+      onDragStart={disableDrag ? undefined : handleDragStart}
+      onKeyDown={handleKeyDown}
+      role="option"
+      style={{
+        aspectRatio,
+        ...(bgColor ? { backgroundColor: bgColor } : {}),
+      }}
+      tabIndex={-1}
+    >
+      <PhotoCardImage
+        draggable={disableDrag ? false : undefined}
+        filename={filename}
+        hasThumbnail={hasThumbnail}
+        height={height}
+        key={url}
+        loading={loading}
+        onError={handleImageError}
+        renderImage={renderImage}
+        srcSet={srcSet}
+        url={url}
+        width={width}
+      />
+
+      {[...(faceOverlay ? [faceOverlay] : []), ...(faceOverlays ?? [])].map(
+        (overlay) => (
+          <FaceOverlayBox
+            containerAspect={aspectRatio}
+            faceOverlay={overlay}
+            faceOverlaysVisible={faceOverlaysVisible}
+            key={`${overlay.x}-${overlay.y}-${overlay.width}-${overlay.height}-${overlay.label ?? ""}`}
+            photoHeight={height}
+            photoWidth={width}
+          />
+        )
+      )}
+
+      {/* Hover overlay */}
+      <div className="absolute inset-0 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+        <div
+          className={`absolute inset-x-0 bottom-0 ${hoverGradientHeightClass} bg-gradient-to-t from-black/70 via-black/30 to-transparent`}
+        />
+        <div
+          className={`absolute inset-x-0 ${hoverOverlayBottomClass} px-2.5 pb-2`}
+        >
+          <p className="truncate font-medium text-[#f7f8f8] text-[11px] leading-tight">
+            <HighlightText query={searchQuery} text={filename} />
+          </p>
+          {width > 0 && height > 0 && (
+            <p className="mt-0.5 text-[10px] text-muted-foreground">
+              {width} × {height}
+            </p>
+          )}
+        </div>
+      </div>
+
+      {recentlyViewedBadge}
+
+      {onNameFace &&
+        faceOverlaysVisible &&
+        (faceOverlays?.length ?? 0) + (faceOverlay ? 1 : 0) === 1 && (
+          <button
+            className="absolute top-2 right-2 rounded-[4px] bg-black/65 px-2 py-1 text-[10px] text-white opacity-0 transition-opacity hover:bg-primary focus-visible:opacity-100 group-hover:opacity-100"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onNameFace(id);
+            }}
+            type="button"
+          >
+            {t("reassignFace")}
+          </button>
+        )}
+
+      {/* Favorite star */}
+      {onToggleFavorite && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              aria-label={isFavorite ? t("unfavorite") : t("favorite")}
+              aria-pressed={isFavorite}
+              className={`absolute top-2 left-2 flex h-5 w-5 items-center justify-center rounded-full transition-opacity ${
+                isFavorite
+                  ? "opacity-100"
+                  : "hover:!opacity-100 opacity-0 group-hover:opacity-70"
+              }`}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (starRef.current) {
+                  starRef.current.classList.remove("animate-star-bounce");
+                  starRef.current.getBoundingClientRect();
+                  starRef.current.classList.add("animate-star-bounce");
+                }
+                onToggleFavorite(id);
+              }}
+              onDoubleClick={(e) => e.stopPropagation()}
+              ref={starRef}
+              type="button"
+            >
+              <svg
+                aria-hidden="true"
+                className={`h-4 w-4 drop-shadow-sm ${isFavorite ? "fill-yellow-400 text-yellow-400" : "fill-transparent text-white"}`}
+                fill="currentFill"
+                stroke="currentColor"
+                strokeWidth="2"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>
+            {isFavorite ? t("unfavorite") : t("favorite")}
+          </TooltipContent>
+        </Tooltip>
+      )}
+
+      {searchMatchLabel && (
+        <div className="absolute top-2 left-2 rounded-[4px] bg-primary/80 px-1.5 py-0.5 font-medium text-[10px] text-white backdrop-blur-sm">
+          {searchMatchLabel}
+        </div>
+      )}
+
+      {/* Selection indicator */}
+      {isSelected && (
+        <div className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-primary ring-1 ring-primary-foreground/20">
+          <svg
+            aria-hidden="true"
+            fill="none"
+            height="12"
+            viewBox="0 0 12 12"
+            width="12"
+          >
+            <path
+              d="M2.5 6L5 8.5L9.5 3.5"
+              stroke="white"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth="2"
+            />
+          </svg>
+        </div>
+      )}
+    </div>
+  );
+});

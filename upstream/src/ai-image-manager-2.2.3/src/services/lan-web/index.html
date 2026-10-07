@@ -1,0 +1,1209 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>全部照片</title>
+    <style>
+      :root {
+        --bg: #0b0b0d;
+        --panel: #17171b;
+        --line: #2a2a31;
+        --fg: #ececf1;
+        --muted: #9a9aa5;
+        --accent: #7aa2ff;
+        --danger: #ff6b6b;
+      }
+      * {
+        box-sizing: border-box;
+        -webkit-tap-highlight-color: transparent;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "Noto Sans SC", "Microsoft YaHei", sans-serif;
+        overscroll-behavior-y: contain;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+        color: inherit;
+      }
+      button,
+      select {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        min-height: 44px;
+        padding: 0 12px;
+      }
+      button:active {
+        opacity: 0.7;
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #0b0b0d;
+        font-weight: 600;
+      }
+      input[type="search"],
+      input[type="password"] {
+        width: 100%;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        min-height: 44px;
+        padding: 0 14px;
+      }
+      /* ── 登录：不含任何数据，所以可以免鉴权发给任何人 ── */
+      #login {
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+      #login .card {
+        width: 100%;
+        max-width: 360px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 22px;
+      }
+      #login h1 {
+        margin: 0 0 4px;
+        font-size: 19px;
+      }
+      #login p {
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      #login button {
+        width: 100%;
+        margin-top: 12px;
+      }
+      /* ── 顶栏 / 次栏 ── */
+      #bar {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 10px 12px 6px;
+        padding-top: calc(10px + env(safe-area-inset-top));
+        background: rgba(11, 11, 13, 0.94);
+        backdrop-filter: blur(8px);
+      }
+      #bar #menu {
+        flex: 0 0 auto;
+        width: 46px;
+        padding: 0;
+        font-size: 19px;
+      }
+      #bar input {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      #bar #out {
+        flex: 0 0 auto;
+        max-width: 84px;
+      }
+      #sub {
+        position: sticky;
+        top: calc(60px + env(safe-area-inset-top));
+        z-index: 4;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 4px 12px 8px;
+        background: rgba(11, 11, 13, 0.94);
+        backdrop-filter: blur(8px);
+        border-bottom: 1px solid var(--line);
+      }
+      #chip {
+        flex: 1 1 auto;
+        min-width: 0;
+        min-height: 34px;
+        padding: 0 10px;
+        border-radius: 999px;
+        font-size: 13px;
+        text-align: left;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--accent);
+        border-color: rgba(122, 162, 255, 0.4);
+      }
+      #sub select {
+        flex: 0 0 auto;
+        min-height: 34px;
+        font-size: 13px;
+        margin-left: auto;
+      }
+      /* 视图大小 / 识图：都是 34px 高的小按钮 */
+      #sub #size,
+      #bar #pickBtn {
+        flex: 0 0 auto;
+        min-height: 34px;
+        padding: 0 10px;
+        font-size: 13px;
+      }
+      #bar #pickBtn {
+        min-height: 44px;
+        font-size: 17px;
+        width: 46px;
+        padding: 0;
+      }
+      #sub #size.on {
+        border-color: rgba(122, 162, 255, 0.45);
+        color: var(--accent);
+      }
+      /* ── 网格（1:1 缩略图 + 月份分组，与桌面一致）──
+         格子大小由 --cell 控制：默认按视口宽度给（手机小、电脑大），
+         用户可以用工具条上的「小/中/大/特大」按钮覆盖。 */
+      #grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(var(--cell, 104px), 1fr));
+        gap: 6px;
+        padding: 10px 12px 12px;
+      }
+      .month {
+        grid-column: 1 / -1;
+        padding: 14px 2px 2px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .cell {
+        position: relative;
+        aspect-ratio: 1;
+        overflow: hidden;
+        border-radius: 10px;
+        background: var(--panel);
+        cursor: pointer;
+      }
+      .cell img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+      #status {
+        padding: 16px 12px 44px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      #status button {
+        margin-top: 12px;
+      }
+      /* ── 侧栏（抽屉）── */
+      #drawer {
+        position: fixed;
+        inset: 0;
+        z-index: 30;
+      }
+      #drawer .scrim {
+        position: absolute;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+      }
+      #drawer .panel {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        /* 必须在遮罩之上，否则点不到树里的行 */
+        z-index: 1;
+        width: min(80vw, 330px);
+        display: flex;
+        flex-direction: column;
+        background: #121216;
+        border-right: 1px solid var(--line);
+        padding: calc(10px + env(safe-area-inset-top)) 10px
+          calc(10px + env(safe-area-inset-bottom));
+        gap: 8px;
+      }
+      #navAll {
+        flex: 0 0 auto;
+        min-height: 40px;
+        text-align: left;
+        border: none;
+        background: transparent;
+        font-size: 15px;
+        padding: 0 8px;
+      }
+      #navAll.on {
+        background: var(--accent);
+        color: #0b0b0d;
+        font-weight: 600;
+        border-radius: 10px;
+      }
+      #tabs {
+        flex: 0 0 auto;
+        display: flex;
+        gap: 6px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 4px;
+      }
+      #tabs button {
+        flex: 1;
+        min-height: 34px;
+        border: none;
+        border-radius: 7px;
+        background: transparent;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      #tabs button.on {
+        background: #2b2b34;
+        color: var(--fg);
+      }
+      #treeFilter {
+        flex: 0 0 auto;
+        min-height: 40px;
+        font-size: 14px;
+      }
+      #tree {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        padding-bottom: 20px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        min-height: 40px;
+        border-radius: 8px;
+        padding-right: 6px;
+        font-size: 14px;
+        color: var(--fg);
+        cursor: pointer;
+      }
+      .row.on {
+        background: rgba(122, 162, 255, 0.16);
+        color: var(--accent);
+      }
+      .row .twist {
+        flex: 0 0 auto;
+        width: 26px;
+        min-height: 32px;
+        border: none;
+        background: transparent;
+        color: var(--muted);
+        padding: 0;
+        font-size: 11px;
+      }
+      .row .label {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .row .count {
+        flex: 0 0 auto;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      /* 隐藏（黑名单）文件夹：单独一段，视觉上明显区分但**照常可点进去** */
+      .treeHeader {
+        margin-top: 10px;
+        padding: 12px 8px 4px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .row.hid:not(.on) .label,
+      .row.hid:not(.on) .count {
+        color: var(--muted);
+      }
+      /* ── 大图 ── */
+      #viewer {
+        position: fixed;
+        inset: 0;
+        z-index: 40;
+        background: #000;
+        display: flex;
+        flex-direction: column;
+      }
+      #viewer .stage {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: auto;
+      }
+      #viewer img {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+      }
+      #viewer .info {
+        flex: 0 0 auto;
+        background: var(--panel);
+        border-top: 1px solid var(--line);
+        padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+      }
+      #viewer .name {
+        font-size: 12px;
+        color: var(--muted);
+        word-break: break-all;
+        margin-bottom: 8px;
+      }
+      #viewer .acts {
+        display: flex;
+        gap: 8px;
+      }
+      #viewer .acts button,
+      #viewer .acts a {
+        flex: 1;
+        text-align: center;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 44px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: #202027;
+        color: var(--fg);
+        font-size: 14px;
+      }
+      #viewer .close {
+        position: absolute;
+        top: calc(10px + env(safe-area-inset-top));
+        right: 12px;
+        z-index: 2;
+        width: 44px;
+        padding: 0;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.6);
+      }
+      #vSpin {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        color: var(--muted);
+        font-size: 13px;
+      }
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- 登录（免鉴权，且不含任何数据） -->
+    <section id="login" hidden>
+      <div class="card">
+        <h1>全部照片</h1>
+        <p>请输入访问口令。这里只能浏览和下载，不能修改任何内容。</p>
+        <input
+          id="pw"
+          type="password"
+          autocomplete="current-password"
+          placeholder="访问口令"
+        />
+        <button class="primary" id="loginBtn">进入</button>
+        <p id="loginMsg" style="margin: 10px 0 0; color: var(--danger)"></p>
+      </div>
+    </section>
+
+    <div id="app" hidden>
+      <header id="bar">
+        <button id="menu" aria-label="打开侧栏">☰</button>
+        <input id="q" type="search" placeholder="搜索" />
+        <button id="pickBtn" aria-label="以图搜图（识图）" title="以图搜图">🔍</button>
+        <button id="out">退出</button>
+      </header>
+      <input id="pick" type="file" accept="image/*" hidden />
+      <div id="sub">
+        <button id="chip" hidden></button>
+        <button id="size" aria-label="视图大小">中</button>
+        <select id="sort" aria-label="排序">
+          <option value="date|desc">日期 新→旧</option>
+          <option value="date|asc">日期 旧→新</option>
+          <option value="name|asc">名称</option>
+          <option value="size|desc">大小</option>
+        </select>
+      </div>
+      <main id="grid"></main>
+      <div id="status"></div>
+    </div>
+
+    <div id="drawer" hidden>
+      <aside class="panel">
+        <button id="navAll" class="on">全部照片</button>
+        <div id="tabs">
+          <button data-tab="folder" class="on">文件夹</button>
+          <button data-tab="tag">标签</button>
+        </div>
+        <input id="treeFilter" type="search" placeholder="搜索文件夹…" />
+        <div id="tree"></div>
+      </aside>
+      <div class="scrim" id="scrim"></div>
+    </div>
+
+    <div id="viewer" hidden>
+      <button class="close" id="closeBtn">✕</button>
+      <div id="vSpin">加载中…</div>
+      <div class="stage"><img id="big" alt="" /></div>
+      <div class="info">
+        <div class="name" id="vName"></div>
+        <div class="acts">
+          <button id="origBtn">原图</button>
+          <a id="dlBtn" download>下载</a>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // 说明：刻意用字符串拼接而不是模板字符串 —— 万一将来不能再用 `?raw`
+      // 导入、要把整页塞进 TS 字符串，改动会很小。
+      (function () {
+        var state = {
+          expanded: { folder: {}, tag: {} },
+          folderId: null,
+          hasMore: true,
+          imageMode: false,
+          items: 0,
+          lastMonth: "",
+          limit: 60,
+          loading: false,
+          offset: 0,
+          order: "desc",
+          query: "",
+          sizeIndex: -1,
+          sort: "date",
+          tab: "folder",
+          tagId: null,
+          tree: { folder: [], tag: [] },
+          treeQuery: "",
+          treeLoaded: false,
+        };
+
+        /* 视图大小：4 档，手机默认第 1 档、电脑默认更大（用户点过就记住） */
+        var CELL_STEPS = [
+          { label: "小", px: 104 },
+          { label: "中", px: 140 },
+          { label: "大", px: 190 },
+          { label: "特大", px: 250 },
+        ];
+        var CELL_KEY = "aim_lan_cell_step";
+
+        function defaultSizeIndex() {
+          var w = window.innerWidth || 390;
+          if (w >= 1400) {
+            return 3;
+          }
+          if (w >= 1000) {
+            return 2;
+          }
+          if (w >= 700) {
+            return 1;
+          }
+          return 0;
+        }
+
+        function applySize(index) {
+          var clamped = Math.max(0, Math.min(CELL_STEPS.length - 1, index));
+          state.sizeIndex = clamped;
+          document.documentElement.style.setProperty(
+            "--cell",
+            CELL_STEPS[clamped].px + "px"
+          );
+          var button = el("size");
+          button.textContent = CELL_STEPS[clamped].label;
+          button.className = clamped === defaultSizeIndex() ? "" : "on";
+          try {
+            localStorage.setItem(CELL_KEY, String(clamped));
+          } catch (e) {
+            /* 隐私模式下写不进去也没关系 */
+          }
+        }
+
+        function initSize() {
+          var stored = null;
+          try {
+            stored = localStorage.getItem(CELL_KEY);
+          } catch (e) {
+            stored = null;
+          }
+          applySize(stored === null ? defaultSizeIndex() : Number(stored));
+        }
+
+        var el = function (id) {
+          return document.getElementById(id);
+        };
+        var loginView = el("login");
+        var appView = el("app");
+        var grid = el("grid");
+        var status = el("status");
+        var drawer = el("drawer");
+        var treeBox = el("tree");
+        var viewer = el("viewer");
+        var big = el("big");
+
+        function showLogin(message) {
+          appView.hidden = true;
+          viewer.hidden = true;
+          drawer.hidden = true;
+          loginView.hidden = false;
+          el("loginMsg").textContent = message || "";
+        }
+
+        function showApp() {
+          loginView.hidden = true;
+          appView.hidden = false;
+          // 登录框会自动聚焦，聚焦可能把页面滚下去一截；
+          // 进到网格后回到顶部，否则第一行会被吸顶的工具栏盖住。
+          window.scrollTo(0, 0);
+        }
+
+        /** 统一取数：401 一律回到登录界面。 */
+        function api(path, options) {
+          return fetch(path, options).then(function (res) {
+            if (res.status === 401) {
+              showLogin("口令已失效，请重新输入。");
+              throw new Error("unauthorized");
+            }
+            if (!res.ok) {
+              throw new Error("HTTP " + res.status);
+            }
+            return res.status === 204 ? null : res.json();
+          });
+        }
+
+        /* ── 侧栏 ─────────────────────────────────────────── */
+
+        function loadTree() {
+          if (state.treeLoaded) {
+            return Promise.resolve();
+          }
+          return Promise.all([api("/api/folders"), api("/api/tags")])
+            .then(function (results) {
+              state.tree.folder = results[0].items || [];
+              state.tree.tag = results[1].items || [];
+              state.treeLoaded = true;
+              // 默认展开根节点，这样一进来就能看到第一层
+              ["folder", "tag"].forEach(function (kind) {
+                state.tree[kind].forEach(function (node) {
+                  if (node.parentId === null) {
+                    state.expanded[kind][node.id] = true;
+                  }
+                });
+              });
+              renderTree();
+            })
+            .catch(function (error) {
+              if (error && error.message !== "unauthorized") {
+                treeBox.textContent = "侧栏加载失败：" + error.message;
+              }
+            });
+        }
+
+        /** 把扁平列表接成 children 映射；服务端已经保证没有悬挂父引用。 */
+        function childrenOf(kind) {
+          var map = {};
+          state.tree[kind].forEach(function (node) {
+            var key = node.parentId === null ? "root" : String(node.parentId);
+            if (!map[key]) {
+              map[key] = [];
+            }
+            map[key].push(node);
+          });
+          return map;
+        }
+
+        function rowFor(kind, node, depth) {
+          var row = document.createElement("div");
+          var isHidden = kind === "folder" && Boolean(node.hidden);
+          row.className = "row";
+          var selected =
+            kind === "folder"
+              ? state.folderId === node.id
+              : state.tagId === node.id;
+          if (selected) {
+            row.className = isHidden ? "row on hid" : "row on";
+          } else if (isHidden) {
+            row.className = "row hid";
+          }
+          row.style.paddingLeft = 6 + depth * 14 + "px";
+
+          var kids = childrenOfCache[kind][String(node.id)] || [];
+          var twist = document.createElement("button");
+          twist.className = "twist";
+          twist.textContent = kids.length
+            ? state.expanded[kind][node.id]
+              ? "▾"
+              : "▸"
+            : "";
+          twist.onclick = function (e) {
+            e.stopPropagation();
+            state.expanded[kind][node.id] = !state.expanded[kind][node.id];
+            renderTree();
+          };
+          row.appendChild(twist);
+
+          var label = document.createElement("div");
+          label.className = "label";
+          label.textContent = (isHidden ? "🚫 " : "") + node.name;
+          row.appendChild(label);
+
+          var count = document.createElement("div");
+          count.className = "count";
+          count.textContent = String(node.photoCount);
+          row.appendChild(count);
+
+          row.onclick = function () {
+            selectNode(kind, node);
+          };
+          return row;
+        }
+
+        var childrenOfCache = { folder: {}, tag: {} };
+
+        function renderTree() {
+          childrenOfCache.folder = childrenOf("folder");
+          childrenOfCache.tag = childrenOf("tag");
+          treeBox.textContent = "";
+          var kind = state.tab;
+          var query = state.treeQuery.toLowerCase();
+
+          if (query) {
+            // 树内搜索：平铺显示命中项（按层级缩进），忽略展开状态
+            state.tree[kind].forEach(function (node) {
+              if (node.name.toLowerCase().indexOf(query) >= 0) {
+                treeBox.appendChild(rowFor(kind, node, 0));
+              }
+            });
+            if (!treeBox.firstChild) {
+              var empty = document.createElement("div");
+              empty.className = "row";
+              empty.style.color = "var(--muted)";
+              empty.style.paddingLeft = "8px";
+              empty.textContent = "没有匹配项";
+              treeBox.appendChild(empty);
+            }
+            return;
+          }
+
+          var walk = function (nodes, depth, allow) {
+            nodes.forEach(function (node) {
+              if (allow && !allow(node)) {
+                return;
+              }
+              treeBox.appendChild(rowFor(kind, node, depth));
+              if (state.expanded[kind][node.id]) {
+                walk(
+                  childrenOfCache[kind][String(node.id)] || [],
+                  depth + 1,
+                  allow
+                );
+              }
+            });
+          };
+
+          var roots = childrenOfCache[kind].root || [];
+          if (kind !== "folder") {
+            walk(roots, 0, null);
+            return;
+          }
+
+          // 普通文件夹树：跳过隐藏的那些
+          walk(roots, 0, function (node) {
+            return !node.hidden;
+          });
+
+          // 隐藏（黑名单）文件夹：**单独一段**（用户要求"给它们单独放一个位置"），
+          // 照常可以点进去看，只是视觉上区分开、且不进普通树。
+          var hiddenIdSet = {};
+          state.tree.folder.forEach(function (node) {
+            if (node.hidden) {
+              hiddenIdSet[node.id] = true;
+            }
+          });
+          var hiddenRoots = state.tree.folder.filter(function (node) {
+            return (
+              node.hidden &&
+              (node.parentId === null || !hiddenIdSet[node.parentId])
+            );
+          });
+          if (hiddenRoots.length > 0) {
+            var header = document.createElement("div");
+            header.className = "treeHeader";
+            header.textContent =
+              "已隐藏（" + hiddenRoots.length + "）· 仍可点进去看";
+            treeBox.appendChild(header);
+            walk(hiddenRoots, 0, null);
+          }
+        }
+
+        function selectNode(kind, node) {
+          if (kind === "folder") {
+            state.folderId = state.folderId === node.id ? null : node.id;
+          } else {
+            state.tagId = state.tagId === node.id ? null : node.id;
+          }
+          state.expanded[kind][node.id] = true;
+          closeDrawer();
+          syncChip();
+          renderTree();
+          load(true);
+        }
+
+        function currentFilterName() {
+          if (state.imageMode) {
+            return "📷 识图结果";
+          }
+          if (state.folderId !== null) {
+            var folder = state.tree.folder.filter(function (n) {
+              return n.id === state.folderId;
+            })[0];
+            if (folder) {
+              return (folder.hidden ? "🚫 " : "📁 ") + folder.name;
+            }
+          }
+          if (state.tagId !== null) {
+            var tag = state.tree.tag.filter(function (n) {
+              return n.id === state.tagId;
+            })[0];
+            if (tag) {
+              return "🏷 " + tag.name;
+            }
+          }
+          return "";
+        }
+
+        function syncChip() {
+          var name = currentFilterName();
+          var chip = el("chip");
+          chip.hidden = !name;
+          chip.textContent = name ? name + "  ✕" : "";
+          el("navAll").className = name ? "" : "on";
+        }
+
+        function openDrawer() {
+          drawer.hidden = false;
+          loadTree();
+        }
+
+        function closeDrawer() {
+          drawer.hidden = true;
+        }
+
+        /* ── 网格 ─────────────────────────────────────────── */
+
+        function setStatus(text, retry) {
+          status.textContent = "";
+          if (text) {
+            var p = document.createElement("div");
+            p.textContent = text;
+            status.appendChild(p);
+          }
+          if (retry) {
+            var b = document.createElement("button");
+            b.textContent = "重试";
+            b.onclick = function () {
+              load(true);
+            };
+            status.appendChild(b);
+          }
+        }
+
+        function monthLabel(fileDate) {
+          if (!fileDate) {
+            return "未知日期";
+          }
+          var d = new Date(fileDate);
+          return d.getFullYear() + "年" + (d.getMonth() + 1) + "月";
+        }
+
+        function appendItem(item) {
+          var label = monthLabel(item.fileDate);
+          if (label !== state.lastMonth) {
+            state.lastMonth = label;
+            var header = document.createElement("div");
+            header.className = "month";
+            header.textContent = label;
+            grid.appendChild(header);
+          }
+          var box = document.createElement("div");
+          box.className = "cell";
+          var img = document.createElement("img");
+          img.loading = "lazy";
+          img.decoding = "async";
+          img.alt = item.filename;
+          img.src = item.urls.thumb;
+          box.appendChild(img);
+          box.onclick = function () {
+            openViewer(item);
+          };
+          grid.appendChild(box);
+        }
+
+        function buildUrl() {
+          var parts = [
+            "limit=" + state.limit,
+            "offset=" + state.offset,
+            "sort=" + state.sort,
+            "order=" + state.order,
+          ];
+          if (state.query) {
+            parts.push("q=" + encodeURIComponent(state.query));
+          }
+          if (state.folderId !== null) {
+            parts.push("folderId=" + state.folderId);
+          }
+          if (state.tagId !== null) {
+            parts.push("tagId=" + state.tagId);
+          }
+          return "/api/photos?" + parts.join("&");
+        }
+
+        function load(reset) {
+          if (state.loading) {
+            return;
+          }
+          if (reset) {
+            state.offset = 0;
+            state.hasMore = true;
+            state.imageMode = false;
+            state.items = 0;
+            state.lastMonth = "";
+            grid.textContent = "";
+            // 换筛选/换排序/搜索时也回到顶部，避免停在半截
+            window.scrollTo(0, 0);
+          }
+          if (!state.hasMore) {
+            return;
+          }
+          state.loading = true;
+          setStatus("加载中…");
+          api(buildUrl())
+            .then(function (data) {
+              state.total = data.total;
+              state.hasMore = data.hasMore;
+              state.offset = data.offset + data.items.length;
+              data.items.forEach(function (item) {
+                state.items += 1;
+                appendItem(item);
+              });
+              if (state.items === 0) {
+                setStatus(
+                  state.query || state.folderId !== null || state.tagId !== null
+                    ? "这里没有照片。"
+                    : "图库里还没有照片。"
+                );
+              } else if (state.hasMore) {
+                setStatus(
+                  "已显示 " +
+                    state.items +
+                    " 张" +
+                    (data.mode === "semantic"
+                      ? "（搜索命中）"
+                      : " / " + state.total)
+                );
+              } else {
+                setStatus(
+                  (data.mode === "semantic" ? "搜索命中 " : "共 ") +
+                    state.total +
+                    " 张"
+                );
+              }
+            })
+            .catch(function (error) {
+              if (error && error.message !== "unauthorized") {
+                setStatus("加载失败：" + error.message, true);
+              } else {
+                setStatus("");
+              }
+            })
+            .then(function () {
+              state.loading = false;
+            });
+        }
+
+        /* ── 识图（以图搜图）────────────────────────────────
+           把选中的图 POST 给服务端，服务端算特征 + 向量检索后回一批照片。
+           服务端会限流、限 8MB、只收图片，且不把上传的图留在磁盘上。 */
+
+        function pickImage() {
+          el("pick").click();
+        }
+
+        function showImageResults(items, note) {
+          state.imageMode = true;
+          state.hasMore = false;
+          state.loading = false;
+          state.items = 0;
+          state.lastMonth = "";
+          grid.textContent = "";
+          items.forEach(function (item) {
+            state.items += 1;
+            appendItem(item);
+          });
+          syncChip();
+          window.scrollTo(0, 0);
+          if (items.length === 0) {
+            setStatus(note || "没有找到相似的图片。");
+          } else {
+            setStatus("识图命中 " + items.length + " 张" + (note ? "（" + note + "）" : ""));
+          }
+        }
+
+        function uploadForSearch(file) {
+          if (!file) {
+            return;
+          }
+          setStatus("识图中…（" + Math.round(file.size / 1024) + " KB）");
+          fetch("/api/search-by-image", {
+            body: file,
+            headers: { "content-type": file.type || "image/jpeg" },
+            method: "POST",
+          })
+            .then(function (res) {
+              if (res.status === 401) {
+                showLogin("口令已失效，请重新输入。");
+                throw new Error("unauthorized");
+              }
+              return res.json().then(function (data) {
+                return { data: data, status: res.status };
+              });
+            })
+            .then(function (result) {
+              if (result.status !== 200) {
+                throw new Error(errorText(result.status, result.data));
+              }
+              showImageResults(result.data.items || []);
+            })
+            .catch(function (error) {
+              if (error && error.message !== "unauthorized") {
+                setStatus("识图失败：" + error.message, false);
+              }
+            });
+        }
+
+        function errorText(status, data) {
+          if (status === 413) {
+            return "图片太大（上限 8 MB）";
+          }
+          if (status === 415) {
+            return "只支持图片文件";
+          }
+          if (status === 429) {
+            return "操作太频繁，请等一分钟再试";
+          }
+          if (status === 503) {
+            return "AI 还没就绪（正在加载模型），稍后再试";
+          }
+          return (data && data.error) || "HTTP " + status;
+        }
+
+        /* ── 大图 ─────────────────────────────────────────── */
+
+        function openViewer(item) {
+          viewer.hidden = false;
+          el("vSpin").hidden = false;
+          el("vSpin").textContent = "加载中…";
+          // 先给 800px 的 webp（快），要细节再点「原图」
+          big.src = item.urls.thumb.replace("size=md", "size=lg");
+          big.alt = item.filename;
+          el("vName").textContent =
+            item.filename +
+            " · " +
+            (item.width || "?") +
+            "×" +
+            (item.height || "?");
+          el("dlBtn").href = item.urls.download;
+          el("dlBtn").setAttribute("download", item.filename);
+          el("origBtn").onclick = function () {
+            el("vSpin").hidden = false;
+            el("vSpin").textContent = "加载原图…";
+            big.src = item.urls.image;
+          };
+        }
+
+        big.onload = function () {
+          el("vSpin").hidden = true;
+        };
+        big.onerror = function () {
+          el("vSpin").hidden = false;
+          el("vSpin").textContent = "图片加载失败";
+        };
+
+        /* ── 事件 ─────────────────────────────────────────── */
+
+        function doLogin() {
+          var pw = el("pw").value;
+          if (!pw) {
+            return;
+          }
+          el("loginMsg").textContent = "";
+          api("/api/login", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ password: pw }),
+          })
+            .then(function () {
+              el("pw").value = "";
+              showApp();
+              loadTree();
+              load(true);
+            })
+            .catch(function (error) {
+              el("loginMsg").textContent =
+                error && error.message === "unauthorized"
+                  ? "口令不对，或者临时口令已经过期。"
+                  : "登录失败：" + error.message;
+            });
+        }
+
+        function doLogout() {
+          fetch("/api/logout", { method: "POST" }).then(function () {
+            state.treeLoaded = false;
+            state.tree = { folder: [], tag: [] };
+            state.folderId = null;
+            state.tagId = null;
+            showLogin("已退出。");
+          });
+        }
+
+        el("loginBtn").onclick = doLogin;
+        el("pw").addEventListener("keydown", function (e) {
+          if (e.key === "Enter") {
+            doLogin();
+          }
+        });
+        el("out").onclick = doLogout;
+        el("menu").onclick = openDrawer;
+        el("pickBtn").onclick = pickImage;
+        el("pick").onchange = function (e) {
+          var file = e.target.files && e.target.files[0];
+          // 立刻清空 input，否则同一张图选第二次不会触发 change
+          e.target.value = "";
+          uploadForSearch(file);
+        };
+        el("size").onclick = function () {
+          applySize(state.sizeIndex + 1);
+        };
+        initSize();
+        el("scrim").onclick = closeDrawer;
+        el("navAll").onclick = function () {
+          state.folderId = null;
+          state.imageMode = false;
+          state.tagId = null;
+          state.query = "";
+          el("q").value = "";
+          syncChip();
+          renderTree();
+          closeDrawer();
+          load(true);
+        };
+        el("chip").onclick = function () {
+          state.folderId = null;
+          state.imageMode = false;
+          state.tagId = null;
+          syncChip();
+          renderTree();
+          load(true);
+        };
+        Array.prototype.forEach.call(
+          el("tabs").querySelectorAll("button"),
+          function (button) {
+            button.onclick = function () {
+              state.tab = button.dataset.tab;
+              state.treeQuery = "";
+              el("treeFilter").value = "";
+              el("treeFilter").placeholder =
+                state.tab === "folder" ? "搜索文件夹…" : "搜索标签…";
+              Array.prototype.forEach.call(
+                el("tabs").querySelectorAll("button"),
+                function (other) {
+                  other.className = other === button ? "on" : "";
+                }
+              );
+              renderTree();
+            };
+          }
+        );
+        el("treeFilter").addEventListener("input", function (e) {
+          state.treeQuery = e.target.value.trim();
+          renderTree();
+        });
+        el("closeBtn").onclick = function () {
+          viewer.hidden = true;
+          big.removeAttribute("src");
+        };
+        el("sort").onchange = function (e) {
+          var parts = String(e.target.value).split("|");
+          state.sort = parts[0];
+          state.order = parts[1];
+          load(true);
+        };
+
+        var timer = null;
+        el("q").addEventListener("input", function (e) {
+          var value = e.target.value;
+          if (timer) {
+            clearTimeout(timer);
+          }
+          timer = setTimeout(function () {
+            state.query = value.trim();
+            load(true);
+          }, 350);
+        });
+
+        window.addEventListener("scroll", function () {
+          if (
+            state.loading ||
+            !state.hasMore ||
+            viewer.hidden === false ||
+            drawer.hidden === false
+          ) {
+            return;
+          }
+          if (
+            window.innerHeight + window.scrollY >
+            document.body.offsetHeight - 700
+          ) {
+            load(false);
+          }
+        });
+
+        // 启动：先看有没有有效会话（有就直接进列表，没有就显示口令框）
+        fetch("/api/photos?limit=1")
+          .then(function (res) {
+            if (res.status === 401) {
+              showLogin("");
+              return;
+            }
+            showApp();
+            loadTree();
+            load(true);
+          })
+          .catch(function () {
+            showLogin("连不上服务，请确认手机和电脑在同一个网络。");
+          });
+      })();
+    </script>
+  </body>
+</html>

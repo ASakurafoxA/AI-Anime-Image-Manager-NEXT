@@ -1,0 +1,119 @@
+// Public API — re-exports from split modules.
+// Existing imports from "@/services/ai-embedder" can be changed to "@/services/ai".
+
+// biome-ignore lint/performance/noBarrelFile: This facade preserves the established AI service import surface.
+export { cleanupPartialEmbedding, embedAllPhotos } from "./embedder";
+export type { AiHealthStatus, AiReadiness } from "./health";
+export { checkAiHealth, getAiReadiness } from "./health";
+export {
+  cancelEmbedding,
+  copyModelsOnce,
+  ensureLocalModel,
+  getEmbeddingProgress,
+  isAiModelLoaded,
+  loadModel,
+  pauseEmbedding,
+  resumeEmbedding,
+  stopEmbedding,
+} from "./model-loader";
+export type { ParsedQuery, ScoringOptions } from "./query-parser";
+export {
+  extractTemporalContext,
+  generateSearchPrompts,
+  parseChineseQuery,
+} from "./query-parser";
+export { TAG_SELECTION_POLICY_VERSION } from "./scoring";
+export type { SemanticTextSearchResult } from "./search";
+export {
+  isAiSearchReady,
+  searchByImage,
+  searchByText,
+  searchByTextWithPlan,
+  warmupAiSearch,
+} from "./search";
+export type {
+  SemanticQueryPlan,
+  SemanticQueryPrompt,
+  SemanticTranslationMode,
+} from "./semantic-query-plan";
+export {
+  getSemanticQueryPlan,
+  prepareSemanticQueryPlan,
+  SEMANTIC_QUERY_PLAN_VERSION,
+} from "./semantic-query-plan";
+export type { EmbedProgress, EmbedProgressCallback } from "./state";
+export {
+  activeEmbeddingRunId,
+  addPendingAutoTagPhotoIds,
+  addWrittenPhotoId,
+  addWrittenPhotoIds,
+  addWrittenPhotoIdsForRun,
+  aiControlState,
+  beginAutoTagging,
+  beginEmbeddingRun,
+  clearWrittenPhotoIdsForRun,
+  colorTable,
+  drainPendingAutoTagPhotoIds,
+  finishAutoTagging,
+  finishAutoTaggingPhoto,
+  finishEmbeddingRun,
+  getAiControlState,
+  getPendingAutoTagPhotoIds,
+  getWrittenPhotoIds,
+  getWrittenPhotoIdsForRun,
+  isAutoTaggingActive,
+  isAutoTaggingPhoto,
+  isCurrentEmbeddingRun,
+  isPaused,
+  isRunWritable,
+  poolCancelled,
+  removePendingAutoTagPhotoIds,
+  setAiControlState,
+  setColorTable,
+  setCurrentProgress,
+  setEmbeddingModel,
+  setIsEmbedding,
+  setIsModelLoaded,
+  setLocalModelPath,
+  setPoolCancelled,
+  setWasAutoRepaired,
+  wasAutoRepaired,
+} from "./state";
+export type {
+  BatchTagMode,
+  CandidateTag,
+  CandidateTagDefinition,
+  TagCategory,
+} from "./tag-suggester";
+export {
+  batchSuggestTags,
+  CANDIDATE_TAG_DEFINITIONS,
+  CANDIDATE_TAGS,
+  MAX_AUTO_TAGS_PER_PHOTO,
+  suggestTags,
+  TAG_AUTO_CONFIRM_MINIMUM,
+  TAG_PROMPT_VERSION,
+  TAG_VOCABULARY_VERSION,
+} from "./tag-suggester";
+export { embedText } from "./text-embedder";
+export {
+  backfillColorVectors,
+  buildPhotoIdFilter,
+  cleanupOrphanVectors,
+  cleanupStaleBackups,
+  closeVectorDB,
+  deleteColorVectors,
+  deletePhotoVectors,
+  ensureVectorIndex,
+  getPhotoVectors,
+  initVectorDB,
+  isVectorDBInitialized,
+  rebuildVectorDB,
+  resetAllAiProcessedFlags,
+  searchByColorVector,
+  upsertColorVector,
+  upsertColorVectors,
+  validateVectorDB,
+} from "./vector-db";
+export type { DictCategory, DictEntry } from "./zh-en-dict";
+export { CHAR_DECOMPOSE, ZH_TO_EN_SEARCH } from "./zh-en-dict";

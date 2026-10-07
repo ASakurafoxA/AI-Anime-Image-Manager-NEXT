@@ -1,0 +1,43 @@
+export type AdvancedExifFilterField =
+  | "vendor"
+  | "captureMode"
+  | "exposureProgram"
+  | "meteringMode"
+  | "whiteBalance"
+  | "focusMode"
+  | "subjectTarget"
+  | "driveMode"
+  | "stabilizationMode"
+  | "computationalMode"
+  | "inCameraLook"
+  | "provenanceStatus";
+
+export interface ExifFilters {
+  advancedField?: AdvancedExifFilterField;
+  advancedValue?: string;
+  apertureMax?: string;
+  apertureMin?: string;
+  cameraModel?: string;
+  creator?: string;
+  dateFrom?: string;
+  dateHour?: string;
+  dateMonth?: string;
+  dateTo?: string;
+  focalMax?: string;
+  focalMin?: string;
+  isoMax?: string;
+  isoMin?: string;
+  lensModel?: string;
+  shutterMax?: string;
+  shutterMin?: string;
+}
+
+export type SearchMode = "text" | "image" | "exif" | "color";
+
+export interface SearchCriteria {
+  colorHex?: string;
+  filters: ExifFilters;
+  imagePath?: string;
+  mode: SearchMode;
+  query: string;
+}

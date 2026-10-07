@@ -1,0 +1,385 @@
+// biome-ignore-all lint/style/noNestedTernary: scoped component lint cleanup preserves existing UI behavior
+import { useNavigate } from "@tanstack/react-router";
+import { Cloud, Copy, ExternalLink, Share2 } from "lucide-react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
+import { openExternalLink } from "@/actions/shell";
+import { AnimatedActionButton } from "@/components/ui/animated-action-button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { ipc } from "@/ipc/manager";
+import { getDateLocale } from "@/utils/date-locale";
+
+interface CloudConfig {
+  id: number;
+  name: string;
+  provider: string;
+}
+
+interface ShareDialogProps {
+  onClose: () => void;
+  open: boolean;
+  photoIds: number[];
+}
+
+const PROVIDER_LABELS: Record<string, string> = {
+  webdav: "WebDAV",
+  s3: "S3",
+};
+
+type ConfigLoadState = "loading" | "error" | "loaded";
+
+export function ShareDialog({ open, onClose, photoIds }: ShareDialogProps) {
+  const { t, i18n } = useTranslation();
+  const navigate = useNavigate();
+  const [configs, setConfigs] = useState<CloudConfig[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [configLoadState, setConfigLoadState] =
+    useState<ConfigLoadState>("loading");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<{
+    url: string;
+    filename: string;
+    provider?: string;
+  } | null>(null);
+  const configRequestRef = useRef(0);
+  const configLoadInFlightRef = useRef(false);
+
+  const loadConfigs = useCallback(async () => {
+    if (configLoadInFlightRef.current) {
+      return;
+    }
+    configLoadInFlightRef.current = true;
+    const requestId = ++configRequestRef.current;
+    setConfigLoadState("loading");
+    setConfigs([]);
+    setSelectedId(null);
+    try {
+      const list = (await ipc.client.cloud.listCloudConfigs(
+        {}
+      )) as CloudConfig[];
+      if (requestId !== configRequestRef.current) {
+        return;
+      }
+      setConfigs(list);
+      setSelectedId(list.length === 1 ? list[0].id : null);
+      setConfigLoadState("loaded");
+    } catch {
+      if (requestId !== configRequestRef.current) {
+        return;
+      }
+      setConfigs([]);
+      setSelectedId(null);
+      setConfigLoadState("error");
+    } finally {
+      if (requestId === configRequestRef.current) {
+        configLoadInFlightRef.current = false;
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (open) {
+      setConfigLoadState("loading");
+      setConfigs([]);
+      setSelectedId(null);
+      setResult(null);
+      setLoading(false);
+      loadConfigs();
+    } else {
+      configRequestRef.current += 1;
+      configLoadInFlightRef.current = false;
+    }
+  }, [open, loadConfigs]);
+
+  const handleOpenCloudSettings = useCallback(() => {
+    onClose();
+    navigate({ to: "/settings/cloud-sync" });
+  }, [navigate, onClose]);
+
+  async function handleGenerate() {
+    if (!selectedId || loading) {
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = (await ipc.client.photos.generateAndUploadShare({
+        photoIds,
+        cloudConfigId: selectedId,
+        locale: getDateLocale(i18n.language),
+      })) as {
+        success: boolean;
+        url?: string;
+        filename?: string;
+        error?: string;
+      };
+      if (res.success && res.url) {
+        setResult({ url: res.url, filename: res.filename || "" });
+        toast.success(t("sharePublished"));
+      } else {
+        toast.error(res.error || t("shareFailed"));
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : undefined;
+      toast.error(message || t("shareException"));
+    }
+    setLoading(false);
+  }
+
+  async function handleCopyUrl() {
+    if (!result) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(result.url);
+      toast.success(t("linkCopied"));
+    } catch {
+      toast(t("copyManually"), { description: result.url });
+    }
+  }
+
+  let configContent: ReactNode;
+  if (configLoadState === "loading") {
+    configContent = (
+      <div
+        aria-live="polite"
+        className="flex items-center justify-center gap-2 px-3 py-6 text-[13px] text-muted-foreground"
+        role="status"
+      >
+        <LoadingSpinner size="sm" />
+        <span>{t("loading")}</span>
+      </div>
+    );
+  } else if (configLoadState === "error") {
+    configContent = (
+      <div
+        aria-live="polite"
+        className="flex flex-col items-center gap-3 px-3 py-6 text-center text-[13px] text-muted-foreground"
+        role="alert"
+      >
+        <p>{t("cloudLoadFailed")}</p>
+        <p className="text-[11px] opacity-70">{t("loadFailedRetry")}</p>
+        <button
+          className="rounded-[6px] border border-border px-3 py-1.5 text-foreground transition-colors hover:bg-foreground/5 disabled:opacity-40"
+          onClick={loadConfigs}
+          type="button"
+        >
+          {t("retry")}
+        </button>
+      </div>
+    );
+  } else if (configs.length === 0) {
+    configContent = (
+      <div className="flex flex-col items-center gap-3 py-6 text-muted-foreground">
+        <Cloud className="h-10 w-10 opacity-40" />
+        <p className="text-[13px]">{t("noCloudConfig")}</p>
+        <p className="text-center text-[11px] opacity-70">
+          {t("shareNeedsCloud")}
+          <br />
+          {t("shareAddCloudHint")}
+        </p>
+        <button
+          className="rounded-md bg-primary px-4 py-1.5 font-medium text-[13px] text-primary-foreground transition-opacity hover:opacity-90"
+          onClick={handleOpenCloudSettings}
+          type="button"
+        >
+          {t("cloudSync")}
+        </button>
+      </div>
+    );
+  } else {
+    configContent = (
+      <>
+        <div>
+          <label
+            className="mb-1.5 block font-medium text-[11px] text-muted-foreground uppercase tracking-wider"
+            htmlFor="share-provider"
+          >
+            {t("uploadTo")}
+          </label>
+          <div className="max-h-[min(15rem,40dvh)] space-y-1 overflow-y-auto overscroll-contain pr-1">
+            {configs.map((cfg) => (
+              <button
+                aria-pressed={selectedId === cfg.id}
+                className={`flex w-full min-w-0 items-center rounded-[6px] border px-3 py-2.5 text-left text-[13px] transition-colors ${
+                  selectedId === cfg.id
+                    ? "border-primary/50 bg-primary/10 text-primary"
+                    : "border-input text-muted-foreground hover:border-muted-foreground"
+                }`}
+                disabled={loading}
+                id={cfg.id === configs[0]?.id ? "share-provider" : undefined}
+                key={cfg.id}
+                onClick={() => setSelectedId(cfg.id)}
+                type="button"
+              >
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="min-w-0 flex-1 truncate text-foreground">
+                      {cfg.name}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-[min(28rem,calc(100vw-1rem))] break-all">
+                    {cfg.name}
+                  </TooltipContent>
+                </Tooltip>
+                <span className="ml-2 shrink-0 text-[11px] opacity-60">
+                  {PROVIDER_LABELS[cfg.provider] || cfg.provider}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <p className="text-[11px] text-muted-foreground/70">
+          {t("shareDescription", { count: photoIds.length })}
+        </p>
+
+        <DialogFooter>
+          <button
+            className="rounded-md border border-border px-4 py-1.5 font-medium text-[13px] text-muted-foreground transition-colors hover:bg-foreground/5 disabled:opacity-40"
+            disabled={loading}
+            onClick={onClose}
+            type="button"
+          >
+            {t("cancel")}
+          </button>
+          <AnimatedActionButton
+            className="py-1.5"
+            disabled={!selectedId || loading}
+            icon={
+              loading ? (
+                <LoadingSpinner size="sm" variant="inherit" />
+              ) : (
+                <Share2 className="h-4 w-4" />
+              )
+            }
+            loading={loading}
+            onClick={handleGenerate}
+          >
+            {loading ? t("generating") : t("generateAndPublish")}
+          </AnimatedActionButton>
+        </DialogFooter>
+      </>
+    );
+  }
+
+  return (
+    <Dialog
+      onOpenChange={(next) => {
+        if (!(next || loading)) {
+          onClose();
+        }
+      }}
+      open={open}
+    >
+      <DialogContent
+        className="max-h-[calc(100dvh-1rem)] overflow-y-auto overflow-x-hidden overscroll-contain"
+        onEscapeKeyDown={(e) => {
+          if (loading) {
+            e.preventDefault();
+          }
+        }}
+        onPointerDownOutside={(e) => {
+          if (loading) {
+            e.preventDefault();
+          }
+        }}
+        showCloseButton={!loading}
+        size="lg"
+      >
+        <DialogHeader>
+          <DialogTitle>{t("sharePageTitle")}</DialogTitle>
+          <DialogDescription className="sr-only">
+            {t("shareDescription", { count: photoIds.length })}
+          </DialogDescription>
+        </DialogHeader>
+
+        {result ? (
+          <div className="space-y-4">
+            <div className="flex items-center gap-2 rounded-[6px] bg-success/10 px-3 py-2 text-[12px] text-success">
+              <Share2 className="h-4 w-4 flex-shrink-0" />
+              {t("sharePublishedCloud")}
+            </div>
+            {result.provider === "webdav" && (
+              <div className="rounded-[6px] bg-warning/10 px-3 py-2 text-[11px] text-warning/80">
+                {t("webdavPrivateNote")}
+              </div>
+            )}
+            <div>
+              <label
+                className="mb-1.5 block font-medium text-[11px] text-muted-foreground uppercase tracking-wider"
+                htmlFor="share-link"
+              >
+                {t("shareLink")}
+              </label>
+              <div className="flex min-w-0 items-center gap-2">
+                <input
+                  className="h-8 min-w-0 flex-1 rounded-[4px] border border-input bg-card px-3 font-mono text-[12px] text-foreground outline-none"
+                  id="share-link"
+                  readOnly
+                  value={result.url}
+                />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      aria-label={t("copyLink")}
+                      className="flex h-8 w-8 items-center justify-center rounded-[4px] border border-input text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+                      onClick={handleCopyUrl}
+                      type="button"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("copyLink")}</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      aria-label={t("openInBrowser")}
+                      className="flex h-8 w-8 items-center justify-center rounded-[4px] border border-input text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+                      onClick={() => openExternalLink(result.url)}
+                      type="button"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("openInBrowser")}</TooltipContent>
+                </Tooltip>
+              </div>
+            </div>
+            <DialogFooter>
+              <button
+                className="rounded-md border border-border px-4 py-1.5 font-medium text-[13px] text-muted-foreground transition-colors hover:bg-foreground/5"
+                onClick={onClose}
+                type="button"
+              >
+                {t("close")}
+              </button>
+            </DialogFooter>
+          </div>
+        ) : (
+          configContent
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}

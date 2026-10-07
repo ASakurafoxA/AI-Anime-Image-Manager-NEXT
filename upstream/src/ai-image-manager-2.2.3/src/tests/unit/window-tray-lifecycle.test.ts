@@ -1,0 +1,259 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  createBeforeQuitHandler,
+  destroyTraySafely,
+  observeWindowLoad,
+  prepareForQuit,
+  showOrCreateWindow,
+  type WindowLifecycleHandle,
+} from "@/services/window-tray-lifecycle";
+
+describe("window loading lifecycle", () => {
+  it("keeps a real load failure actionable while the window is active", async () => {
+    const error = new Error("ERR_FAILED (-2)");
+    const onFailure = vi.fn();
+    const onInactive = vi.fn();
+    await observeWindowLoad({
+      load: Promise.reject(error),
+      isActive: () => true,
+      onFailure,
+      onInactive,
+    });
+    expect(onFailure).toHaveBeenCalledExactlyOnceWith(error);
+    expect(onInactive).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "quitting",
+    "destroyed",
+    "replaced",
+  ])("checks ownership after a pending load rejects when %s", async (reason) => {
+    const loadingWindow = { isDestroyed: () => destroyed };
+    let destroyed = false;
+    let quitting = false;
+    let currentWindow: typeof loadingWindow | null = loadingWindow;
+    let rejectLoad: ((error: Error) => void) | undefined;
+    const load = new Promise<void>((_resolve, reject) => {
+      rejectLoad = reject;
+    });
+    const onFailure = vi.fn();
+    const onInactive = vi.fn();
+    const observed = observeWindowLoad({
+      load,
+      isActive: () =>
+        !(quitting || loadingWindow.isDestroyed()) &&
+        currentWindow === loadingWindow,
+      onFailure,
+      onInactive,
+    });
+    if (reason === "quitting") {
+      quitting = true;
+    } else if (reason === "destroyed") {
+      destroyed = true;
+    } else {
+      currentWindow = null;
+    }
+    const error = new Error("ERR_FAILED (-2)");
+    rejectLoad?.(error);
+    await observed;
+    expect(onFailure).not.toHaveBeenCalled();
+    expect(onInactive).toHaveBeenCalledExactlyOnceWith(error);
+  });
+
+  it("does not report successful loads even after ownership changes", async () => {
+    const onFailure = vi.fn();
+    const onInactive = vi.fn();
+    await observeWindowLoad({
+      load: Promise.resolve(),
+      isActive: () => false,
+      onFailure,
+      onInactive,
+    });
+    expect(onFailure).not.toHaveBeenCalled();
+    expect(onInactive).not.toHaveBeenCalled();
+  });
+});
+
+function createWindowMock(
+  overrides: Partial<WindowLifecycleHandle> = {}
+): WindowLifecycleHandle {
+  return {
+    focus: vi.fn(),
+    isDestroyed: vi.fn(() => false),
+    isMinimized: vi.fn(() => false),
+    restore: vi.fn(),
+    show: vi.fn(),
+    ...overrides,
+  };
+}
+
+describe("window and tray lifecycle", () => {
+  it("destroys a tray and tolerates an already-cleared reference", () => {
+    const destroy = vi.fn();
+    const onError = vi.fn();
+    const tray = { destroy };
+
+    destroyTraySafely(tray, onError);
+    destroyTraySafely(null, onError);
+
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("reports tray destroy failures without throwing", () => {
+    const error = new Error("destroy failed");
+    const onError = vi.fn();
+
+    const destroyed = destroyTraySafely(
+      {
+        destroy: () => {
+          throw error;
+        },
+      },
+      onError
+    );
+
+    expect(destroyed).toBe(false);
+    expect(onError).toHaveBeenCalledWith(error);
+  });
+
+  it("shows and focuses an existing minimized window", () => {
+    const window = createWindowMock({ isMinimized: vi.fn(() => true) });
+
+    showOrCreateWindow({
+      createWindow: vi.fn(),
+      isQuitting: false,
+      window,
+    });
+
+    expect(window.restore).toHaveBeenCalledOnce();
+    expect(window.show).toHaveBeenCalledOnce();
+    expect(window.focus).toHaveBeenCalledOnce();
+  });
+
+  it("recreates a destroyed window", () => {
+    const createWindow = vi.fn();
+    const window = createWindowMock({ isDestroyed: vi.fn(() => true) });
+
+    showOrCreateWindow({
+      createWindow,
+      isQuitting: false,
+      window,
+    });
+
+    expect(createWindow).toHaveBeenCalledOnce();
+    expect(window.show).not.toHaveBeenCalled();
+  });
+
+  it("does not recreate or show a window while quitting", () => {
+    const createWindow = vi.fn();
+    const window = createWindowMock({ isDestroyed: vi.fn(() => true) });
+
+    showOrCreateWindow({
+      createWindow,
+      isQuitting: true,
+      window,
+    });
+
+    expect(createWindow).not.toHaveBeenCalled();
+    expect(window.show).not.toHaveBeenCalled();
+  });
+
+  it("marks the app as quitting before destroying the tray", () => {
+    const events: string[] = [];
+
+    prepareForQuit({
+      destroyTray: () => {
+        events.push("destroy-tray");
+      },
+      markQuitting: () => {
+        events.push("mark-quitting");
+      },
+    });
+
+    expect(events).toEqual(["mark-quitting", "destroy-tray"]);
+  });
+
+  it("waits for cleanup once and allows the second quit event", async () => {
+    let finishCleanup: (() => void) | undefined;
+    const cleanup = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishCleanup = resolve;
+        })
+    );
+    const destroyTray = vi.fn();
+    const markQuitting = vi.fn();
+    const onCleanupError = vi.fn();
+    const requestQuit = vi.fn();
+    const firstEvent = { preventDefault: vi.fn() };
+    const duplicateEvent = { preventDefault: vi.fn() };
+    const finalEvent = { preventDefault: vi.fn() };
+    const handler = createBeforeQuitHandler({
+      cleanup,
+      destroyTray,
+      markQuitting,
+      onCleanupError,
+      requestQuit,
+    });
+
+    handler(firstEvent);
+    handler(duplicateEvent);
+
+    expect(firstEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(duplicateEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+
+    finishCleanup?.();
+    await vi.waitFor(() => {
+      expect(requestQuit).toHaveBeenCalledOnce();
+    });
+
+    handler(finalEvent);
+    expect(finalEvent.preventDefault).not.toHaveBeenCalled();
+    expect(onCleanupError).not.toHaveBeenCalled();
+    expect(destroyTray).toHaveBeenCalledTimes(3);
+    expect(markQuitting).toHaveBeenCalledTimes(3);
+  });
+
+  it("still requests the final quit when cleanup fails", async () => {
+    const error = new Error("cleanup failed");
+    const onCleanupError = vi.fn();
+    const requestQuit = vi.fn();
+    const handler = createBeforeQuitHandler({
+      cleanup: () => Promise.reject(error),
+      destroyTray: vi.fn(),
+      markQuitting: vi.fn(),
+      onCleanupError,
+      requestQuit,
+    });
+
+    handler({ preventDefault: vi.fn() });
+
+    await vi.waitFor(() => {
+      expect(requestQuit).toHaveBeenCalledOnce();
+    });
+    expect(onCleanupError).toHaveBeenCalledWith(error);
+  });
+
+  it("blocks a manual quit while an update installer is active", () => {
+    const event = { preventDefault: vi.fn() };
+    const onQuitBlocked = vi.fn();
+    const cleanup = vi.fn(async () => undefined);
+    const handler = createBeforeQuitHandler({
+      cleanup,
+      destroyTray: vi.fn(),
+      markQuitting: vi.fn(),
+      onCleanupError: vi.fn(),
+      onQuitBlocked,
+      requestQuit: vi.fn(),
+      shouldBlockQuit: () => true,
+    });
+
+    handler(event);
+
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(onQuitBlocked).toHaveBeenCalledOnce();
+    expect(cleanup).not.toHaveBeenCalled();
+  });
+});

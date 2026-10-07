@@ -1,0 +1,354 @@
+import {
+  createRootRoute,
+  Outlet,
+  useLocation,
+  useNavigate,
+} from "@tanstack/react-router";
+import {
+  type ReactNode,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
+import {
+  getDiagnosticsOverview,
+  recordRendererIncident,
+} from "@/actions/diagnostics";
+import { consumeUpdateWelcome } from "@/actions/update-changelog";
+import DragWindowRegion from "@/components/drag-window-region";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { StartupSplash } from "@/components/startup-splash";
+import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { APP_DISPLAY_NAME, PRIVATE_BUILD } from "@/config/private-build";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { BrowseSessionProvider } from "@/contexts/BrowseSessionContext";
+import { ImportDropProvider } from "@/contexts/import-drop-context";
+import { ScrollPositionProvider } from "@/contexts/ScrollPositionContext";
+import { SidebarFilterProvider } from "@/contexts/SidebarFilterContext";
+import BaseLayout from "@/layouts/base-layout";
+import { isBenignRendererErrorMessage } from "@/utils/renderer-error-filter";
+import {
+  STARTUP_HOME_READY_EVENT,
+  STARTUP_ONBOARDING_STATE_EVENT,
+  type StartupOnboardingStateDetail,
+} from "@/utils/startup-readiness";
+
+const STARTUP_READY_TIMEOUT_MS = 15_000;
+const STARTUP_SPLASH_FADE_MS = 180;
+const ROUTE_DIAGNOSTIC_PATTERN = /^\/(albums|people|cull)\/[^/]+/;
+
+function RouteSuspense() {
+  return (
+    <div className="flex h-full items-center justify-center">
+      <LoadingSpinner size="xl" />
+    </div>
+  );
+}
+
+function Root() {
+  const { t } = useTranslation();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const diagnosticNoticeShown = useRef(false);
+  const isTestEnvironment = Boolean(
+    window.electronAPI?.isE2E || !window.electronAPI?.preloadReady
+  );
+  const [startupReady, setStartupReady] = useState(isTestEnvironment);
+  const [onboardingStateKnown, setOnboardingStateKnown] =
+    useState(isTestEnvironment);
+  const [needsOnboarding, setNeedsOnboarding] = useState(isTestEnvironment);
+  const [homeReady, setHomeReady] = useState(isTestEnvironment);
+  const [startupTimedOut, setStartupTimedOut] = useState(false);
+  const [renderSplash, setRenderSplash] = useState(!isTestEnvironment);
+  const [splashExiting, setSplashExiting] = useState(false);
+
+  useEffect(() => {
+    const route = location.pathname.replace(
+      ROUTE_DIAGNOSTIC_PATTERN,
+      "/$1/:id"
+    );
+    const record = (action: string, message: string, stack?: string) => {
+      try {
+        // Keep the global error handler safe even if a partially initialized
+        // IPC client returns synchronously during renderer startup.
+        Promise.resolve(
+          recordRendererIncident({ action, message, stack, route })
+        ).catch(() => {
+          // Diagnostics are best-effort and must never create another UI failure.
+        });
+      } catch {
+        // A synchronous IPC failure must not become a second renderer error.
+      }
+    };
+    const handleError = (event: ErrorEvent) => {
+      if (isBenignRendererErrorMessage(event.message)) {
+        return;
+      }
+      record(
+        "window-error",
+        event.message || "Unhandled renderer error",
+        event.error?.stack
+      );
+    };
+    const handleRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason;
+      record(
+        "unhandled-rejection",
+        reason instanceof Error ? reason.message : String(reason),
+        reason instanceof Error ? reason.stack : undefined
+      );
+    };
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleRejection);
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleRejection);
+    };
+  }, [location.pathname]);
+
+  useEffect(() => {
+    // 自用版：关闭启动时的「发现 N 个待反馈故障」提示横幅
+    // （见 private-build.ts 的 hideDiagnosticsNotice）。故障仍会被记录，只是不弹提示。
+    if (PRIVATE_BUILD.hideDiagnosticsNotice) {
+      return;
+    }
+    if (diagnosticNoticeShown.current) {
+      return;
+    }
+    diagnosticNoticeShown.current = true;
+    Promise.resolve(getDiagnosticsOverview())
+      .then((overview) => {
+        if (overview.pendingIncidents.length === 0) {
+          return;
+        }
+        toast.warning(
+          t("diagnosticsPendingStartup", {
+            count: overview.pendingIncidents.length,
+          }),
+          {
+            action: {
+              label: t("diagnosticsOpenPage"),
+              onClick: () => {
+                navigate({ to: "/settings/diagnostics" }).catch(() => {
+                  // The page remains available through Settings.
+                });
+              },
+            },
+          }
+        );
+      })
+      .catch(() => {
+        // Diagnostics are best-effort during renderer startup.
+      });
+  }, [navigate, t]);
+
+  useLayoutEffect(() => {
+    const handleHomeReady = () => {
+      setHomeReady(true);
+    };
+    const handleOnboardingState = (event: Event) => {
+      const detail = (event as CustomEvent<StartupOnboardingStateDetail>)
+        .detail;
+      if (!detail) {
+        return;
+      }
+      setNeedsOnboarding(detail.needsOnboarding);
+      setOnboardingStateKnown(true);
+    };
+
+    window.addEventListener(STARTUP_HOME_READY_EVENT, handleHomeReady);
+    window.addEventListener(
+      STARTUP_ONBOARDING_STATE_EVENT,
+      handleOnboardingState
+    );
+
+    return () => {
+      window.removeEventListener(STARTUP_HOME_READY_EVENT, handleHomeReady);
+      window.removeEventListener(
+        STARTUP_ONBOARDING_STATE_EVENT,
+        handleOnboardingState
+      );
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    if (isTestEnvironment) {
+      return () => {
+        active = false;
+      };
+    }
+
+    consumeUpdateWelcome()
+      .then(({ version }) => {
+        if (!active) {
+          return;
+        }
+
+        if (!version) {
+          setStartupReady(true);
+          return;
+        }
+
+        return navigate({
+          to: "/whats-new",
+          search: { version },
+          replace: true,
+        }).finally(() => {
+          if (active) {
+            setStartupReady(true);
+          }
+        });
+      })
+      .catch((error) => {
+        console.error("Failed to check update welcome state", error);
+        if (active) {
+          setStartupReady(true);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [isTestEnvironment, navigate]);
+
+  const isHomeRoute = location.pathname === "/";
+  const surfaceReady = onboardingStateKnown && (needsOnboarding || homeReady);
+  const startupWaiting = !startupReady || (isHomeRoute && !surfaceReady);
+  const shouldShowSplash = !startupTimedOut && startupWaiting;
+
+  useEffect(() => {
+    if (isTestEnvironment || startupTimedOut || !startupWaiting) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      console.warn(
+        "[startup] Initial surface readiness timed out; revealing fallback UI"
+      );
+      setStartupTimedOut(true);
+    }, STARTUP_READY_TIMEOUT_MS);
+
+    return () => window.clearTimeout(timeout);
+  }, [isTestEnvironment, startupTimedOut, startupWaiting]);
+
+  useEffect(() => {
+    if (shouldShowSplash) {
+      setRenderSplash(true);
+      setSplashExiting(false);
+      return;
+    }
+
+    if (!renderSplash) {
+      return;
+    }
+
+    setSplashExiting(true);
+    const timeout = window.setTimeout(() => {
+      setRenderSplash(false);
+      setSplashExiting(false);
+    }, STARTUP_SPLASH_FADE_MS);
+
+    return () => window.clearTimeout(timeout);
+  }, [renderSplash, shouldShowSplash]);
+
+  const content = (
+    <ErrorBoundary>
+      <Suspense fallback={<RouteSuspense />}>
+        <Outlet />
+      </Suspense>
+    </ErrorBoundary>
+  );
+
+  return (
+    <>
+      <TooltipProvider>
+        <ScrollPositionProvider>
+          <RootSurface pathname={location.pathname}>{content}</RootSurface>
+        </ScrollPositionProvider>
+      </TooltipProvider>
+      {renderSplash && <StartupSplash exiting={splashExiting} />}
+    </>
+  );
+}
+
+export function RootSurface({
+  children,
+  pathname,
+}: {
+  children: ReactNode;
+  pathname: string;
+}) {
+  return (
+    <SidebarFilterProvider>
+      <ImportDropProvider>
+        <BrowseSessionProvider>
+          {pathname === "/whats-new" ? (
+            <StandaloneLayout>{children}</StandaloneLayout>
+          ) : (
+            <BaseLayout>{children}</BaseLayout>
+          )}
+        </BrowseSessionProvider>
+      </ImportDropProvider>
+    </SidebarFilterProvider>
+  );
+}
+
+function StandaloneLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex h-dvh min-h-0 min-w-0 flex-col overflow-hidden bg-background">
+      <DragWindowRegion title={APP_DISPLAY_NAME} />
+      <main className="min-h-0 min-w-0 flex-1 overflow-hidden">{children}</main>
+    </div>
+  );
+}
+
+function RootError() {
+  const { t } = useTranslation();
+
+  return (
+    <div className="flex min-h-dvh min-w-0 flex-col items-center justify-center gap-3 overflow-y-auto px-4 py-4 text-center sm:px-6">
+      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-danger/10">
+        <svg
+          aria-hidden="true"
+          className="h-5 w-5 text-danger"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          viewBox="0 0 24 24"
+        >
+          <path
+            d="M12 9v3.75m9-.75a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 3.75h.008v.008H12v-.008Z"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </div>
+      <div className="min-w-0 max-w-full">
+        <p className="font-medium text-[13px] text-foreground">
+          {t("routeErrorTitle")}
+        </p>
+        <p className="mt-1 break-words text-[12px] text-muted-foreground">
+          {t("routeErrorDescription")}
+        </p>
+      </div>
+      <button
+        className="rounded-[6px] bg-primary/10 px-3 py-1.5 font-medium text-[12px] text-primary transition-colors hover:bg-primary/20"
+        onClick={() => window.location.reload()}
+        type="button"
+      >
+        {t("refresh")}
+      </button>
+    </div>
+  );
+}
+
+export const Route = createRootRoute({
+  component: Root,
+  errorComponent: RootError,
+});

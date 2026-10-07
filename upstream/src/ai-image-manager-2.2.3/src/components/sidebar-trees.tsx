@@ -1,0 +1,961 @@
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { ChevronDown, ChevronRight, Pin } from "lucide-react";
+import type React from "react";
+import type { ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { getTagDisplayName } from "@/localization/tag-display";
+import type { Folder as FolderType } from "@/types/photo";
+import { FolderBadge } from "./FolderBadge";
+
+export interface TagInfo {
+  color: string | null;
+  id: number;
+  name: string;
+  parentId: number | null;
+  photoCount: number;
+}
+
+interface TagTreeNode {
+  children: TagTreeNode[];
+  /** 自用版：所属一级标签的 id —— 小点颜色按它取，于是整棵子树的色签一致（= 归属） */
+  dotColorId?: number;
+  tag: TagInfo;
+}
+
+export interface FolderTreeNode {
+  children: FolderTreeNode[];
+  folder: FolderType;
+}
+
+export interface VisibleFolderNode {
+  ancestorContinuations: Array<number | null>;
+  depth: number;
+  isLastSibling: boolean;
+  node: FolderTreeNode;
+}
+
+const FOLDER_INDENT_PX = 12;
+const MAX_VISIBLE_FOLDER_DEPTH = 6;
+const VIRTUAL_FOLDER_THRESHOLD = 200;
+const folderNameCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
+
+function markReachableFolderNodes(
+  startingNodes: FolderTreeNode[],
+  reachableIds: Set<number>
+) {
+  const stack = [...startingNodes];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || reachableIds.has(node.folder.id)) {
+      continue;
+    }
+    reachableIds.add(node.folder.id);
+    stack.push(...node.children);
+  }
+}
+
+function getTreeRowClassName({
+  activeClassName,
+  isActive,
+  isDragOver,
+}: {
+  activeClassName: string;
+  isActive: boolean;
+  isDragOver: boolean;
+}) {
+  const base =
+    "flex min-w-0 flex-1 items-center gap-2 rounded-[6px] text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50";
+  if (isDragOver) {
+    return `${base} bg-primary/20 text-primary ring-1 ring-primary/50`;
+  }
+  if (isActive) {
+    return `${base} ${activeClassName}`;
+  }
+  return `${base} text-muted-foreground hover:bg-foreground/5 hover:text-foreground`;
+}
+
+export function buildFolderTree(folders: FolderType[]): FolderTreeNode[] {
+  const nodeMap = new Map<number, FolderTreeNode>();
+  const roots: FolderTreeNode[] = [];
+
+  for (const f of folders) {
+    nodeMap.set(f.id, { folder: f, children: [] });
+  }
+  for (const f of folders) {
+    const node = nodeMap.get(f.id);
+    if (!node) {
+      continue;
+    }
+    if (f.parentId != null && nodeMap.has(f.parentId)) {
+      nodeMap.get(f.parentId)?.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+
+  const reachableIds = new Set<number>();
+  markReachableFolderNodes(roots, reachableIds);
+  for (const node of nodeMap.values()) {
+    if (!reachableIds.has(node.folder.id)) {
+      roots.push(node);
+      markReachableFolderNodes([node], reachableIds);
+    }
+  }
+
+  const compareNodes = (a: FolderTreeNode, b: FolderTreeNode) =>
+    folderNameCollator.compare(a.folder.displayName, b.folder.displayName) ||
+    a.folder.path.localeCompare(b.folder.path);
+  roots.sort(compareNodes);
+  for (const node of nodeMap.values()) {
+    node.children.sort(compareNodes);
+  }
+  return roots;
+}
+
+export function pinFolderTreeNodes(
+  nodes: FolderTreeNode[],
+  pinnedIds: readonly number[]
+): FolderTreeNode[] {
+  if (pinnedIds.length === 0) {
+    return nodes;
+  }
+
+  const pinnedIdSet = new Set(pinnedIds);
+  const pinnedNodes = new Map<number, FolderTreeNode>();
+
+  function removePinnedNodes(
+    node: FolderTreeNode,
+    ancestors: ReadonlySet<number> = new Set()
+  ): FolderTreeNode | null {
+    if (ancestors.has(node.folder.id)) {
+      return null;
+    }
+
+    const nextAncestors = new Set(ancestors);
+    nextAncestors.add(node.folder.id);
+    const remainingChildren: FolderTreeNode[] = [];
+    for (const child of node.children) {
+      const remainingChild = removePinnedNodes(child, nextAncestors);
+      if (remainingChild) {
+        remainingChildren.push(remainingChild);
+      }
+    }
+
+    if (pinnedIdSet.has(node.folder.id)) {
+      pinnedNodes.set(node.folder.id, {
+        children: remainingChildren,
+        folder: node.folder,
+      });
+      return null;
+    }
+
+    return { children: remainingChildren, folder: node.folder };
+  }
+
+  const remainingRoots = nodes
+    .map((node) => removePinnedNodes(node))
+    .filter((node): node is FolderTreeNode => node !== null);
+  const pinnedRoots = pinnedIds
+    .map((id) => pinnedNodes.get(id))
+    .filter((node): node is FolderTreeNode => node !== undefined);
+
+  return [...pinnedRoots, ...remainingRoots];
+}
+
+export function flattenVisibleFolderTree(
+  nodes: FolderTreeNode[],
+  expandedIds: Set<number>
+): VisibleFolderNode[] {
+  const visible: VisibleFolderNode[] = [];
+  const visited = new Set<number>();
+  const stack: VisibleFolderNode[] = [];
+  for (let index = nodes.length - 1; index >= 0; index--) {
+    stack.push({
+      ancestorContinuations: [],
+      depth: 0,
+      isLastSibling: index === nodes.length - 1,
+      node: nodes[index],
+    });
+  }
+
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (!item || visited.has(item.node.folder.id)) {
+      continue;
+    }
+    visited.add(item.node.folder.id);
+    visible.push(item);
+
+    if (expandedIds.has(item.node.folder.id)) {
+      for (let index = item.node.children.length - 1; index >= 0; index--) {
+        stack.push({
+          ancestorContinuations:
+            item.depth === 0
+              ? []
+              : [
+                  ...item.ancestorContinuations,
+                  item.isLastSibling ? null : item.node.folder.id,
+                ],
+          depth: item.depth + 1,
+          isLastSibling: index === item.node.children.length - 1,
+          node: item.node.children[index],
+        });
+      }
+    }
+  }
+
+  return visible;
+}
+
+interface FolderTreeBranchProps {
+  expanded: boolean;
+  isActive?: boolean;
+  item: VisibleFolderNode;
+  onToggle: (id: number) => void;
+  toggleLabel?: string;
+}
+
+export function FolderTreeBranch({
+  expanded,
+  isActive = false,
+  item,
+  onToggle,
+  toggleLabel,
+}: FolderTreeBranchProps) {
+  const { ancestorContinuations, depth, isLastSibling, node } = item;
+  const hasChildren = node.children.length > 0;
+  const visibleDepth = Math.min(depth, MAX_VISIBLE_FOLDER_DEPTH);
+
+  return (
+    <div
+      aria-hidden={toggleLabel ? undefined : "true"}
+      className="relative flex-shrink-0 self-stretch"
+      style={{ width: visibleDepth * FOLDER_INDENT_PX + 20 }}
+    >
+      {Array.from(
+        { length: Math.max(0, visibleDepth - 1) },
+        (_, guideIndex) => {
+          const ancestorId = ancestorContinuations[guideIndex];
+          return ancestorId !== null && ancestorId !== undefined ? (
+            <span
+              className="pointer-events-none absolute top-0 bottom-0 w-px bg-foreground/20"
+              data-tree-guide="ancestor"
+              key={ancestorId}
+              style={{
+                left: guideIndex * FOLDER_INDENT_PX + 10,
+              }}
+            />
+          ) : null;
+        }
+      )}
+      {visibleDepth > 0 && (
+        <>
+          <span
+            className={`pointer-events-none absolute top-0 w-px ${isActive ? "bg-primary/70" : "bg-foreground/25"}`}
+            data-tree-guide="branch"
+            style={{
+              height: isLastSibling ? "50%" : "100%",
+              left: (visibleDepth - 1) * FOLDER_INDENT_PX + 10,
+            }}
+          />
+          <span
+            className={`pointer-events-none absolute top-1/2 h-px ${isActive ? "bg-primary/70" : "bg-foreground/25"}`}
+            data-tree-guide="elbow"
+            style={{
+              left: (visibleDepth - 1) * FOLDER_INDENT_PX + 10,
+              width: FOLDER_INDENT_PX,
+            }}
+          />
+        </>
+      )}
+      {hasChildren && (
+        <button
+          aria-hidden={toggleLabel ? undefined : "true"}
+          aria-label={toggleLabel}
+          className="absolute top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-[4px] text-muted-foreground/70 hover:text-foreground"
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggle(node.folder.id);
+          }}
+          style={{ left: visibleDepth * FOLDER_INDENT_PX }}
+          tabIndex={toggleLabel ? 0 : -1}
+          type="button"
+        >
+          <ChevronRight
+            className={`h-3 w-3 transition-transform ${expanded ? "rotate-90" : ""}`}
+          />
+        </button>
+      )}
+    </div>
+  );
+}
+
+interface FolderTreeProps {
+  activeId: number | null;
+  dragOverId: number | null;
+  expandedIds: Set<number>;
+  label: string;
+  nodes: FolderTreeNode[];
+  onContextMenu: (e: React.MouseEvent, id: number, name: string) => void;
+  onDragLeave: () => void;
+  onDragOver: (e: React.DragEvent, id: number) => void;
+  onDrop: (e: React.DragEvent, id: number) => void;
+  onSelect: (id: number) => void;
+  onToggle: (id: number) => void;
+  onTogglePinned?: () => void;
+  pinnedBoundaryLabel?: string;
+  pinnedCollapsed?: boolean;
+  pinnedFolderIds?: readonly number[];
+  pinnedLabel?: string;
+}
+
+export function FolderTree({
+  activeId,
+  dragOverId,
+  expandedIds,
+  label,
+  nodes,
+  onTogglePinned,
+  onContextMenu,
+  onDragLeave,
+  onDragOver,
+  onDrop,
+  onSelect,
+  onToggle,
+  pinnedBoundaryLabel,
+  pinnedCollapsed = false,
+  pinnedFolderIds = [],
+  pinnedLabel,
+}: FolderTreeProps) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pendingFocusRef = useRef(false);
+  const [hasMoreBelow, setHasMoreBelow] = useState(false);
+  const pinnedIdSet = useMemo(
+    () => new Set(pinnedFolderIds),
+    [pinnedFolderIds]
+  );
+  const pinnedRootCount = useMemo(() => {
+    let count = 0;
+    while (
+      count < nodes.length &&
+      pinnedIdSet.has(nodes[count]?.folder.id ?? -1)
+    ) {
+      count += 1;
+    }
+    return count;
+  }, [nodes, pinnedIdSet]);
+  const hasPinnedSection = Boolean(
+    pinnedRootCount > 0 && pinnedLabel && onTogglePinned
+  );
+  const pinnedHeaderOffset = hasPinnedSection ? 1 : 0;
+  const treeNodes = pinnedCollapsed ? nodes.slice(pinnedRootCount) : nodes;
+  const visibleNodes = useMemo(
+    () => flattenVisibleFolderTree(treeNodes, expandedIds),
+    [expandedIds, treeNodes]
+  );
+  const pinnedBoundaryIndex = useMemo(() => {
+    if (!hasPinnedSection || pinnedCollapsed) {
+      return -1;
+    }
+    return visibleNodes.findIndex(
+      (item) => item.depth === 0 && !pinnedIdSet.has(item.node.folder.id)
+    );
+  }, [hasPinnedSection, pinnedCollapsed, pinnedIdSet, visibleNodes]);
+  const hasPinnedBoundary =
+    pinnedBoundaryIndex >= 0 && Boolean(pinnedBoundaryLabel);
+  const pinnedBoundaryOffset = hasPinnedBoundary ? 1 : 0;
+  const activeVisible =
+    activeId !== null &&
+    visibleNodes.some((item) => item.node.folder.id === activeId);
+  const [focusedId, setFocusedId] = useState<number | null>(
+    activeVisible ? activeId : (visibleNodes[0]?.node.folder.id ?? null)
+  );
+  const shouldVirtualize = visibleNodes.length > VIRTUAL_FOLDER_THRESHOLD;
+  const virtualizer = useVirtualizer({
+    count: shouldVirtualize
+      ? visibleNodes.length + pinnedHeaderOffset + pinnedBoundaryOffset
+      : 0,
+    estimateSize: () => 32,
+    getItemKey: (index) => {
+      if (hasPinnedSection && index === 0) {
+        return "pinned-folder-section";
+      }
+      if (
+        hasPinnedBoundary &&
+        index === pinnedHeaderOffset + pinnedBoundaryIndex
+      ) {
+        return "pinned-folder-boundary";
+      }
+      const itemIndex =
+        index -
+        pinnedHeaderOffset -
+        (hasPinnedBoundary && index > pinnedHeaderOffset + pinnedBoundaryIndex
+          ? 1
+          : 0);
+      return visibleNodes[itemIndex].node.folder.id;
+    },
+    getScrollElement: () => scrollRef.current,
+    overscan: 8,
+  });
+  const virtualItems = virtualizer.getVirtualItems();
+  const virtualStartIndex = virtualItems[0]?.index ?? -1;
+  const virtualEndIndex = virtualItems.at(-1)?.index ?? -1;
+  const visibleNodeCount = visibleNodes.length;
+
+  const updateBottomFade = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) {
+      setHasMoreBelow(false);
+      return;
+    }
+    setHasMoreBelow(
+      element.scrollHeight - element.scrollTop - element.clientHeight > 2
+    );
+  }, []);
+
+  useEffect(() => {
+    if (visibleNodeCount === 0) {
+      setHasMoreBelow(false);
+      return;
+    }
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+    updateBottomFade();
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(updateBottomFade);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [updateBottomFade, visibleNodeCount]);
+
+  useEffect(() => {
+    if (visibleNodes.some((item) => item.node.folder.id === focusedId)) {
+      return;
+    }
+    setFocusedId(
+      activeId !== null &&
+        visibleNodes.some((item) => item.node.folder.id === activeId)
+        ? activeId
+        : (visibleNodes[0]?.node.folder.id ?? null)
+    );
+  }, [activeId, focusedId, visibleNodes]);
+
+  useEffect(() => {
+    if (!(pendingFocusRef.current && focusedId !== null)) {
+      return;
+    }
+    const index = visibleNodes.findIndex(
+      (item) => item.node.folder.id === focusedId
+    );
+    if (index < 0) {
+      return;
+    }
+    const targetIsOutsideVirtualRange =
+      shouldVirtualize &&
+      (() => {
+        const targetVirtualIndex =
+          index +
+          pinnedHeaderOffset +
+          (hasPinnedBoundary && index >= pinnedBoundaryIndex ? 1 : 0);
+        return (
+          targetVirtualIndex < virtualStartIndex ||
+          targetVirtualIndex > virtualEndIndex
+        );
+      })();
+    if (targetIsOutsideVirtualRange) {
+      virtualizer.scrollToIndex(
+        index +
+          pinnedHeaderOffset +
+          (hasPinnedBoundary && index >= pinnedBoundaryIndex ? 1 : 0),
+        { align: "auto" }
+      );
+      return;
+    }
+    const element = scrollRef.current?.querySelector<HTMLElement>(
+      `[data-folder-id="${focusedId}"]`
+    );
+    if (element) {
+      element.focus();
+      pendingFocusRef.current = false;
+    }
+  }, [
+    focusedId,
+    hasPinnedBoundary,
+    pinnedBoundaryIndex,
+    shouldVirtualize,
+    pinnedHeaderOffset,
+    virtualEndIndex,
+    virtualStartIndex,
+    virtualizer,
+    visibleNodes,
+  ]);
+
+  function focusFolder(id: number) {
+    pendingFocusRef.current = true;
+    setFocusedId(id);
+  }
+
+  function handleHorizontalKey(
+    key: string,
+    node: FolderTreeNode,
+    depth: number
+  ): boolean {
+    const hasChildren = node.children.length > 0;
+    const isExpanded = expandedIds.has(node.folder.id);
+    if (key === "ArrowRight") {
+      if (hasChildren && !isExpanded) {
+        onToggle(node.folder.id);
+      } else if (hasChildren) {
+        focusFolder(node.children[0].folder.id);
+      }
+      return true;
+    }
+    if (key !== "ArrowLeft") {
+      return false;
+    }
+    if (hasChildren && isExpanded) {
+      onToggle(node.folder.id);
+    } else if (depth > 0 && node.folder.parentId !== null) {
+      focusFolder(node.folder.parentId);
+    }
+    return true;
+  }
+
+  function handleKeyDown(
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    index: number
+  ) {
+    const item = visibleNodes[index];
+    if (!item) {
+      return;
+    }
+    const { node } = item;
+
+    const focusIndexByKey: Record<string, number> = {
+      ArrowDown: index + 1,
+      ArrowUp: index - 1,
+      End: visibleNodes.length - 1,
+      Home: 0,
+    };
+    const nextIndex = focusIndexByKey[event.key];
+    if (nextIndex !== undefined) {
+      event.preventDefault();
+      const target = visibleNodes[nextIndex];
+      if (target) {
+        focusFolder(target.node.folder.id);
+      }
+      return;
+    }
+    if (handleHorizontalKey(event.key, node, item.depth)) {
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onSelect(node.folder.id);
+    }
+  }
+
+  function renderPinnedHeader() {
+    if (!hasPinnedSection) {
+      return null;
+    }
+    return (
+      <div className="flex h-8 items-center px-1" role="presentation">
+        <button
+          aria-expanded={!pinnedCollapsed}
+          className="flex w-full items-center gap-1 rounded-[6px] px-2 py-1 text-left text-[11px] text-muted-foreground/70 transition-colors hover:bg-foreground/5 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50"
+          data-surface="pinned-folder-header"
+          onClick={() => onTogglePinned?.()}
+          type="button"
+        >
+          <Pin className="h-3 w-3 text-primary/80" />
+          <span className="font-medium uppercase tracking-wider">
+            {pinnedLabel}
+          </span>
+          <ChevronDown
+            className={`h-3.5 w-3.5 transition-transform ${
+              pinnedCollapsed ? "-rotate-90" : ""
+            }`}
+          />
+        </button>
+      </div>
+    );
+  }
+
+  function renderPinnedBoundary() {
+    if (!hasPinnedBoundary) {
+      return null;
+    }
+    return (
+      <div
+        className="flex h-8 items-center gap-2 px-3"
+        data-pinned-boundary="true"
+      >
+        <hr
+          aria-label={pinnedBoundaryLabel}
+          className="h-px min-w-0 flex-1 border-0 bg-border/70"
+        />
+        <span className="shrink-0 px-1 font-medium text-[10px] text-primary/80">
+          {pinnedBoundaryLabel}
+        </span>
+        <span aria-hidden="true" className="h-px min-w-0 flex-1 bg-border/70" />
+      </div>
+    );
+  }
+
+  function renderRow(item: VisibleFolderNode, index: number) {
+    const { depth, node } = item;
+    const hasChildren = node.children.length > 0;
+    const isExpanded = expandedIds.has(node.folder.id);
+    const isActive = activeId === node.folder.id;
+    const isDragOver = dragOverId === node.folder.id;
+
+    return (
+      <div className="flex h-8 items-center" key={node.folder.id}>
+        <FolderTreeBranch
+          expanded={isExpanded}
+          isActive={isActive}
+          item={item}
+          onToggle={onToggle}
+        />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              aria-expanded={hasChildren ? isExpanded : undefined}
+              aria-label={node.folder.path}
+              aria-level={depth + 1}
+              aria-selected={isActive}
+              className={`${getTreeRowClassName({
+                activeClassName: "nav-item-active bg-primary/15 text-primary",
+                isActive,
+                isDragOver,
+              })} px-2.5 py-1.5 text-[13px]`}
+              data-folder-id={node.folder.id}
+              onClick={() => onSelect(node.folder.id)}
+              onContextMenu={(event) =>
+                onContextMenu(event, node.folder.id, node.folder.displayName)
+              }
+              onDragLeave={onDragLeave}
+              onDragOver={(event) => onDragOver(event, node.folder.id)}
+              onDrop={(event) => onDrop(event, node.folder.id)}
+              onFocus={() => setFocusedId(node.folder.id)}
+              onKeyDown={(event) => handleKeyDown(event, index)}
+              role="treeitem"
+              tabIndex={focusedId === node.folder.id ? 0 : -1}
+              type="button"
+            >
+              {depth > MAX_VISIBLE_FOLDER_DEPTH && (
+                <span aria-hidden="true" className="text-muted-foreground/50">
+                  ...
+                </span>
+              )}
+              <FolderBadge folder={node.folder} />
+              <span className="min-w-0 flex-1 truncate">
+                {node.folder.displayName}
+              </span>
+              <span className="ml-1 flex-shrink-0 text-[10px] text-muted-foreground/70 tabular-nums">
+                {node.folder.totalPhotoCount ?? node.folder.photoCount}
+              </span>
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right">{node.folder.path}</TooltipContent>
+        </Tooltip>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      aria-label={label}
+      className="resource-tree-scroll min-h-0 flex-1 overflow-y-auto"
+      data-bottom-fade={hasMoreBelow}
+      data-resource-tree-scroll="true"
+      data-surface="resource-tree"
+      data-virtualized={shouldVirtualize}
+      onScroll={updateBottomFade}
+      ref={scrollRef}
+      role="tree"
+    >
+      {shouldVirtualize ? (
+        <div
+          style={{ height: virtualizer.getTotalSize(), position: "relative" }}
+        >
+          {virtualItems.map((virtualRow) => {
+            if (hasPinnedSection && virtualRow.index === 0) {
+              return (
+                <div
+                  key="pinned-folder-section"
+                  style={{
+                    left: 0,
+                    position: "absolute",
+                    top: 0,
+                    transform: `translateY(${virtualRow.start}px)`,
+                    width: "100%",
+                  }}
+                >
+                  {renderPinnedHeader()}
+                </div>
+              );
+            }
+            if (
+              hasPinnedBoundary &&
+              virtualRow.index === pinnedHeaderOffset + pinnedBoundaryIndex
+            ) {
+              return (
+                <div
+                  key="pinned-folder-boundary"
+                  style={{
+                    left: 0,
+                    position: "absolute",
+                    top: 0,
+                    transform: `translateY(${virtualRow.start}px)`,
+                    width: "100%",
+                  }}
+                >
+                  {renderPinnedBoundary()}
+                </div>
+              );
+            }
+            const itemIndex =
+              virtualRow.index -
+              pinnedHeaderOffset -
+              (hasPinnedBoundary &&
+              virtualRow.index > pinnedHeaderOffset + pinnedBoundaryIndex
+                ? 1
+                : 0);
+            const item = visibleNodes[itemIndex];
+            if (!item) {
+              return null;
+            }
+            return (
+              <div
+                key={item.node.folder.id}
+                style={{
+                  left: 0,
+                  position: "absolute",
+                  top: 0,
+                  transform: `translateY(${virtualRow.start}px)`,
+                  width: "100%",
+                }}
+              >
+                {renderRow(item, itemIndex)}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <>
+          {renderPinnedHeader()}
+          {visibleNodes.map((item, index) => (
+            <Fragment key={item.node.folder.id}>
+              {hasPinnedBoundary && index === pinnedBoundaryIndex
+                ? renderPinnedBoundary()
+                : null}
+              {renderRow(item, index)}
+            </Fragment>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 自用版：一级标签（角色 / 通用）的显示顺序。
+ * 不在表里的按原顺序排在后面。
+ */
+const TAG_ROOT_ORDER = ["角色", "通用"];
+
+/**
+ * 自用版：标签小点的**默认颜色**。
+ *
+ * 上游所有标签的小点都是同一个主题色，看不出层级/归属差异。
+ * 现在**整棵一级子树共用同一个颜色**（由一级标签 id 稳定决定），
+ * 于是二级、三级标签的色点天然标识了它属于哪个一级分组 —— 这正是"色签区分归属"。
+ *
+ * 用户为某个标签单独设过颜色（`tags.color`）时优先用自定义色。
+ */
+const ROOT_TAG_DOT_COLORS = [
+  "#f97316", // 橙
+  "#22c55e", // 绿
+  "#3b82f6", // 蓝
+  "#a855f7", // 紫
+  "#ec4899", // 粉
+  "#14b8a6", // 青
+  "#eab308", // 黄
+  "#ef4444", // 红
+];
+
+export function defaultTagDotColor(rootTagId: number): string {
+  const index = Math.abs(Math.trunc(rootTagId)) % ROOT_TAG_DOT_COLORS.length;
+  return ROOT_TAG_DOT_COLORS[index];
+}
+
+export function buildTagTree(tags: TagInfo[]): TagTreeNode[] {
+  const nodeMap = new Map<number, TagTreeNode>();
+  const roots: TagTreeNode[] = [];
+
+  for (const t of tags) {
+    nodeMap.set(t.id, { tag: t, children: [] });
+  }
+  for (const t of tags) {
+    const node = nodeMap.get(t.id);
+    if (!node) {
+      continue;
+    }
+    if (t.parentId && nodeMap.has(t.parentId)) {
+      nodeMap.get(t.parentId)?.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+
+  // 自用版：把「角色」提到「通用」上面（其余根节点保持原有相对顺序）
+  const rankOf = (node: TagTreeNode): number => {
+    const index = TAG_ROOT_ORDER.indexOf(node.tag.name);
+    return index === -1 ? TAG_ROOT_ORDER.length : index;
+  };
+  const sortedRoots = roots
+    .map((node, index) => ({ index, node }))
+    .sort((a, b) => rankOf(a.node) - rankOf(b.node) || a.index - b.index)
+    .map((entry) => entry.node);
+
+  // 自用版：整棵子树继承一级标签的色签 id（色点 = 归属标识）
+  const assignDotColorId = (node: TagTreeNode, rootId: number): void => {
+    node.dotColorId = rootId;
+    for (const child of node.children) {
+      assignDotColorId(child, rootId);
+    }
+  };
+  for (const root of sortedRoots) {
+    assignDotColorId(root, root.tag.id);
+  }
+  return sortedRoots;
+}
+
+export function renderTagTree(
+  nodes: TagTreeNode[],
+  depth: number,
+  expandedIds: Set<number>,
+  onToggle: (id: number) => void,
+  activeIds: number[],
+  onSelect: (id: number | null) => void,
+  onContextMenu: (e: React.MouseEvent, id: number, name: string) => void,
+  onDragOver: (e: React.DragEvent) => void,
+  onDragEnter: (id: number) => void,
+  onDragLeave: (e: React.DragEvent) => void,
+  onDrop: (e: React.DragEvent, id: number) => void,
+  dragOverId: number | null,
+  language: string
+): ReactNode[] {
+  return nodes.flatMap((node) => {
+    const hasChildren = node.children.length > 0;
+    const isExpanded = expandedIds.has(node.tag.id);
+    const isActive = activeIds.includes(node.tag.id);
+    const isDragOver = dragOverId === node.tag.id;
+
+    const row = (
+      <div
+        aria-expanded={hasChildren ? isExpanded : undefined}
+        aria-level={depth + 1}
+        aria-selected={isActive}
+        className="flex items-center"
+        data-tag-id={node.tag.id}
+        key={node.tag.id}
+        role="treeitem"
+        tabIndex={-1}
+      >
+        <button
+          aria-hidden="true"
+          className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-[4px] text-muted-foreground/70 hover:text-foreground"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle(node.tag.id);
+          }}
+          style={{ marginLeft: depth * 14 }}
+          tabIndex={-1}
+          type="button"
+        >
+          {hasChildren ? (
+            <ChevronRight
+              className={`h-3 w-3 transition-transform ${isExpanded ? "rotate-90" : ""}`}
+            />
+          ) : (
+            <span className="w-3" />
+          )}
+        </button>
+        <button
+          className={`group/tag ${getTreeRowClassName({
+            activeClassName: "nav-item-active bg-primary/15 text-primary",
+            isActive,
+            isDragOver,
+          })} px-3 py-1 text-[12px] ${isDragOver ? "animate-pulse" : ""}`}
+          onClick={() => {
+            onSelect(node.tag.id);
+          }}
+          onContextMenu={(e) => onContextMenu(e, node.tag.id, node.tag.name)}
+          onDragEnter={() => onDragEnter(node.tag.id)}
+          onDragLeave={onDragLeave}
+          onDragOver={onDragOver}
+          onDrop={(e) => onDrop(e, node.tag.id)}
+          type="button"
+        >
+          <span
+            className="h-2.5 w-2.5 flex-shrink-0 rounded-full"
+            style={{
+              background:
+                node.tag.color ||
+                defaultTagDotColor(node.dotColorId ?? node.tag.id),
+            }}
+          />
+          <span className="min-w-0 flex-1 truncate">
+            {getTagDisplayName(node.tag.name, language)}
+          </span>
+          <span className="ml-1 flex-shrink-0 text-[10px] text-muted-foreground/70 tabular-nums">
+            {node.tag.photoCount}
+          </span>
+        </button>
+      </div>
+    );
+
+    return hasChildren && isExpanded
+      ? [
+          row,
+          ...renderTagTree(
+            node.children,
+            depth + 1,
+            expandedIds,
+            onToggle,
+            activeIds,
+            onSelect,
+            onContextMenu,
+            onDragOver,
+            onDragEnter,
+            onDragLeave,
+            onDrop,
+            dragOverId,
+            language
+          ),
+        ]
+      : [row];
+  });
+}

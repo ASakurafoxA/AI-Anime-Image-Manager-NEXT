@@ -1,0 +1,403 @@
+import {
+  and,
+  eq,
+  gte,
+  inArray,
+  like,
+  lte,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
+import { getDatabase } from "@/db";
+import { exifData, photos, photoTags, tags } from "@/db/schema";
+
+const RAW_EXTENSIONS = [
+  "cr2",
+  "cr3",
+  "nef",
+  "nrw",
+  "arw",
+  "srf",
+  "sr2",
+  "dng",
+  "orf",
+  "rw2",
+  "raf",
+  "pef",
+  "rwl",
+  "3fr",
+  "raw",
+];
+
+// --- Rule type definitions ---
+
+interface DateRangeRule {
+  dateFrom?: number;
+  dateTo?: number;
+  preset?: "去年今日" | "最近7天" | "最近30天" | "今年";
+  type: "dateRange";
+}
+
+interface CameraRule {
+  operator: "等于" | "包含";
+  type: "cameraModel";
+  value: string;
+}
+
+interface LensRule {
+  operator: "等于" | "包含";
+  type: "lensModel";
+  value: string;
+}
+
+interface TagsRule {
+  operator: "包含任一" | "包含全部";
+  type: "tags";
+  value: string[];
+}
+
+interface FocalLengthRule {
+  max?: number;
+  operator: ">=" | "<=" | "范围";
+  type: "focalLength";
+  value: number;
+}
+
+interface ApertureRule {
+  max?: number;
+  operator: ">=" | "<=" | "范围";
+  type: "aperture";
+  value: number;
+}
+
+interface ISORule {
+  max?: number;
+  operator: ">=" | "<=" | "范围";
+  type: "iso";
+  value: number;
+}
+
+interface FileFormatRule {
+  type: "fileFormat";
+  value: string;
+}
+
+type SmartRule =
+  | DateRangeRule
+  | CameraRule
+  | LensRule
+  | TagsRule
+  | FocalLengthRule
+  | ApertureRule
+  | ISORule
+  | FileFormatRule;
+
+interface SmartAlbumRules {
+  rules: SmartRule[];
+}
+
+// --- Date preset resolution ---
+
+function resolveDateRange(
+  rule: DateRangeRule
+): { from: number; to: number } | null {
+  const now = Date.now();
+  const d = new Date();
+
+  if (rule.preset === "去年今日") {
+    const lastYear = new Date(d);
+    lastYear.setFullYear(d.getFullYear() - 1);
+    const start = new Date(lastYear);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(lastYear);
+    end.setHours(23, 59, 59, 999);
+    return { from: start.getTime(), to: end.getTime() };
+  }
+  if (rule.preset === "最近7天") {
+    const from = now - 7 * 24 * 3_600_000;
+    return { from, to: now };
+  }
+  if (rule.preset === "最近30天") {
+    const from = now - 30 * 24 * 3_600_000;
+    return { from, to: now };
+  }
+  if (rule.preset === "今年") {
+    const start = new Date(d.getFullYear(), 0, 1).getTime();
+    return { from: start, to: now };
+  }
+  if (rule.dateFrom !== undefined || rule.dateTo !== undefined) {
+    return {
+      from: rule.dateFrom ?? 0,
+      to: rule.dateTo ?? now,
+    };
+  }
+  return null;
+}
+
+// --- Rule evaluation (returns photo IDs) ---
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Each smart-album rule type maps directly to its existing SQL semantics in one dispatcher.
+function evaluateRule(rule: SmartRule): number[] {
+  const db = getDatabase();
+
+  switch (rule.type) {
+    case "dateRange": {
+      const range = resolveDateRange(rule);
+      if (!range) {
+        return [];
+      }
+      const rows = db
+        .select({ photoId: exifData.photoId })
+        .from(exifData)
+        .where(
+          and(
+            gte(exifData.dateTaken, range.from),
+            lte(exifData.dateTaken, range.to)
+          )
+        )
+        .all();
+      return rows.map((r) => r.photoId).filter(Boolean) as number[];
+    }
+
+    case "cameraModel": {
+      if (rule.operator === "等于") {
+        const rows = db
+          .select({ photoId: exifData.photoId })
+          .from(exifData)
+          .where(eq(exifData.cameraModel, rule.value))
+          .all();
+        return rows.map((r) => r.photoId).filter(Boolean) as number[];
+      }
+      const rows = db
+        .select({ photoId: exifData.photoId })
+        .from(exifData)
+        .where(like(exifData.cameraModel, `%${rule.value}%`))
+        .all();
+      return rows.map((r) => r.photoId).filter(Boolean) as number[];
+    }
+
+    case "lensModel": {
+      if (rule.operator === "等于") {
+        const rows = db
+          .select({ photoId: exifData.photoId })
+          .from(exifData)
+          .where(eq(exifData.lensModel, rule.value))
+          .all();
+        return rows.map((r) => r.photoId).filter(Boolean) as number[];
+      }
+      const rows = db
+        .select({ photoId: exifData.photoId })
+        .from(exifData)
+        .where(like(exifData.lensModel, `%${rule.value}%`))
+        .all();
+      return rows.map((r) => r.photoId).filter(Boolean) as number[];
+    }
+
+    case "tags": {
+      if (!rule.value.length) {
+        return [];
+      }
+      const tagRows = db
+        .select({ id: tags.id })
+        .from(tags)
+        .where(inArray(tags.name, rule.value))
+        .all();
+      const tagIds = tagRows.map((t) => t.id);
+      if (!tagIds.length) {
+        return [];
+      }
+
+      const photoRows = db
+        .select({ photoId: photoTags.photoId })
+        .from(photoTags)
+        .where(inArray(photoTags.tagId, tagIds))
+        .all();
+
+      const photoIdCounts = new Map<number, number>();
+      for (const r of photoRows) {
+        if (r.photoId === null) {
+          continue;
+        }
+        photoIdCounts.set(r.photoId, (photoIdCounts.get(r.photoId) || 0) + 1);
+      }
+
+      if (rule.operator === "包含全部") {
+        return [...photoIdCounts.entries()]
+          .filter(([, count]) => count >= tagIds.length)
+          .map(([id]) => id);
+      }
+      // 包含任一
+      return [...photoIdCounts.keys()];
+    }
+
+    case "focalLength": {
+      let cond: SQL<unknown> | undefined;
+      if (rule.operator === ">=") {
+        cond = gte(exifData.focalLengthNum, rule.value);
+      } else if (rule.operator === "<=") {
+        cond = lte(exifData.focalLengthNum, rule.value);
+      } else {
+        cond = and(
+          gte(exifData.focalLengthNum, rule.value),
+          lte(exifData.focalLengthNum, rule.max ?? rule.value)
+        );
+      }
+      const rows = db
+        .select({ photoId: exifData.photoId })
+        .from(exifData)
+        .where(and(sql`${exifData.focalLength} IS NOT NULL`, cond))
+        .all();
+      return rows.map((r) => r.photoId).filter(Boolean) as number[];
+    }
+
+    case "aperture": {
+      let cond: SQL<unknown> | undefined;
+      if (rule.operator === ">=") {
+        cond = gte(exifData.aperture, rule.value);
+      } else if (rule.operator === "<=") {
+        cond = lte(exifData.aperture, rule.value);
+      } else {
+        cond = and(
+          gte(exifData.aperture, rule.value),
+          lte(exifData.aperture, rule.max ?? rule.value)
+        );
+      }
+      const rows = db
+        .select({ photoId: exifData.photoId })
+        .from(exifData)
+        .where(and(sql`${exifData.aperture} IS NOT NULL`, cond))
+        .all();
+      return rows.map((r) => r.photoId).filter(Boolean) as number[];
+    }
+
+    case "iso": {
+      let cond: SQL<unknown> | undefined;
+      if (rule.operator === ">=") {
+        cond = gte(exifData.iso, rule.value);
+      } else if (rule.operator === "<=") {
+        cond = lte(exifData.iso, rule.value);
+      } else {
+        cond = and(
+          gte(exifData.iso, rule.value),
+          lte(exifData.iso, rule.max ?? rule.value)
+        );
+      }
+      const rows = db
+        .select({ photoId: exifData.photoId })
+        .from(exifData)
+        .where(and(sql`${exifData.iso} IS NOT NULL`, cond))
+        .all();
+      return rows.map((r) => r.photoId).filter(Boolean) as number[];
+    }
+
+    case "fileFormat": {
+      // Match format column or filename extension; "raw" matches all RAW formats
+      if (rule.value.toLowerCase() === "raw") {
+        const patterns = RAW_EXTENSIONS.map((ext) => `%.${ext}`);
+        const rows = db
+          .select({ id: photos.id })
+          .from(photos)
+          .where(
+            or(
+              inArray(photos.format, RAW_EXTENSIONS),
+              ...patterns.map((p) => sql`LOWER(${photos.filename}) LIKE ${p}`)
+            )
+          )
+          .all();
+        return rows.map((r) => r.id);
+      }
+      const needle = `.${rule.value.toLowerCase()}`;
+      const rows = db
+        .select({ id: photos.id })
+        .from(photos)
+        .where(
+          or(
+            eq(photos.format, rule.value),
+            sql`LOWER(${photos.filename}) LIKE ${`%${needle}`}`
+          )
+        )
+        .all();
+      return rows.map((r) => r.id);
+    }
+
+    default:
+      return [];
+  }
+}
+
+// --- Public API ---
+
+function intersectIds(idSets: number[][]): number[] {
+  if (!idSets.length) {
+    return [];
+  }
+  // Start with the smallest set to minimize filter passes
+  const sorted = [...idSets].sort((a, b) => a.length - b.length);
+  let result = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    const set = new Set(sorted[i]);
+    result = result.filter((id) => set.has(id));
+  }
+  return result;
+}
+
+// ── 智能相册结果缓存 ──────────────────────────────────────────────────
+// 相册规则不变时避免重复执行多条 SQL 查询（规则数 × 单次查询）。
+// 短 TTL 确保新导入/删除的照片能较快反映到智能相册中。
+const albumCache = new Map<string, { ids: number[]; ts: number }>();
+const ALBUM_CACHE_TTL = 15_000; // 15 seconds
+const MAX_ALBUM_CACHE = 20;
+
+export function invalidateSmartAlbumCache(): void {
+  albumCache.clear();
+}
+
+export function evaluateSmartAlbum(rules: SmartAlbumRules): number[] {
+  if (!rules.rules?.length) {
+    return [];
+  }
+
+  // 缓存键：规则 JSON 序列化
+  const cacheKey = JSON.stringify(rules.rules);
+  const cached = albumCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < ALBUM_CACHE_TTL) {
+    return cached.ids;
+  }
+
+  // LRU 淘汰
+  if (albumCache.size >= MAX_ALBUM_CACHE) {
+    const lru = albumCache.keys().next().value;
+    if (lru !== undefined) {
+      albumCache.delete(lru);
+    }
+  }
+
+  const idSets = rules.rules.map(evaluateRule);
+  const result = intersectIds(idSets);
+  albumCache.set(cacheKey, { ids: result, ts: Date.now() });
+  return result;
+}
+
+export function validateSmartRules(rulesJson: string): {
+  valid: boolean;
+  matchCount: number;
+  error?: string;
+} {
+  try {
+    const rules = JSON.parse(rulesJson) as SmartAlbumRules;
+    if (!(rules.rules && Array.isArray(rules.rules))) {
+      return { valid: false, matchCount: 0, error: "rules 字段必须是数组" };
+    }
+    const ids = evaluateSmartAlbum(rules);
+    return { valid: true, matchCount: ids.length };
+  } catch (e: unknown) {
+    return {
+      valid: false,
+      matchCount: 0,
+      error: e instanceof Error ? e.message : "无效的 JSON",
+    };
+  }
+}
+
+export type { SmartAlbumRules, SmartRule };

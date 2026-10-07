@@ -1,0 +1,133 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { GpuSettingsCard } from "@/components/gpu-settings-card";
+import { ipc } from "@/ipc/manager";
+
+vi.mock("@/ipc/manager", () => ({
+  ipc: {
+    client: {
+      settings: {
+        checkGpuCapability: vi.fn(),
+        getGpuSettings: vi.fn(),
+        setGpuSettings: vi.fn(),
+      },
+    },
+  },
+}));
+
+describe("GpuSettingsCard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
+      detected: null,
+      enabled: false,
+      promptShown: false,
+    });
+  });
+
+  it("reports its loaded state and hides the separate save action in onboarding mode", async () => {
+    const onEnabledChange = vi.fn();
+    const onLoaded = vi.fn();
+
+    render(
+      <GpuSettingsCard
+        hideSaveButton
+        onEnabledChange={onEnabledChange}
+        onLoaded={onLoaded}
+      />
+    );
+
+    await waitFor(() => {
+      expect(onLoaded).toHaveBeenCalledOnce();
+    });
+    expect(onEnabledChange).toHaveBeenCalledWith(false);
+    expect(screen.queryByText("保存")).not.toBeInTheDocument();
+  });
+
+  it("reports detection work and the enabled state to the onboarding parent", async () => {
+    const onBusyChange = vi.fn();
+    const onEnabledChange = vi.fn();
+    vi.mocked(ipc.client.settings.checkGpuCapability).mockResolvedValue({
+      dmlAvailable: true,
+      gpuName: "Test GPU",
+      probeTimeMs: 12,
+    });
+
+    render(
+      <GpuSettingsCard
+        hideSaveButton
+        onBusyChange={onBusyChange}
+        onEnabledChange={onEnabledChange}
+      />
+    );
+
+    await screen.findByText("gpuDetect");
+    onBusyChange.mockClear();
+    onEnabledChange.mockClear();
+    fireEvent.click(screen.getByText("gpuDetect"));
+
+    await waitFor(() => {
+      expect(onEnabledChange).toHaveBeenCalledWith(true);
+    });
+    expect(onBusyChange.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it("shows DirectML image embedding as active when its probe succeeds", async () => {
+    vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
+      detected: {
+        dmlAvailable: false,
+        embeddingDmlAvailable: true,
+        embeddingProbeTimeMs: 34,
+        probeTimeMs: 12,
+      },
+      enabled: true,
+      promptShown: true,
+    });
+
+    render(<GpuSettingsCard hideSaveButton />);
+    await waitFor(() => {
+      expect(screen.getByText("gpuStatusActive")).toBeInTheDocument();
+    });
+  });
+
+  it("shows the detected real GPU name without changing DirectML status", async () => {
+    vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
+      detected: {
+        dmlAvailable: true,
+        gpuName: "NVIDIA GeForce RTX 4060 Laptop GPU",
+        probeTimeMs: 34,
+      },
+      enabled: true,
+      promptShown: true,
+    });
+
+    render(<GpuSettingsCard hideSaveButton />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("NVIDIA GeForce RTX 4060 Laptop GPU")
+      ).toBeInTheDocument();
+    });
+    expect(screen.getByText("gpuStatusActive")).toBeInTheDocument();
+  });
+
+  it("shows CPU fallback after an embedding probe failure without claiming GPU use", async () => {
+    vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
+      detected: {
+        dmlAvailable: false,
+        embeddingDmlAvailable: false,
+        embeddingError: "model incompatible",
+        probeTimeMs: 12,
+      },
+      enabled: true,
+      promptShown: true,
+    });
+
+    render(<GpuSettingsCard hideSaveButton />);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpuStatusProbeFailed")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("gpuStatusActive")).not.toBeInTheDocument();
+  });
+});
