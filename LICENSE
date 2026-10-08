@@ -1,0 +1,32 @@
+MIT License
+
+Copyright (c) 2025 Luan Roger            (上游 AI Image Manager 原作者)
+Copyright (c) 2026 ASakurafoxA            (本仓库的修改部分)
+
+本仓库是 [Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) v2.2.3
+的个人自用修改版。按 MIT 许可要求，**上游原始版权声明完整保留**在上方；
+下方为上游原始许可全文，对本仓库同样适用。
+
+---
+
+MIT License
+
+Copyright (c) 2025 Luan Roger
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
