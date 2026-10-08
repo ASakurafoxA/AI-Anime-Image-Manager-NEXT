@@ -4,13 +4,36 @@
 > 上游采用 MIT License（Copyright © 2025 Luan Roger）；本仓库为个人自用修改版，与上游作者无关。
 
 基于 **[Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) v2.2.3**（MIT License，Copyright © 2025 Luan Roger）的**个人自用修改版**。
-上游原始源码就在本目录的 `upstream/ai-image-manager-v2.2.3.zip` 里，**自包含**：
+上游原始源码**不在本仓库里**（50.9 MB，属于构建输入；放在仓库会触发 GitHub 的 50 MB 警告，
+且本项目的三个仓库会重复存三份）。它在 Releases 里作为附件提供：
+
+- 下载：<https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases/download/upstream-v2.2.3/ai-image-manager-v2.2.3.zip>
+- 校验：`Get-FileHash ai-image-manager-v2.2.3.zip -Algorithm SHA256` → `b3679a512ea3298e2693a8d457b5485521aa7e69fe8e50874d89b0564fefc7ee`
+- 页面：<https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases/tag/upstream-v2.2.3>
+
+本仓库内容如下（`upstream/src/` 与 `patches/` 都是文本，体积很小）：
 
 ```
-upstream/ai-image-manager-v2.2.3.zip     ← 上游 v2.2.3 原始源码（SHA256: b3679a512ea3298e2693a8d457b5485521aa7e69fe8e50874d89b0564fefc7ee）
+（上游原始源码请从上面 Releases 链接下载，仓库内不再保留该 zip）
 upstream/src/ai-image-manager-2.2.3/     ← 本版本的工作树（= 上游 + 补丁）
 patches/                                  ← 相对上游的补丁（干净解压 + git apply 可逐字节还原本工作树）
 ```
+
+## 性能数据从哪来
+
+本文里的速度 / 命中率 / 体积等数字**都来自本机实测**，不是估算：
+
+| 项目 | 值 |
+|---|---|
+| 显卡 | NVIDIA GeForce RTX 4070 Ti SUPER（DirectML） |
+| CPU | AMD Ryzen 7 9700X |
+| 系统 | Windows，`onnxruntime-node` 1.26（DirectML） |
+| 图库规模 | 约 8 万张动漫插画 |
+
+⚠️ **这些数字换一台机器就会变**（尤其 CPU 侧的解码与缩略图，以及显卡的显存大小）。
+按模型不同：WD14 约 **0.23 秒/张**（CPU）、PixAI 约 **0.59 秒/张**（GPU）。
+
+**逐条可核对**：每处改动的具体实现都在 `patches/` 里，按提交历史能查到。
 
 ## 功能
 
