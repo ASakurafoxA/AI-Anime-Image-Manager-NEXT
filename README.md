@@ -155,13 +155,13 @@ NEXT 版**同样带局域网访问功能，用法与 LAN 版完全一致**：设
 
 #### 手机端
 
-![手机端：图库浏览](screenshots/06-web-gallery-mobile.jpg)
+<p align="center">
+  <img src="screenshots/06-web-gallery-mobile.jpg" width="300" alt="手机端：图库浏览" />
+  &nbsp;&nbsp;&nbsp;
+  <img src="screenshots/07-web-tag-tree-mobile.jpg" width="300" alt="手机端：标签树" />
+</p>
 
-<p align="center"><em>手机端图库浏览</em></p>
-
-![手机端：标签树](screenshots/07-web-tag-tree-mobile.jpg)
-
-<p align="center"><em>手机端标签树</em></p>
+<p align="center"><em>手机端：图库浏览（左）　标签树（右）</em></p>
 
 ## 校验补丁（可复现）
 
