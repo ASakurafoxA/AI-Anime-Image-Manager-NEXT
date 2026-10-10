@@ -4,13 +4,16 @@
 > 上游采用 MIT License（Copyright © 2025 Luan Roger）；本仓库为个人自用修改版，与上游作者无关。
 
 基于 **[Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) v2.2.3**（MIT License，Copyright © 2025 Luan Roger）的**个人自用修改版**。
-上游原始源码就在本目录的 `upstream/ai-image-manager-v2.2.3.zip` 里，**自包含**：
+上游原始源码包 **不放进仓库**（50.9 MB 二进制大文件不进 git），单独放在 Release 里：
 
 ```
-upstream/ai-image-manager-v2.2.3.zip     ← 上游 v2.2.3 原始源码（SHA256: b3679a512ea3298e2693a8d457b5485521aa7e69fe8e50874d89b0564fefc7ee）
 upstream/src/ai-image-manager-2.2.3/     ← 本版本的工作树（= 上游 + 补丁）
-patches/                                  ← 相对上游的补丁（干净解压 + git apply 可逐字节还原本工作树）
+patches/next.patch                       ← 相对上游的补丁（干净解压上游源码 + git apply 可逐字节还原本工作树）
 ```
+
+上游源码包（补丁验证基准，50.9 MB）：
+<https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases/download/upstream-v2.2.3/ai-image-manager-v2.2.3.zip>
+SHA256 `b3679a512ea3298e2693a8d457b5485521aa7e69fe8e50874d89b0564fefc7ee`
 
 ## 最近更新（2026-10）
 
@@ -109,7 +112,7 @@ patches/                                  ← 相对上游的补丁（干净解�
 
 | 代价 | 说明 |
 |---|---|
-| **🔴 新模型建库明显更慢** | 单张 **0.59 秒**（WD14 是 **0.23 秒**，慢约 **2.6 倍**）<br>**8 万张推算约 13.1 小时**（WD14 约 4 小时）<br>**可以随时中断，下次从断点继续** |
+| **🔴 新模型建库明显更慢** | 单张 **0.59 秒**（WD14 是 **0.23 秒**，慢约 **2.6 倍**）<br>**8 万张约 13.1 小时**（WD14 约 5 小时）<br>⚠️ 以上为**本机 RTX 4070 Ti SUPER** 实测 —— 速度很看显卡：笔记本中端独显（RTX 4060 级）约 **0.6 张/秒**、纯 CPU 约 **6.5 秒/张**，详见 [快速上手.md](快速上手.md)<br>**可以随时中断，下次从断点继续** |
 | **模型体积大 5 倍** | 1.86 GB（WD14 是 361 MB）→ 打包体积变大 |
 
 > **首次建库建议**：先放一个子文件夹试跑，确认效果满意再对全库跑。
