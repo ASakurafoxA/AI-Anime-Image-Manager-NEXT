@@ -2093,6 +2093,45 @@ export const getDuplicateScan = os
     return run;
   });
 
+/**
+ * 自用：**只读**上次保存的重复检测结果。
+ *
+ * 与 `findDuplicates` 的关键区别 —— 这条路径**不扫描**：
+ *   · 不把全部图片查出来（那是 7.7 万行）
+ *   · 不对每一张做 `fs.statSync`
+ *   · 不算各种修订号（图片 / 向量 / 设置 / 序列 / 模型指纹）
+ *   · **不新建**检测运行记录
+ * 只是把 `duplicate_pairs` 里已保存的配对读出来，整理成界面要的分组结构。
+ *
+ * 用途：进入重复检测页时先用它**立刻显示上次结果**（很快），
+ * 只有用户点「开始检测 / 重新扫描」才走真正的扫描。
+ */
+export const getSavedDuplicateGroups = os.handler(() => {
+  const db = getDatabase();
+  const persisted = loadNonSequenceDuplicatePairs(db);
+  const hydrated = hydrateDuplicateGroups(db, persisted);
+  const signature = getScannedDuplicateSignature();
+  const groups = db.transaction((tx) =>
+    summarizeDuplicateGroups(
+      db,
+      hydrated,
+      // 与 scanDuplicates 的缓存分支口径一致：没有签名时用 "legacy"
+      signature || "legacy",
+      new Set(),
+      tx
+    )
+  );
+  return {
+    groups,
+    fromCache: true,
+    /**
+     * 是否"存在一次可展示的历史结果"。
+     * 界面用它区分「从来没扫过 → 显示开始按钮」和「扫过但没重复 → 显示"没有重复"」。
+     */
+    hasSavedResult: persisted.length > 0 || Boolean(signature),
+  };
+});
+
 export const getDuplicateGroupPhotos = os
   .input(
     z.object({

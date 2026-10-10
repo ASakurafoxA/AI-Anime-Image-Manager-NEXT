@@ -199,10 +199,33 @@ describe("PhotoCard", () => {
   });
 
   it("labels an automatic tag source in pure tag-filter results", () => {
+    /*
+     * 自用：自用版**故意不显示**「AI 标签」这个笼统角标
+     *（见 `private-build.ts` 的 `hideAiTagUi`：那是给"真实图片 + 参考标签"写的话术，
+     *  自用版是专门给动漫打标分类的，标签就是正式产物，不需要"仅供参考"的提示）。
+     * 所以这里断言的是"自动标签命中时不再挂角标"。
+     */
     render(
       <PhotoCard {...baseProps} match={{ kind: "tagFilter", origin: "auto" }} />
     );
-    expect(screen.getByText("AI 标签")).toBeInTheDocument();
+    expect(screen.queryByText("AI 标签")).not.toBeInTheDocument();
+  });
+
+  it("shows the matched tag names with their class colors in tag-filter results", () => {
+    // 自用（问题 2）：命中标签的角标按"所属主类"上色（颜色由主进程算好随 match 送来）
+    render(
+      <PhotoCard
+        {...baseProps}
+        match={{
+          kind: "tagFilter",
+          origin: "auto",
+          tagColors: ["#ec4899", "#14b8a6"],
+          tagNames: ["soulworker", "AI 生成 (ai-generated)"],
+        }}
+      />
+    );
+    expect(screen.getByText("soulworker")).toBeInTheDocument();
+    expect(screen.getByText("AI 生成 (ai-generated)")).toBeInTheDocument();
   });
 
   it("labels semantic results with a percentage normalized to the top match", () => {

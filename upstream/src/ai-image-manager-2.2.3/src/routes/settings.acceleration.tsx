@@ -12,7 +12,8 @@ function AccelerationSettingsPage() {
 
   return (
     <SettingsPageShell scrollRef={scrollRef} title={t("gpuAcceleration")}>
-      <GpuSettingsCard />
+      {/* hideTitle：页面外壳已经渲染了「GPU 加速」标题，卡片里不再重复一份 */}
+      <GpuSettingsCard hideTitle />
     </SettingsPageShell>
   );
 }

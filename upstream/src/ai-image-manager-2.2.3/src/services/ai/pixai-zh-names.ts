@@ -6,13 +6,15 @@
  * 实测 `blue_archive` / `highres` / `official_art` 在它里面一个都查不到。
  * 换模型之后这三类是**新增维度**，不补中文的话侧边栏就是一片英文。
  *
- * 三类各自的处理策略（2026-10 与用户确认）：
+ * 三类各自的处理策略（2026-10 与用户确认，**已按 2026-10-09 的新要求更新**）：
  *   · `copyright` 作品系列 —— **补中文**（`blue_archive` → 蔚蓝档案）。本表覆盖
  *     库里实际出现过的 + 常见系列；查不到的仍按现有行为显示英文原名，**不硬造**。
  *   · `meta` 元信息 —— **整类补全**（145 个全在表里；`unfinished` 之类原本就在
  *     `zh_names.csv` 里的会被这张表覆盖成更准确的说法）。
- *   · `style` 画风 —— **保持画师原名**（`tyomimas` / `bkub` 这些是画师账号名，
- *     翻译反而是错的）。所以这里**故意不提供** style 表。
+ *   · `style` 画风 —— ⚠️ **2026-10-09 用户改口**：原来是"保持画师原名"，
+ *     现在要求"**查得到真正原名（日文/中文）就把中文放前面，罗马音放括号里**"。
+ *     映射来自 `pixai-name-zh.ts`（Danbooru 中文对照表，宁缺勿错）。
+ *   · `character` 角色 —— 同理，改用 `pixai-name-zh.ts` 的表。
  *   · `rating` 分级 —— 4 个短表放在 `pixai-tagger.ts` 里（与落库逻辑在一起）。
  *
  * ⚠️ 查找链的键是「标签英文原名」，与分类无关的标签**不会**被误翻；
@@ -20,6 +22,11 @@
  */
 
 import type { PixaiCategoryName } from "./pixai-tag-categories";
+import {
+  PIXAI_ARTIST_ZH,
+  PIXAI_CHARACTER_ZH,
+  PIXAI_COPYRIGHT_NAME_ZH,
+} from "./pixai-name-zh";
 
 /** 元信息（145 个，与 `config.json` 的 meta 区间一一对应）。 */
 export const PIXAI_META_ZH: Record<string, string> = {
@@ -393,30 +400,45 @@ export const PIXAI_COPYRIGHT_ZH: Record<string, string> = {
  * 按分类取中文名。返回 `null` 表示"这张表里没有"，调用方继续往下找
  * （`zh_names.csv` → 英文原名）。
  *
- * ⚠️ `style`（画风）**故意永远返回 null** —— 那些是画师账号名，保持原名才对。
+ * ⚠️ `style`（画风）**2026-10-09 起不再"故意返回 null"** ——
+ * 用户要求画师也汉化（有真原名就用），映射见 `pixai-name-zh.ts`。
  */
 export function pixaiChineseName(
   tagName: string,
   category: PixaiCategoryName
 ): string | null {
   if (category === "copyright") {
-    return PIXAI_COPYRIGHT_ZH[tagName] ?? null;
+    // 先查本项目补充的短表（含库里实际出现过的），再查 Danbooru 对照表
+    return PIXAI_COPYRIGHT_ZH[tagName] ?? PIXAI_COPYRIGHT_NAME_ZH[tagName] ?? null;
   }
   if (category === "meta") {
     return PIXAI_META_ZH[tagName] ?? null;
   }
-  // style / general / character / rating 都没有分类专属表：
-  // general/character 走既有的 zh_names.csv，rating 走 pixai-tagger.ts 里的 4 条短表。
+  if (category === "character") {
+    // 角色：Danbooru 中文对照表（`zh_names.csv` 里没有角色，见文件头注释）
+    return PIXAI_CHARACTER_ZH[tagName] ?? null;
+  }
+  if (category === "style") {
+    // 画师：只收"真原名"，查不到就 null（调用方回落英文原名）
+    return PIXAI_ARTIST_ZH[tagName] ?? null;
+  }
+  // general 走既有的 zh_names.csv，rating 走 pixai-tagger.ts 里的 4 条短表。
   return null;
 }
 
 /** 表里各有多少条（启动时打一行日志，方便核对覆盖面）。 */
 export function pixaiChineseNameCoverage(): {
+  artist: number;
+  character: number;
   copyright: number;
+  copyrightExtra: number;
   meta: number;
 } {
   return {
-    copyright: Object.keys(PIXAI_COPYRIGHT_ZH).length,
+    artist: Object.keys(PIXAI_ARTIST_ZH).length,
+    character: Object.keys(PIXAI_CHARACTER_ZH).length,
+    copyright: Object.keys(PIXAI_COPYRIGHT_NAME_ZH).length,
+    copyrightExtra: Object.keys(PIXAI_COPYRIGHT_ZH).length,
     meta: Object.keys(PIXAI_META_ZH).length,
   };
 }

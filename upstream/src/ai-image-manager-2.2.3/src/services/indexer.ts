@@ -14,6 +14,11 @@ import { extractDominantColors } from "./color-extractor";
 import { checkNewPhotoDuplicates } from "./dedup-service";
 import { getFolderMatcher, reloadFolderMatcher } from "./folder-matcher";
 import {
+  forgetRemovedPath,
+  getRemovedFolderPaths,
+  isPathRemoved,
+} from "./folder-exclusions";
+import {
   type ExifOrientation,
   getOrientedDimensions,
   resolveImageOrientation,
@@ -1009,6 +1014,12 @@ export async function scanFolder(
 
     const folderId = folder.id;
 
+    // 用户主动重新导入一个曾被「移除文件夹」的路径 → 忘掉这条移除记录。
+    // （开机补扫走的是**树根**，树根不会在移除列表里，所以这里不会误清子目录的记录。）
+    forgetRemovedPath(resolvedPath);
+    // 本次扫描要跳过的目录：一次读好，避免在逐层遍历里反复查数据库。
+    const removedPaths = getRemovedFolderPaths();
+
     // Async walk — avoids blocking the main process on large folders.
     // Each directory level yields the event loop via setImmediate to keep the UI responsive.
     const files: string[] = [];
@@ -1037,6 +1048,11 @@ export async function scanFolder(
         }
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
+          // 用户移除过的目录（及其整棵子树）不再扫描 —— 否则开机补扫会把
+          // 刚删掉的文件夹连照片一起重新建回来。
+          if (isPathRemoved(fullPath, removedPaths)) {
+            continue;
+          }
           await walk(fullPath);
         } else if (entry.isFile() && shouldIndex(fullPath)) {
           files.push(fullPath);
@@ -1063,6 +1079,10 @@ export async function scanFolder(
 
       // Create missing directories top-down so parentId is available
       for (const d of missing) {
+        // 兜底：万一某个祖先被移除过（正常已被 walk 剪掉，这里再挡一次）
+        if (isPathRemoved(d, removedPaths)) {
+          continue;
+        }
         const parentDir = path.dirname(d);
         const parentId = dirToFolderId.get(parentDir) ?? null;
 
@@ -1103,6 +1123,7 @@ export async function scanFolder(
     // Sharp/libvips uses the libuv thread pool internally, so overlapping
     // thumbnail generation + metadata reads yields ~3x throughput on typical
     // consumer hardware without saturating I/O.
+    // 自用：并发数固定 4（原「占用限制」滑块的缩放已整体删除）
     const CONCURRENCY = 4;
     const BATCH_SIZE = 50;
     const photoIds: number[] = [];
@@ -1515,6 +1536,11 @@ export async function scanFolder(
 // ancestor match can never be written as the new photo's folder relation.
 function resolveWatchedFileFolder(filePath: string): number | null {
   const db = getDatabase();
+  // 用户移除过的目录：监听器刚发现的新文件也不要再把它建回来。
+  // （父目录的监听器覆盖整棵子树，所以即使文件夹记录已删，事件仍会到达这里。）
+  if (isPathRemoved(path.dirname(filePath))) {
+    return null;
+  }
   const ancestorId = getFolderMatcher().match(filePath);
   if (ancestorId === null) {
     return null;
@@ -1643,6 +1669,12 @@ export function startWatching(
             return;
           }
           const matchedFolderId = resolveWatchedFileFolder(filePath);
+          // 用户移除过的目录：这里的文件一律不索引，否则会以「无文件夹」的形态
+          // 回到库里，而且下次扫描又把它所属的文件夹建回来。
+          if (isPathRemoved(path.dirname(filePath))) {
+            watcherStats.skipped++;
+            return;
+          }
 
           const alreadyIndexed = db
             .select({ id: photos.id })
@@ -1769,6 +1801,11 @@ export function watchFolder(
           return;
         }
         const matchedFolderId = resolveWatchedFileFolder(filePath);
+        // 用户移除过的目录：不索引（同上面那处）
+        if (isPathRemoved(path.dirname(filePath))) {
+          watcherStats.skipped++;
+          return;
+        }
 
         const alreadyIndexed = db
           .select({ id: photos.id })

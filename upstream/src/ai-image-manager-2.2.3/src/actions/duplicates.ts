@@ -12,6 +12,8 @@ export const duplicateActions = {
     offset?: number;
   }) => ipc.client.photos.getDuplicateGroupPhotos(input),
   getScan: (runId: string) => ipc.client.photos.getDuplicateScan({ runId }),
+  /** 自用：只读上次保存的结果（不扫描，用于进页面立刻显示）。 */
+  getSaved: () => ipc.client.photos.getSavedDuplicateGroups(),
   scan: (forceRescan = false) =>
     ipc.client.photos.findDuplicates({ forceRescan }),
   startScan: (forceRescan = false) =>

@@ -21,7 +21,7 @@ import {
 } from "@/content/changelogs";
 import appIcon from "../../assets/icon.png";
 
-const GITHUB_RELEASE_URL = "https://github.com/Uyoung666/ai-image-manager";
+const GITHUB_RELEASE_URL = "https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT";
 
 const searchSchema = z.object({
   source: z.string().optional(),

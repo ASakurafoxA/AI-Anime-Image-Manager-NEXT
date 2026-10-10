@@ -1,6 +1,8 @@
 import {
   CheckCircle2,
+  ClipboardCopy,
   FileArchive,
+  FileText,
   ShieldCheck,
   TriangleAlert,
 } from "lucide-react";
@@ -10,6 +12,7 @@ import { toast } from "sonner";
 import {
   createDiagnosticsBundle,
   dismissDiagnosticIncident,
+  exportDiagnosticLog,
   getDiagnosticsOverview,
 } from "@/actions/diagnostics";
 import { openExternalLink, openInExplorer } from "@/actions/shell";
@@ -51,6 +54,8 @@ export function DiagnosticsReportForm({
     useState<DiagnosticReproducibility>("once");
   const [includeNativeDump, setIncludeNativeDump] = useState(false);
   const [generating, setGenerating] = useState(false);
+  /** 自用：导出单文件 Markdown 的进行中状态（与 ZIP 那个分开，避免互相禁用）。 */
+  const [exportingLog, setExportingLog] = useState(false);
   const [dismissing, setDismissing] = useState(false);
   const [result, setResult] = useState<DiagnosticBundleResult>();
   const [feedbackRequested, setFeedbackRequested] = useState(false);
@@ -176,8 +181,89 @@ export function DiagnosticsReportForm({
     }
   }
 
+  /**
+   * 自用：导出**单个 Markdown** 诊断日志。
+   * `copyToClipboard` = true 时顺便复制全文（直接粘给 AI 最省事，不用找文件）。
+   */
+  async function exportLog(copyToClipboard: boolean) {
+    if (!lastAction.trim()) {
+      toast.error(t("diagnosticsLastActionRequired"));
+      return;
+    }
+    setExportingLog(true);
+    try {
+      const exported = await exportDiagnosticLog({
+        incidentId: selectedIncidentId || undefined,
+        lastAction: lastAction.trim(),
+        actualBehavior: actualBehavior.trim() || undefined,
+        reproducibility,
+      });
+      if (copyToClipboard) {
+        try {
+          await navigator.clipboard.writeText(exported.markdown);
+          toast.success(t("diagnosticsLogCopied"));
+        } catch (clipboardError) {
+          console.error(
+            "[Diagnostics] Failed to copy diagnostics log",
+            clipboardError
+          );
+          toast.error(t("diagnosticsIssueFallbackCopyFailed"));
+        }
+      } else {
+        toast.success(t("diagnosticsLogExported"));
+        try {
+          await openInExplorer(exported.path);
+        } catch (explorerError) {
+          console.error(
+            "[Diagnostics] Failed to open File Explorer",
+            explorerError
+          );
+        }
+      }
+    } catch (error) {
+      console.error("[Diagnostics] Log export failed", error);
+      toast.error(t("diagnosticsBundleFailed"));
+    } finally {
+      setExportingLog(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
+      {/*
+        自用：最上面放"给 AI 看的日志"两个按钮。
+        为什么放最前：自用版出问题时主要靠自己或朋友把它交给 AI 排查，
+        比"打 ZIP 再去提 issue"常用得多。复用的是同一套采集与脱敏。
+      */}
+      <div className="flex flex-col gap-2 rounded-[8px] border border-primary/25 bg-primary/[0.04] p-3 sm:flex-row sm:flex-wrap sm:items-center">
+        <div className="min-w-0 flex-1">
+          <p className="font-medium text-[12px] text-foreground">
+            {t("diagnosticsAiLogTitle")}
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            {t("diagnosticsAiLogHint")}
+          </p>
+        </div>
+        <button
+          className="flex items-center justify-center gap-1.5 rounded-[6px] bg-primary px-3 py-2 font-medium text-[12px] text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={exportingLog || generating || dismissing}
+          onClick={() => exportLog(true)}
+          type="button"
+        >
+          <ClipboardCopy className="h-3.5 w-3.5" />
+          {t("diagnosticsCopyLog")}
+        </button>
+        <button
+          className="flex items-center justify-center gap-1.5 rounded-[6px] border border-border px-3 py-2 font-medium text-[12px] text-foreground transition-colors hover:bg-foreground/5 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={exportingLog || generating || dismissing}
+          onClick={() => exportLog(false)}
+          type="button"
+        >
+          <FileText className="h-3.5 w-3.5" />
+          {exportingLog ? t("diagnosticsGenerating") : t("diagnosticsExportLog")}
+        </button>
+      </div>
+
       {overview && overview.pendingIncidents.length > 0 && (
         <div className="space-y-2 rounded-[8px] border border-warning/30 bg-warning/5 p-3">
           <div className="flex items-start gap-2">

@@ -52,3 +52,10 @@ export interface DiagnosticBundleResult {
   nativeDumpIncluded: boolean;
   warnings: string[];
 }
+
+/** 自用：单个 Markdown 诊断日志（给 AI 排查用）。 */
+export interface DiagnosticLogExportResult {
+  markdown: string;
+  path: string;
+  warnings: string[];
+}

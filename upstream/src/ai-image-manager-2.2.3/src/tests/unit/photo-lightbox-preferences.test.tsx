@@ -115,7 +115,7 @@ describe("PhotoLightbox panel preferences", () => {
     const { rerender } = renderLightbox();
 
     expect(
-      screen.getByRole("complementary", { name: "照片详情" })
+      screen.getByRole("complementary", { name: "图片详情" })
     ).toBeInTheDocument();
 
     rerender(
@@ -131,7 +131,7 @@ describe("PhotoLightbox panel preferences", () => {
     );
 
     expect(
-      screen.getByRole("complementary", { name: "照片详情" })
+      screen.getByRole("complementary", { name: "图片详情" })
     ).toBeInTheDocument();
   });
 
@@ -148,7 +148,7 @@ describe("PhotoLightbox panel preferences", () => {
 
     fireEvent.keyDown(window, { key: "i" });
     expect(
-      screen.getByRole("complementary", { name: "照片详情" })
+      screen.getByRole("complementary", { name: "图片详情" })
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "2: second.jpg" })
@@ -157,7 +157,7 @@ describe("PhotoLightbox panel preferences", () => {
 
     fireEvent.keyDown(window, { key: "i" });
     expect(
-      screen.queryByRole("complementary", { name: "照片详情" })
+      screen.queryByRole("complementary", { name: "图片详情" })
     ).not.toBeInTheDocument();
     expect(localStorage.getItem(LIGHTBOX_PANEL_MODE_STORAGE_KEY)).toBe("off");
   });
@@ -205,7 +205,7 @@ describe("PhotoLightbox panel preferences", () => {
 
     fireEvent.keyDown(window, { key: "Escape" });
     expect(
-      screen.queryByRole("complementary", { name: "照片详情" })
+      screen.queryByRole("complementary", { name: "图片详情" })
     ).not.toBeInTheDocument();
     expect(localStorage.getItem(LIGHTBOX_PANEL_MODE_STORAGE_KEY)).toBe("off");
 
@@ -222,7 +222,7 @@ describe("PhotoLightbox panel preferences", () => {
     );
 
     expect(
-      screen.queryByRole("complementary", { name: "照片详情" })
+      screen.queryByRole("complementary", { name: "图片详情" })
     ).not.toBeInTheDocument();
   });
 
@@ -230,11 +230,11 @@ describe("PhotoLightbox panel preferences", () => {
     saveLightboxPanelMode("info");
     renderLightbox();
 
-    const panel = screen.getByRole("complementary", { name: "照片详情" });
+    const panel = screen.getByRole("complementary", { name: "图片详情" });
     fireEvent.click(within(panel).getByRole("button", { name: "关闭" }));
 
     expect(
-      screen.queryByRole("complementary", { name: "照片详情" })
+      screen.queryByRole("complementary", { name: "图片详情" })
     ).not.toBeInTheDocument();
     expect(localStorage.getItem(LIGHTBOX_PANEL_MODE_STORAGE_KEY)).toBe("off");
   });
@@ -280,7 +280,7 @@ describe("PhotoLightbox panel preferences", () => {
     });
 
     expect(
-      screen.queryByRole("complementary", { name: "照片详情" })
+      screen.queryByRole("complementary", { name: "图片详情" })
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "2: second.jpg" })
@@ -297,7 +297,7 @@ describe("PhotoLightbox panel preferences", () => {
       />
     );
     expect(
-      screen.queryByRole("complementary", { name: "照片详情" })
+      screen.queryByRole("complementary", { name: "图片详情" })
     ).not.toBeInTheDocument();
     expect(readLightboxPanelMode()).toBe("info");
   });
@@ -311,7 +311,7 @@ describe("PhotoLightbox panel preferences", () => {
     fireEvent.keyDown(window, { key: "i" });
 
     expect(
-      screen.getByRole("complementary", { name: "照片详情" })
+      screen.getByRole("complementary", { name: "图片详情" })
     ).toBeInTheDocument();
   });
 });

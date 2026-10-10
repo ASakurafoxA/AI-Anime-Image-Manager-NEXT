@@ -19,6 +19,12 @@ export interface GlobalAiProgress {
   canCancel: boolean;
   /** Whether any background AI task is currently active. */
   isRunning: boolean;
+  /**
+   * 自用（问题 4）：当前任务的**原始张数**，供界面算"处理速度 / 预估剩余时间"。
+   * 只有 AI 特征提取与打标这两个按张数推进的阶段有值，其它阶段为 null。
+   */
+  processed: number | null;
+  total: number | null;
   /** 0–100 aggregate progress percentage. */
   percent: number;
   /** Which kind of task is currently active. */
@@ -39,7 +45,9 @@ const IDLE_GLOBAL_AI_PROGRESS: GlobalAiProgress = {
   isRunning: false,
   percent: 0,
   phase: "idle",
+  processed: null,
   statusText: "",
+  total: null,
 };
 
 const GlobalAiStatusContext = createContext<GlobalAiProgress>(
@@ -61,6 +69,8 @@ interface AiProgressPayload {
     | "loading"
     | "embedding"
     | "tagging"
+    /** 自用（需求 1）：打标被暂停（游标保留，继续即续跑） */
+    | "tagging-paused"
     | "complete"
     | "error"
     | "tag-error"
@@ -171,7 +181,10 @@ function processQueueHistory(
 interface ProgressSnapshot {
   aiPercent: number;
   aiPhase: AiProgressPayload["phase"];
+  /** 自用（问题 4）：原始张数，用于算速度/预估。 */
+  aiProcessed: number | null;
   aiText: string;
+  aiTotal: number | null;
   facePercent: number;
   faceText: string;
   hasAi: boolean;
@@ -226,14 +239,18 @@ function getAiSnapshot(ai: AiProgressPayload | null) {
       aiText = `AI 特征提取 ${ai.processed}/${ai.total}`;
     } else if (ai.phase === "tagging") {
       aiPct = clampPct(ai.processed, ai.total);
-      aiText = `AI 标签生成 ${ai.processed}/${ai.total}`;
+      // 自用（方案 A · 问题 6）：累计口径 + 本次还需，避免看起来像从头重跑
+      aiText = `AI 标签生成 ${ai.processed}/${ai.total}（还需 ${Math.max(0, ai.total - ai.processed)}）`;
     }
   }
   return {
     hasAi: aiActive,
     aiPhase: ai?.phase ?? "idle",
     aiPercent: aiPct,
+    // 自用（问题 4）：把原始张数一并带出去（特征提取/打标才有意义）
+    aiProcessed: ai?.processed ?? null,
     aiText,
+    aiTotal: ai?.total ?? null,
   };
 }
 
@@ -291,7 +308,9 @@ function buildSnapshot(
     hasAi: aiSnap.hasAi,
     aiPhase: aiSnap.aiPhase,
     aiPercent: aiSnap.aiPercent,
+    aiProcessed: aiSnap.aiProcessed,
     aiText: aiSnap.aiText,
+    aiTotal: aiSnap.aiTotal,
     hasFace: faceSnap.hasFace,
     isFaceRunning: faceSnap.isFaceRunning,
     facePercent: faceSnap.facePercent,
@@ -311,7 +330,13 @@ function buildSnapshot(
  *   4. File scan / indexing
  *   5. Idle
  */
-function deriveStatus(snap: ProgressSnapshot): GlobalAiProgress {
+/**
+ * 自用（问题 4）：`deriveStatus` 只管"阶段 / 百分比 / 文案"，
+ * 原始张数（processed/total）由下面的 hook 统一补上，所以这里不用重复填。
+ */
+type DerivedGlobalAiProgress = Omit<GlobalAiProgress, "processed" | "total">;
+
+function deriveStatus(snap: ProgressSnapshot): DerivedGlobalAiProgress {
   // Queue currently processing a folder (covers scan+embed phases)
   if (snap.hasQueue && snap.queueCurrent) {
     return {
@@ -633,7 +658,14 @@ function useGlobalAiStatusState(): GlobalAiProgress {
   // ── Derive unified status ──────────────────────────────────────
 
   const snap = buildSnapshot(scan, ai, face, faceRunning, queue, queueRunning);
-  return deriveStatus(snap);
+  const derived = deriveStatus(snap);
+  // 自用（问题 4）：把"按张数推进"的两个阶段的原始张数挂上去，供界面算速度/预估。
+  const countable = derived.phase === "embedding" || derived.phase === "tagging";
+  return {
+    ...derived,
+    processed: countable ? snap.aiProcessed : null,
+    total: countable ? snap.aiTotal : null,
+  };
 }
 
 export function GlobalAiStatusProvider({ children }: { children: ReactNode }) {

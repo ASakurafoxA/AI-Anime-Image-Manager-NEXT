@@ -37,6 +37,10 @@ async function handleProbe(message) {
   const modelPath = String(message.modelPath || "");
   const inputName = String(message.inputName || "pixel_values");
   const imageSize = Number(message.imageSize || 224);
+  const deviceId =
+    Number.isInteger(message.deviceId) && message.deviceId >= 0
+      ? Number(message.deviceId)
+      : null;
   if (!(modelPath && fs.existsSync(modelPath))) {
     process.send?.({
       type: "result",
@@ -50,11 +54,17 @@ async function handleProbe(message) {
 
   try {
     const { InferenceSession, Tensor } = loadOrt();
+    const provider = deviceId === null ? "dml" : { name: "dml", deviceId };
     const session = await InferenceSession.create(modelPath, {
-      executionProviders: ["dml"],
+      executionProviders: [provider],
       enableMemPattern: false,
       executionMode: "sequential",
-      graphOptimizationLevel: "basic",
+      // ⚠️ 必须是 "disabled"（2026-10-08 实测）：这个量化过的 SigLIP vision 模型
+      // 会让 ORT 1.26 的图优化器在部分环境下**原生崩溃**（0xC0000005，进程直接死），
+      // 表现就是"探测失败/超时 → 图像嵌入只好用 CPU"。DML 自己的图融合
+      // （DmlGraphFusionTransformer）不受这个开关影响，所以关掉不影响性能
+      // （实测 basic 14.1ms/张 vs disabled 14.7ms/张，噪声级）。
+      graphOptimizationLevel: "disabled",
       interOpNumThreads: 1,
       intraOpNumThreads: 1,
       logSeverityLevel: 3,

@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
@@ -7,6 +8,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useGlobalAiStatus } from "@/hooks/use-global-ai-status";
+import { useProgressRate } from "@/hooks/use-progress-rate";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { ipc } from "@/ipc/manager";
 import { getRandomPhrase } from "@/utils/progress-phrases";
@@ -16,6 +18,27 @@ export function GlobalProgressBar() {
   const { t } = useTranslation();
   const status = useGlobalAiStatus();
   const reduceMotion = useReducedMotion();
+  const queryClient = useQueryClient();
+  /** 自用：暂停打标是异步的（要等循环在批次边界退出，最长 8 秒），期间禁用按钮防止重复点。 */
+  const [pausingTag, setPausingTag] = useState(false);
+
+  /*
+   * 自用（问题 4）：顶栏右侧（百分比左边）显示"处理速度 · 预估剩余时间"。
+   * 只在特征提取 / 打标这两个按张数推进的阶段有数据（其它阶段 processed/total 是 null）。
+   */
+  const { pending: ratePending, remainingText, speedText } = useProgressRate(
+    status.isRunning &&
+      status.processed !== null &&
+      status.total !== null &&
+      status.total > 0
+      ? {
+          isActive: true,
+          phase: String(status.phase),
+          processed: status.processed,
+          total: status.total,
+        }
+      : null
+  );
 
   // ── Fun phrase rotation ─────────────────────────────────────
   const [phrase, setPhrase] = useState(() => getRandomPhrase(status.phase));
@@ -156,6 +179,38 @@ export function GlobalProgressBar() {
           <TooltipContent>{progressLabel}</TooltipContent>
         </Tooltip>
 
+        {/*
+          自用：打标的「暂停」键。
+          以前只有标签树那一块有，用户希望顶栏也能直接暂停 —— 位置就放在
+          导入的「取消」键这里（两者互斥：正在打标时 canCancel 一定是 false）。
+          phase === "tagging" 正好等价于"正在打标、可以暂停"：
+          pauseTagging() 之后相位会变成 tagging-paused，而这里会把
+          tagging-paused 归到 idle，所以按钮会自己消失。
+        */}
+        {status.phase === "tagging" && (
+          <button
+            className="shrink-0 rounded px-2 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground disabled:opacity-50"
+            disabled={pausingTag}
+            onClick={() => {
+              setPausingTag(true);
+              ipc.client.photos
+                .pauseTagging({})
+                // 打标暂停后 useAiStatus 的轮询会掉到 30 秒一次，
+                // 这里主动失效一次，标签树那一行才能立刻变成「已暂停」。
+                .then(() =>
+                  queryClient.invalidateQueries({ queryKey: ["aiStatus"] })
+                )
+                .catch((error) => {
+                  console.error("[Tagging] Failed to pause", error);
+                })
+                .finally(() => setPausingTag(false));
+            }}
+            type="button"
+          >
+            {t("aiPause")}
+          </button>
+        )}
+
         {status.canCancel && (
           <button
             className="shrink-0 rounded px-2 py-0.5 text-[10px] text-danger hover:bg-danger/10"
@@ -171,9 +226,19 @@ export function GlobalProgressBar() {
         )}
 
         {!isIndeterminate && (
-          <span className="shrink-0 font-medium text-[11px] text-primary tabular-nums">
-            {Math.round(smoothPct)}%
-          </span>
+          <>
+            {/* 自用（问题 4）：百分比左侧显示处理速度与预估剩余时间 */}
+            {(speedText || remainingText || ratePending) && (
+              <span className="shrink-0 text-[10px] text-muted-foreground/70 tabular-nums">
+                {speedText ?? ""}
+                {speedText && remainingText ? " · " : ""}
+                {remainingText ?? (speedText ? "" : t("aiProgressEtaCalculating"))}
+              </span>
+            )}
+            <span className="shrink-0 font-medium text-[11px] text-primary tabular-nums">
+              {Math.round(smoothPct)}%
+            </span>
+          </>
         )}
       </div>
 

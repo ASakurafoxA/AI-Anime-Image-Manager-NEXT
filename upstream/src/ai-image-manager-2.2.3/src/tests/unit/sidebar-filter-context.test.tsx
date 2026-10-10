@@ -292,4 +292,49 @@ describe("SidebarFilterContext", () => {
     expect(tagState.searchDraft).toEqual({ filters: {}, query: "" });
     expect(tagState.favoriteOnly).toBe(false);
   });
+
+  // 自用（需求 3）：标签树默认单选 —— 点哪个 tag 就只看哪个 tag 的图
+  describe("tag select mode (自用需求 3)", () => {
+    it("defaults to single select and replaces the selection on each click", () => {
+      expect(initialBrowseCriteriaState.tagSelectMode).toBe("single");
+
+      const first = browseCriteriaReducer(initialBrowseCriteriaState, {
+        type: "toggleTag",
+        tagId: 11,
+      });
+      expect(first.activeTagIds).toEqual([11]);
+
+      // 单选模式下点第二个标签 = 换成它（不是叠加）
+      const second = browseCriteriaReducer(first, {
+        type: "toggleTag",
+        tagId: 22,
+      });
+      expect(second.activeTagIds).toEqual([22]);
+
+      // 再点同一个 = 取消
+      const cleared = browseCriteriaReducer(second, {
+        type: "toggleTag",
+        tagId: 22,
+      });
+      expect(cleared.activeTagIds).toEqual([]);
+    });
+
+    it("accumulates tags only after switching to multi select", () => {
+      const multi = browseCriteriaReducer(initialBrowseCriteriaState, {
+        type: "toggleTagSelectMode",
+      });
+      expect(multi.tagSelectMode).toBe("multi");
+
+      const a = browseCriteriaReducer(multi, { type: "toggleTag", tagId: 1 });
+      const b = browseCriteriaReducer(a, { type: "toggleTag", tagId: 2 });
+      expect(b.activeTagIds).toEqual([1, 2]);
+
+      // 切回单选时只保留最后点的那一个，避免"看着选了一个、实际筛了好几个"
+      const backToSingle = browseCriteriaReducer(b, {
+        type: "toggleTagSelectMode",
+      });
+      expect(backToSingle.tagSelectMode).toBe("single");
+      expect(backToSingle.activeTagIds).toEqual([2]);
+    });
+  });
 });

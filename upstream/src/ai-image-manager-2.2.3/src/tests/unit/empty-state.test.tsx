@@ -10,7 +10,7 @@ describe("gallery empty states", () => {
     const onAddFolder = vi.fn();
     render(<Welcome onAddFolder={onAddFolder} />);
 
-    expect(screen.getByText("添加照片文件夹开始整理")).toBeInTheDocument();
+    expect(screen.getByText("添加图片文件夹开始整理")).toBeInTheDocument();
     expect(screen.queryByText(AI_INDEX_TEXT)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "添加文件夹" }));
     expect(onAddFolder).toHaveBeenCalledOnce();
@@ -19,7 +19,7 @@ describe("gallery empty states", () => {
   it("shows a non-actionable importing state while the first folder is scanned", () => {
     render(<Welcome isImporting={true} onAddFolder={vi.fn()} />);
 
-    expect(screen.getByText("正在导入照片")).toBeInTheDocument();
+    expect(screen.getByText("正在导入图片")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "添加文件夹" })).toBeNull();
   });
 
@@ -80,7 +80,7 @@ describe("gallery empty states", () => {
 
     expect(screen.getByText("搜索失败")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "retry" }));
-    fireEvent.click(screen.getByRole("button", { name: "浏览全部照片" }));
+    fireEvent.click(screen.getByRole("button", { name: "浏览全部图片" }));
     expect(onRetry).toHaveBeenCalledOnce();
     expect(onClearSearch).toHaveBeenCalledOnce();
   });
@@ -101,7 +101,7 @@ describe("gallery empty states", () => {
     expect(screen.getByText("以图搜图失败")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "retry" })).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "浏览全部照片" })
+      screen.getByRole("button", { name: "浏览全部图片" })
     ).toBeInTheDocument();
   });
 });

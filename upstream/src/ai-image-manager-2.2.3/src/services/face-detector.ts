@@ -661,7 +661,9 @@ export async function detectFaces(
       }
     }, 500);
     try {
-      await initFaceWorkerPool(modelsDir, useGPU);
+      // 自用：人脸识别也跟随「设置 → GPU 加速 → 使用显卡」选中的那块卡。
+      const { getDmlDeviceId } = await import("@/services/gpu-detector");
+      await initFaceWorkerPool(modelsDir, useGPU, getDmlDeviceId());
     } finally {
       clearInterval(poolInitInterval);
     }

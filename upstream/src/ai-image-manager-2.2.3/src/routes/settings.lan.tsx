@@ -271,10 +271,12 @@ function LanSettingsPage() {
       >
         <SettingRow
           action={
-            <div className="flex flex-wrap items-center gap-2">
+            // 自用（需求 6）：端口输入框 / 保存 / 随机 三个控件**排在监听端口这一行右侧**，
+            // 不再换行（原来会折到第二行，看着像位置错位）。随机键文字用短的「随机」。
+            <div className="flex flex-nowrap items-center justify-end gap-2">
               <SmoothInput
                 aria-label={t("lanPort")}
-                className={`${FILTER_DROPDOWN_CLASS_NAME} w-[96px]`}
+                className={`${FILTER_DROPDOWN_CLASS_NAME} w-[92px] shrink-0`}
                 inputMode="numeric"
                 onChange={(event) => setPortInput(event.target.value)}
                 value={portInput}
@@ -313,12 +315,15 @@ function LanSettingsPage() {
                 size="sm"
                 variant="outline"
               >
-                {t("lanPickRandomPort")}
+                {t("lanPickRandomPortShort")}
               </Button>
             </div>
           }
           description={t("lanPortHint")}
           title={t("lanPort")}
+          // 自用（问题 7）：这一行有输入框等控件，给上下**对称**的内边距
+          //（`first:pt-2` 用来覆盖 SettingRow 默认的"首行无上边距"，否则上 0 下 8 不对称）
+          className="py-3 first:pt-3"
         />
         <SettingRow
           action={
@@ -344,6 +349,8 @@ function LanSettingsPage() {
               ? "warning"
               : "default"
           }
+          // 自用（问题 7）：「重试监听」按钮上下留一样的边距
+          className="pb-3"
         />
         <SettingRow
           action={
@@ -362,10 +369,14 @@ function LanSettingsPage() {
           }
           description={urls.length > 0 ? undefined : t("lanNoAddress")}
           title={
-            <span className="font-mono">
+            /* 自用（问题 3）：地址原来是一行很细的等宽字，看着"突兀"；
+               改成浅底色的小块，更像"一个可复制的地址"而不是飘着的文字。 */
+            <span className="font-mono text-foreground">
               {primaryUrl ?? t("lanNoAddress")}
             </span>
           }
+          // 自用（问题 7）：「复制地址」按钮上下留一样的边距
+          className="pb-3"
         >
           {urls.length > 1 ? (
             <div className="space-y-0.5 font-mono text-[11px] text-muted-foreground">
@@ -452,6 +463,8 @@ function LanSettingsPage() {
               ? t("lanPasswordSet")
               : t("lanPasswordUnset")
           }
+          // 自用（问题 7）：输入框与右侧按钮上下边距一致
+          className="pb-3"
         >
           <SmoothInput
             aria-label={t("lanPermanentPassword")}
@@ -499,6 +512,8 @@ function LanSettingsPage() {
             />
           }
           title={t("lanTempDuration")}
+          // 自用（需求 6）：这一行原来紧贴下面那条分隔线，补一点底部间距。
+          className="pb-2"
         />
         <SettingRow
           action={
@@ -563,6 +578,8 @@ function LanSettingsPage() {
             </div>
           }
           title={tempStatus}
+          // 自用（问题 7）：与上一行同理，上下边距一致
+          className="pb-3"
         >
           <SmoothInput
             aria-label={t("lanTempPassword")}

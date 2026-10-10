@@ -19,6 +19,7 @@
  * 这类规则不会两边跑偏。
  */
 import { and, inArray, isNull } from "drizzle-orm";
+import { tagRootRank } from "@/config/tag-root-order";
 import { getDatabase } from "@/db";
 import { photos, tags } from "@/db/schema";
 import {
@@ -355,9 +356,16 @@ export function listLanTags(): LanTagNode[] {
     }));
 
   const fixed = reparentToSurvivors(survivors, parentOf);
-  fixed.sort(
-    (a, b) => b.photoCount - a.photoCount || a.name.localeCompare(b.name)
-  );
+  // 自用（需求 3）：主类顺序与桌面端保持一致 —— 「角色」置顶、「通用」次之，
+  // 其余主类按原来的"照片数降序 + 名称"排；非主类（有父节点）不参与主类排序。
+  fixed.sort((a, b) => {
+    const aRank = a.parentId === null ? tagRootRank(a.name) : Number.MAX_SAFE_INTEGER;
+    const bRank = b.parentId === null ? tagRootRank(b.name) : Number.MAX_SAFE_INTEGER;
+    if (aRank !== bRank) {
+      return aRank - bRank;
+    }
+    return b.photoCount - a.photoCount || a.name.localeCompare(b.name);
+  });
   return fixed;
 }
 

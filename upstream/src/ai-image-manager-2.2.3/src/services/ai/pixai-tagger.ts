@@ -30,6 +30,7 @@ import { photos, photoTags, tags } from "@/db/schema";
 import { getSetting, setSetting } from "@/services/settings-manager";
 import { invalidateTagSearch } from "@/services/tag-search-revision";
 import { createLogger } from "@/utils/logger";
+import { shouldResetTaggingCursor } from "./tagging-cursor";
 import {
   PIXAI_CATEGORY_ORDER,
   pixaiParentLabel,
@@ -602,9 +603,32 @@ export function isPixaiVocabularyImported(): boolean {
   return getSetting(VOCAB_KEY) === VOCAB_VERSION;
 }
 
+/**
+ * 自用（方案 A · 问题 6）：开始前就能算出的"累计基线"，供界面第一帧使用。
+ * `done` = 库里已打标的张数，`total` = 全库张数。
+ */
+export function getPixaiTaggingBaseline(): { done: number; total: number } {
+  const libraryTotal = countRemaining(0);
+  return {
+    done: Math.max(0, libraryTotal - countRemaining(readCursor())),
+    total: libraryTotal,
+  };
+}
+
 /** 是否已经跑完过一次全库重扫（决定下次点按钮是否重置游标）。 */
 export function isFullPixaiRunDone(): boolean {
   return getSetting(FULL_RUN_KEY) === "1";
+}
+
+/**
+ * 自用（需求 1）：**强制**下次从第 0 张开始全库重扫。
+ *
+ * 只有"换了模型、必须把旧标签全部重打"这类用户明确要求时才调用它 ——
+ * 日常的"继续打标"靠游标自动续跑，不要清游标（清了就等于从头再来）。
+ */
+export function resetPixaiTaggingProgress(): void {
+  setSetting(CURSOR_KEY, "0");
+  setSetting(FULL_RUN_KEY, "0");
 }
 
 /** 确认词表已导入；必要时执行导入。 */
@@ -880,7 +904,9 @@ async function processBatch(
  *
  * @param modelsDir `<dataPath>/models`
  * @param options.photoIds    只打这些照片；不传则按游标增量推进全库
- * @param options.resetCursor 从头开始（全库重跑）
+ * @param options.resetCursor **显式要求从头**（无条件清空游标 → 全库重跑）。
+ *   界面上点"生成 AI 标签"传的是 false（断点续跑）；只有明确要重打才传 true
+ *   （例：无头命令 `--run-pixai-tagging` 默认 true、`--tag-resume` 时 false）。
  * @param options.maxPhotos   最多处理多少张（用于小范围试点）
  */
 export async function runPixaiTagging(
@@ -908,8 +934,16 @@ export async function runPixaiTagging(
   try {
     // 词表必须先导入：否则 loadTagIdMap() 是空的，打标会"成功但一个标签都写不进去"
     ensurePixaiVocabulary(modelsDir);
-    await initPixaiTagger(modelsDir, Boolean(options.useGpu));
-    const tagIds = loadTagIdMap();
+    // 自用：打标也跟随「设置 → GPU 加速 → 使用显卡」选中的那块卡。
+    const { getDmlDeviceId, resolveWorkerDevices } = await import(
+      "@/services/gpu-detector"
+    );
+    await initPixaiTagger(
+      modelsDir,
+      Boolean(options.useGpu),
+      getDmlDeviceId(),
+      resolveWorkerDevices()
+    );    const tagIds = loadTagIdMap();
 
     let done = 0;
     let tagged = 0;
@@ -920,6 +954,7 @@ export async function runPixaiTagging(
      * 显式标注类型，否则 TS 会把下面循环里的赋值"看不见"，收窄成 null。
      */
     let stalledAt: number | null = null as number | null;
+    const batchSize = BATCH_SIZE;
 
     if (options.photoIds && options.photoIds.length > 0) {
       const ids = [...new Set(options.photoIds)];
@@ -927,11 +962,11 @@ export async function runPixaiTagging(
         ? ids.slice(0, options.maxPhotos)
         : ids;
       total = limited.length;
-      for (let i = 0; i < limited.length; i += BATCH_SIZE) {
+      for (let i = 0; i < limited.length; i += batchSize) {
         if (cancelRequested) {
           break;
         }
-        const chunk = limited.slice(i, i + BATCH_SIZE);
+        const chunk = limited.slice(i, i + batchSize);
         const rows = loadPhotosByIds(chunk);
         const batch = await processBatch(rows, tagIds);
         done += chunk.length;
@@ -940,17 +975,34 @@ export async function runPixaiTagging(
         options.onProgress?.({ done, total, tagged, failed });
       }
     } else {
-      if (options.resetCursor && !isFullPixaiRunDone()) {
-        // 只在**第一次**全库重扫时把游标归零。
-        // 之后即便中途关掉应用再点一次，也会从上次的游标继续，而不是从头再来
-        //（全库跑一遍代价极大：1008px 输入在 CPU 上约 6.5 秒/张）。
+      if (
+        shouldResetTaggingCursor(options, {
+          cursor: readCursor(),
+          fullRunDone: isFullPixaiRunDone(),
+        })
+      ) {
+        // 「从头全库重跑」的唯一入口：调用方显式传 `resetCursor: true`
+        // （界面上点按钮走的是 false → 断点续跑；无头 --run-pixai-tagging 默认 true）。
+        // 另有一个更彻底的 `resetPixaiTaggingProgress()`（连"跑完过一轮"的标记一起清），
+        // 留给"换模型要把旧标签全部重打"的显式操作。
         setSetting(CURSOR_KEY, "0");
       }
       let cursor = readCursor();
-      total = countRemaining(cursor);
-      if (options.maxPhotos) {
-        total = Math.min(total, options.maxPhotos);
-      }
+      /*
+       * 自用（方案 A · 问题 6）：进度用**累计口径**上报。
+       *
+       *   processed = 库里已完成 + 本次已完成，  total = 全库张数
+       *
+       * 为什么：原来 total 是"还剩多少张"、processed 是"本次处理了多少张"，
+       * 界面就成了"0 / 剩余" —— 看着像从头重跑，其实已经在续跑。
+       * 换成累计口径后，界面自然显示"已完成 X / 全库 Y"，一眼就知道是在继续，
+       * 而速度/预估也仍然正确（剩余时间 = (total − processed) / 速度）。
+       */
+      const libraryTotal = countRemaining(0);
+      done = Math.max(0, libraryTotal - countRemaining(cursor));
+      total = libraryTotal;
+      // 先报一次累计基线：否则界面第一帧会是"0 / 全库"那种误导数字
+      options.onProgress?.({ done, failed, tagged, total });
       for (;;) {
         if (cancelRequested) {
           break;
@@ -958,7 +1010,7 @@ export async function runPixaiTagging(
         if (options.maxPhotos && done >= options.maxPhotos) {
           break;
         }
-        const rows = loadPhotosAfterCursor(cursor, BATCH_SIZE);
+        const rows = loadPhotosAfterCursor(cursor, batchSize);
         if (rows.length === 0) {
           break;
         }

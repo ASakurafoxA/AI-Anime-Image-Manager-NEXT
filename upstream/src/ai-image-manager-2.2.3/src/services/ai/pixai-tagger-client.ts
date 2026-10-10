@@ -58,25 +58,32 @@
 import type { ChildProcess } from "node:child_process";
 import { fork } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { app } from "electron";
 import { PRIVATE_BUILD } from "@/config/private-build";
+import {
+  getDmlDeviceId,
+  resolveWorkerDevices,
+} from "@/services/gpu-detector";
+import { createRateMeter, type RateMeter } from "@/services/rate-meter";
 import { createLogger } from "@/utils/logger";
 import type { PixaiCategoryName } from "./pixai-tag-categories";
 
 const log = createLogger("pixai-tagger");
 
 /**
- * 同时常驻的 worker 数量。
+ * 同时常驻的 worker 数量（**默认 1**）。
  *
- * 为什么需要 >1：单个 worker 里「CPU 预处理 → GPU 推理」是**串行**的 —— DirectML
- * 推理时 CPU 在解码/归一化，显卡只能等，所以 1 个 worker 时显卡长期只用到一半。
- * 两个 worker 就能把预处理与推理叠起来（实测 DirectML 单 worker 约占 2.4 GB 显存）。
+ * 曾经的理由是"1 个 worker 里 CPU 预处理 → GPU 推理是串行的，多开能把两段叠起来"。
+ * 但 2026-10-09 用**真实模型 + 真实缩略图**实测后推翻了它 —— 这块显卡上多开只会互相抢：
+ *   · 1 个 worker : **1.71 张/秒**（586ms/张）
+ *   · 2 个 worker : 1.30 张/秒
+ *   · 3 个 worker : 0.59 张/秒
+ *   · 4 个 worker : 0.43 张/秒
+ * 原因：预处理只占每张的约 1.6%（实测 19.5ms / 1188ms），没有多少 CPU 时间可以"藏"，
+ * 而多个 DirectML 会话在同一块 GPU 上会互相打断。多开还白白多占一份显存（每个约 2.4 GB）。
  *
- * 为什么不写死 2：PixAI 模型 1.86 GB，**CPU 回退**时单个 worker 实测能吃到约 10 GB
- * 内存，小内存机器多开会换页。所以按物理内存自适应：≥24 GB 用 2，否则维持 1。
- * 需要手工指定时设环境变量 `AIM_PIXAI_WORKERS=1..4`。
+ * 所以默认 1；真要试多开用环境变量 `AIM_PIXAI_WORKERS=1..4` 覆盖。
  */
 const WORKER_COUNT = resolveWorkerCount();
 
@@ -85,7 +92,7 @@ function resolveWorkerCount(): number {
   if (Number.isFinite(override) && override >= 1 && override <= 4) {
     return override;
   }
-  return os.totalmem() >= 24 * 1024 ** 3 ? 2 : 1;
+  return 1;
 }
 /**
  * 单批超时（毫秒）。
@@ -149,6 +156,12 @@ interface WorkerSlot {
   index: number;
   ready: boolean;
   dead: boolean;
+  /** 这个 worker 绑定的 DirectML 适配器序号（null = 系统默认）。 */
+  deviceId?: number | null;
+  /** 界面上显示的卡名（由调用方填入，例如"NVIDIA GeForce RTX 4070 Ti SUPER"）。 */
+  deviceLabel?: string | null;
+  /** 这个 worker 的速度计（实时张/秒，滑动窗口）。 */
+  rateMeter?: RateMeter;
 }
 
 interface PendingBatch {
@@ -165,6 +178,8 @@ let slotPending = new Map<number, PendingBatch>();
  */
 let initPromise: Promise<void> | null = null;
 let resolvedModelsDir = "";
+/** 多卡模式下已生效的设备清单（用于判断"设置变了要不要重新拉 worker"）。 */
+let resolvedConfiguredDevices: Array<number | null> = [];
 /** 调用方**请求**的 GPU 设定（诊断面板显示这个，而不是实际生效的那个）。 */
 let resolvedUseGpu = false;
 /** 实际发给 worker 的 GPU 设定：DML 崩过之后这里是 false（自动降级 CPU）。 */
@@ -388,7 +403,17 @@ function spawnSlot(index: number): WorkerSlot {
       if (pending) {
         clearTimeout(pending.timer);
         slotPending.delete(index);
-        pending.resolve(message.results ?? []);
+        const results = message.results ?? [];
+        // 自用（多卡）：按 worker 累计成功张数，界面用来显示"每张卡实时速度"。
+        // 用滑动窗口速率计而不是累计平均 —— 否则拖动占用限制也看不出变化。
+        const succeeded = results.filter((item) => !item.error).length;
+        if (succeeded > 0) {
+          if (!slot.rateMeter) {
+            slot.rateMeter = createRateMeter(4000);
+          }
+          slot.rateMeter.add(succeeded);
+        }
+        pending.resolve(results);
       }
       return;
     }
@@ -458,9 +483,50 @@ function waitForReady(slot: WorkerSlot, timeoutMs: number): Promise<void> {
  *                  内部退回 CPU。若上一次 init 是 DML **推理中崩溃**，
  *                  这里会自动改成 `useGPU: false`（只降一次，见文件头注释）。
  */
+/**
+ * 自用（第 10 轮）：**多设备模式** —— 一张卡一个常驻 worker。
+ *
+ * 为什么：本机实测"**同一张卡上多开会互相踩**"（1 个 1.70 张/秒、2 个只有 0.82 张/秒，
+ * 显存已到 15.6/16.4GB），而打标是纯 GPU 受限（推理占 98.3% 时间）。
+ * 所以真正能提速的只有"跨卡并行"：一张卡一个 worker，各自绑自己的 deviceId。
+ *
+ * 设备清单来自「设置 → GPU 加速 → 多卡模式」（`gpu-detector.ts` 的 `resolveWorkerDevices()`）：
+ *   · 多卡关闭 → 只有 1 个设备 = `fallbackDeviceId`（行为与以前完全一致）；
+ *   · 多卡开启 → 勾了几张卡就有几个 worker（最多 3 张，用户定的上限）。
+ * 环境变量 `AIM_PIXAI_DEVICES=2,3` 仍可覆盖（便于命令行实测，不必改设置）。
+ *
+ * ⚠️ **不建议**把核显算进来：Ryzen 核显算力低一个数量级、还要共享内存带宽，
+ * 跑 1.86GB 的模型大概率比 8 线程 CPU 更慢（CPU 实测 6.5 秒/张），只会拖慢整体。
+ *
+ * @param fallbackDeviceId 单卡模式下要用的适配器序号
+ * @param configuredDevices 来自设置的设备清单（多卡模式；为空表示单卡）
+ */
+function resolveDeviceList(
+  fallbackDeviceId: number | null,
+  configuredDevices: Array<number | null> = []
+): Array<number | null> {
+  const raw = (process.env.AIM_PIXAI_DEVICES ?? "").trim();
+  if (raw) {
+    const parsed = raw
+      .split(",")
+      .map((part) => Number.parseInt(part.trim(), 10))
+      .filter((value) => Number.isInteger(value) && value >= 0);
+    if (parsed.length > 0) {
+      return parsed;
+    }
+  }
+  if (configuredDevices.length > 0) {
+    return configuredDevices;
+  }
+  return [fallbackDeviceId];
+}
+
 export async function initPixaiTagger(
   modelsDir: string,
-  useGpu: boolean
+  useGpu: boolean,
+  deviceId: number | null = null,
+  /** 多卡模式下的设备清单（来自设置）；为空数组 = 单卡，行为不变。 */
+  configuredDevices: Array<number | null> = []
 ): Promise<void> {
   if (!isEnabled()) {
     return;
@@ -469,9 +535,15 @@ export async function initPixaiTagger(
     return initPromise;
   }
   // 参数变了 = 调用方想重新试一次，清掉 DML 降级记忆
-  if (modelsDir !== resolvedModelsDir || useGpu !== resolvedUseGpu) {
+  if (
+    modelsDir !== resolvedModelsDir ||
+    useGpu !== resolvedUseGpu ||
+    configuredDevices.length !== resolvedConfiguredDevices.length ||
+    configuredDevices.some((value, index) => value !== resolvedConfiguredDevices[index])
+  ) {
     lastInitWasProviderError = false;
   }
+  resolvedConfiguredDevices = configuredDevices;
   resolvedModelsDir = modelsDir;
   resolvedUseGpu = useGpu;
   // DML 上次把进程搞崩了 → 这次直接 CPU，别再去送一次死
@@ -500,14 +572,31 @@ export async function initPixaiTagger(
     }
     slots = [];
     slotPending = new Map();
-    for (let i = 0; i < WORKER_COUNT; i++) {
+    /**
+     * 多设备（自用·第 10 轮）：一张卡一个 worker。
+     * 多卡模式关闭时 deviceList 只有一个元素 → 行为与以前完全一致。
+     */
+    const deviceList = resolveDeviceList(deviceId, configuredDevices);
+    // 每个设备一个 worker（不再按内存随手开 2 个：同一张卡上多开只会互相踩）
+    const workerCount = Math.max(1, deviceList.length);
+    for (let i = 0; i < workerCount; i++) {
       const slot = spawnSlot(i);
+      slot.deviceId =
+        deviceList[Math.min(i, deviceList.length - 1)] ?? null;
+      slot.deviceLabel = null;
       slots.push(slot);
       slot.process.send({
-        type: "init",
+        deviceId: slot.deviceId ?? undefined,
         modelsDir,
+        type: "init",
         useGPU: effectiveUseGpu,
       });
+    }
+    if (deviceList.length > 1) {
+      log.info(
+        { devices: deviceList, workers: workerCount },
+        "PixAI 多卡模式：每个 worker 绑定一个 DirectML 适配器"
+      );
     }
     await Promise.all(slots.map((slot) => waitForReady(slot, READY_TIMEOUT_MS)));
     log.info(
@@ -581,7 +670,12 @@ export async function tagPhotoBatchPixai(
     }
     // 走到这里说明 worker 崩过（或上一批超时被杀）—— 重新拉起，不静默失败
     log.warn("PixAI tagger 未就绪，自动重新拉起 worker");
-    await initPixaiTagger(resolvedModelsDir, resolvedUseGpu);
+    await initPixaiTagger(
+      resolvedModelsDir,
+      resolvedUseGpu,
+      getDmlDeviceId(),
+      resolveWorkerDevices()
+    );
   }
   const slot = await acquireSlot();
   return new Promise<PixaiPhotoResult[]>((resolve, reject) => {
@@ -618,8 +712,25 @@ export async function tagPhotoBatchPixai(
   });
 }
 
-/** 请求中止当前批次（worker 会在当前图片处理完后停止）。 */
-export function abortPixaiTagger(): void {
+/**
+ * 自用（多卡）：每张卡的实时速度 —— 供设置页显示。
+ *
+ * 返回每个 worker（= 每张卡）的适配器序号与当前张/秒。
+ * 未在跑任务时速率计为空 → 速度返回 0（界面显示"空闲"）。
+ */
+export function getPixaiPerDeviceStats(): Array<{
+  deviceId: number | null;
+  label: string | null;
+  perSecond: number;
+}> {
+  return slots.map((slot) => ({
+    deviceId: slot.deviceId ?? null,
+    label: slot.deviceLabel ?? null,
+    perSecond: slot.rateMeter?.perSecond() ?? 0,
+  }));
+}
+
+/** 请求中止当前批次（worker 会在当前图片处理完后停止）。 */export function abortPixaiTagger(): void {
   for (const slot of slots) {
     try {
       slot.process.send({ type: "abort" });

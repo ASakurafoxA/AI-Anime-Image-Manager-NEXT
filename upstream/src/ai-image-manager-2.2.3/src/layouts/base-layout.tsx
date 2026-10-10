@@ -124,7 +124,9 @@ function SidebarSlot() {
           }
           onToggleTag={filter.toggleTag}
           onToggleTagMode={filter.toggleTagMode}
+          onToggleTagSelectMode={filter.toggleTagSelectMode}
           tagMode={filter.tagMode}
+          tagSelectMode={filter.tagSelectMode}
           totalPhotos={filter.totalPhotos}
         />
         {isHomePage && (

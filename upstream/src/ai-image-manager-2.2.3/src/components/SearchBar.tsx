@@ -5,6 +5,7 @@
 // biome-ignore-all lint/correctness/noUnusedFunctionParameters: scoped component lint cleanup preserves existing UI behavior
 import { useNavigate } from "@tanstack/react-router";
 import { Clock, Filter, ImageUp, Search, X } from "lucide-react";
+import { resolveTagDotColor } from "@/components/sidebar-trees";
 import {
   type Dispatch,
   forwardRef,
@@ -133,6 +134,8 @@ interface SearchBarProps {
   onImageSearch?: (imagePath: string) => void;
   onQueryChange: (query: string) => void;
   onSearch: (query: string, filters?: ExifFilters) => void;
+  /** 自用（问题 3）：一键清空已选标签。 */
+  onTagClear?: () => void;
   onTagRemove?: (tagId: number) => void;
   onTagSelect?: (tag: TagInfo) => void;
   query: string;
@@ -161,6 +164,7 @@ export const SearchBar = memo(
         onFiltersChange: setFilters,
         onQueryChange: setQuery,
         onSearch,
+        onTagClear,
         onTagRemove,
         onTagSelect,
         onClear,
@@ -883,6 +887,14 @@ export const SearchBar = memo(
         const selected = new Set(activeTagIds);
         return tags.filter((tag) => selected.has(tag.id));
       }, [activeTagIds, tags]);
+      /*
+       * 自用（问题 2）：已选标签的小点颜色必须与标签树一致 ——
+       * 颜色代表"属于哪个主类"，所以统一走 resolveTagDotColor（标签树用的同一套规则）。
+       */
+      const tagById = useMemo(
+        () => new Map(tags.map((tag) => [tag.id, tag])),
+        [tags]
+      );
 
       return (
         <search
@@ -1164,15 +1176,25 @@ export const SearchBar = memo(
 
             {selectedTags.length > 0 && (
               <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                {selectedTags.map((tag) => (
-                  <span
-                    className="inline-flex h-6 min-w-0 max-w-full items-center gap-1 rounded-[5px] border border-primary/20 bg-primary/10 px-2 font-medium text-[11px] text-primary"
-                    key={tag.id}
-                  >
+                {selectedTags.map((tag) => {
+                  /*
+                   * 自用（问题 2）：chip 的色**按所属标签（主类）来**，不跟主题色走。
+                   */
+                  const chipColor = resolveTagDotColor(tag, tagById);
+                  return (
+                    <span
+                      className="inline-flex h-6 min-w-0 max-w-full items-center gap-1 rounded-[5px] border px-2 font-medium text-[11px]"
+                      key={tag.id}
+                      style={{
+                        backgroundColor: `color-mix(in srgb, ${chipColor} 14%, transparent)`,
+                        borderColor: `color-mix(in srgb, ${chipColor} 38%, transparent)`,
+                        color: chipColor,
+                      }}
+                    >
                     <span
                       className="h-2 w-2 shrink-0 rounded-full"
                       style={{
-                        backgroundColor: tag.color || "var(--primary)",
+                        backgroundColor: resolveTagDotColor(tag, tagById),
                       }}
                     />
                     <Tooltip>
@@ -1200,7 +1222,21 @@ export const SearchBar = memo(
                       </button>
                     )}
                   </span>
-                ))}
+                  );
+                })}
+                {/* 自用（问题 3）：标签多了以后要能一键清空（叠一个很方便） */}
+                {onTagClear && selectedTags.length > 1 && (
+                  <button
+                    aria-label={t("tagClearAll")}
+                    className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-card px-2 text-[11px] text-muted-foreground transition-colors hover:border-danger/40 hover:text-danger"
+                    onClick={onTagClear}
+                    title={t("tagClearAll")}
+                    type="button"
+                  >
+                    <X className="h-3 w-3" />
+                    {t("tagClearAll")}
+                  </button>
+                )}
               </div>
             )}
 
@@ -2242,6 +2278,9 @@ export const SearchBar = memo(
       return false;
     }
     if (prevProps.onTagRemove !== nextProps.onTagRemove) {
+      return false;
+    }
+    if (prevProps.onTagClear !== nextProps.onTagClear) {
       return false;
     }
     if (prevProps.onTagSelect !== nextProps.onTagSelect) {

@@ -52,6 +52,45 @@ describe("diagnostic bundle metadata", () => {
     reproducibility: "sometimes",
   };
 
+  it("自用：导出单个 Markdown 诊断日志（给 AI 排查用）", async () => {
+    testDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "aim-ai-log-test-"));
+    vi.spyOn(app, "getPath").mockReturnValue(testDirectory);
+    vi.spyOn(os, "hostname").mockReturnValue("PRIVATE-MACHINE-34");
+    const directory = path.join(testDirectory, "logs");
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(
+      path.join(directory, "app.log"),
+      [
+        JSON.stringify({
+          message: "Worker initialization failed",
+          level: "error",
+        }),
+        JSON.stringify({ message: "Running on PRIVATE-MACHINE-34" }),
+      ].join("\n")
+    );
+
+    const { createDiagnosticLogExport } = await import(
+      "@/services/diagnostics/bundle"
+    );
+    const result = await createDiagnosticLogExport(input);
+
+    // 落盘的文件和返回值是同一份内容，扩展名是 .md（不是 .zip）
+    expect(result.path.endsWith(".md")).toBe(true);
+    expect(fs.existsSync(result.path)).toBe(true);
+    expect(fs.readFileSync(result.path, "utf-8")).toBe(result.markdown);
+
+    // 结构：一句话说明 + 报告 + 机器可读 JSON + 原始日志，AI 可直接解析
+    expect(result.markdown).toContain("# AI Image Manager 诊断日志");
+    expect(result.markdown).toContain("## 机器可读摘要");
+    expect(result.markdown).toContain("````json");
+    expect(result.markdown).toContain("## 近期日志（已脱敏）");
+    expect(result.markdown).toContain("Worker initialization failed");
+
+    // 隐私口径与 ZIP 包一致：机器名、图片文件名都不能出现
+    expect(result.markdown).not.toContain("PRIVATE-MACHINE-34");
+    expect(result.markdown).not.toContain("private.jpg");
+  });
+
   it("redacts only the unsafe field and keeps failure logs and AI state", async () => {
     testDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "aim-privacy-test-"));
     vi.spyOn(app, "getPath").mockReturnValue(testDirectory);
@@ -189,7 +228,7 @@ describe("diagnostic bundle metadata", () => {
     const result = buildGitHubIssue({ incident, input, manifest });
 
     expect(result.issueUrl).toContain(
-      "github.com/Uyoung666/ai-image-manager/issues/new"
+      "github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/issues/new"
     );
     expect(result.issueBody).toContain(incident.id);
     expect(result.issueBody).toContain(incident.fingerprint);

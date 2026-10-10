@@ -524,17 +524,27 @@
         }
 
         function applySize(index) {
-          var clamped = Math.max(0, Math.min(CELL_STEPS.length - 1, index));
-          state.sizeIndex = clamped;
+          /*
+           * 自用修复 2026-10-09：**取模循环**，不要 clamp。
+           *
+           * 原来是 `Math.max(0, Math.min(len-1, index))` —— 夹到上限。
+           * 可这个按钮是"点一下进下一档"（`applySize(state.sizeIndex + 1)`），
+           * 于是到了「特大」再点还是「特大」（4 → 夹回 3），**按钮看起来就失效了**。
+           * 用户明确要求"正常逻辑应该是循环的"，所以改成取模：特大 → 小。
+           * 注意负数也要能正确回绕（`-1 % 4` 在 JS 里是 -1，所以要补一次 +len）。
+           */
+          var count = CELL_STEPS.length;
+          var wrapped = ((Number(index) || 0) % count + count) % count;
+          state.sizeIndex = wrapped;
           document.documentElement.style.setProperty(
             "--cell",
-            CELL_STEPS[clamped].px + "px"
+            CELL_STEPS[wrapped].px + "px"
           );
           var button = el("size");
-          button.textContent = CELL_STEPS[clamped].label;
-          button.className = clamped === defaultSizeIndex() ? "" : "on";
+          button.textContent = CELL_STEPS[wrapped].label;
+          button.className = wrapped === defaultSizeIndex() ? "" : "on";
           try {
-            localStorage.setItem(CELL_KEY, String(clamped));
+            localStorage.setItem(CELL_KEY, String(wrapped));
           } catch (e) {
             /* 隐私模式下写不进去也没关系 */
           }
@@ -603,14 +613,11 @@
               state.tree.folder = results[0].items || [];
               state.tree.tag = results[1].items || [];
               state.treeLoaded = true;
-              // 默认展开根节点，这样一进来就能看到第一层
-              ["folder", "tag"].forEach(function (kind) {
-                state.tree[kind].forEach(function (node) {
-                  if (node.parentId === null) {
-                    state.expanded[kind][node.id] = true;
-                  }
-                });
-              });
+              /*
+               * 自用：**默认全部折叠**（原来是"自动展开所有根节点"）。
+               * 用户要求合上一级标签 —— 这里刻意什么都不设，
+               * 让 state.expanded 保持空对象，用户点哪一层再展开哪一层。
+               */
               renderTree();
             })
             .catch(function (error) {

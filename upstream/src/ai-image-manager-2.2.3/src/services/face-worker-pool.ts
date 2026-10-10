@@ -65,6 +65,8 @@ let slots: WorkerSlot[] = [];
 let requestQueue: QueuedRequest[] = [];
 let poolModelsDir: string | null = null;
 let poolUseGPU = false;
+/** 自用：要交给 DirectML 的适配器序号（null = 系统默认）。 */
+let poolDeviceId: number | null = null;
 let initialized = false;
 let poolSize = 0;
 let poolGeneration = 0;
@@ -259,6 +261,7 @@ function handleWorkerDeath(slot: WorkerSlot, reason?: Error): void {
       try {
         newSlot.process.send({
           type: "init",
+          deviceId: poolDeviceId ?? undefined,
           modelsDir: poolModelsDir,
           useGPU: poolUseGPU,
         });
@@ -406,7 +409,8 @@ function waitForWorkerReady(slot: WorkerSlot): Promise<void> {
 /** Start the face-worker pool. Workers load ONNX models once and stay alive. */
 export function initFaceWorkerPool(
   modelsDir: string,
-  useGPU: boolean
+  useGPU: boolean,
+  deviceId: number | null = null
 ): Promise<void> {
   if (initialized && !shuttingDown && slots.some((s) => s.status !== "dead")) {
     return Promise.resolve();
@@ -418,6 +422,8 @@ export function initFaceWorkerPool(
 
   poolModelsDir = modelsDir;
   poolUseGPU = useGPU;
+  // 自用：人脸识别也跟随「设置 → GPU 加速 → 使用显卡」选中的那块卡。
+  poolDeviceId = deviceId;
   shuttingDown = false;
   const promise = (async () => {
     // Invalidate all handlers/timers from a failed or previous generation before
@@ -447,7 +453,12 @@ export function initFaceWorkerPool(
 
     try {
       for (const slot of slots) {
-        slot.process.send({ type: "init", modelsDir, useGPU });
+        slot.process.send({
+          deviceId: poolDeviceId ?? undefined,
+          modelsDir,
+          type: "init",
+          useGPU,
+        });
       }
       await Promise.all(readyPromises);
       if (generation !== poolGeneration || shuttingDown) {
@@ -608,10 +619,12 @@ export async function detectFacesWithPool(
   const total = photos.length;
   const aliveCount = slots.filter((s) => s.status !== "dead").length;
   const concurrency = Math.min(poolSize, aliveCount);
+  // 自用：批量受「占用限制」缩放（100% 时不变）。
+  const effectiveBatchSize = batchSize;
 
   const batchList: Array<Array<{ id: number; path: string }>> = [];
-  for (let i = 0; i < photos.length; i += batchSize) {
-    batchList.push(photos.slice(i, i + batchSize));
+  for (let i = 0; i < photos.length; i += effectiveBatchSize) {
+    batchList.push(photos.slice(i, i + effectiveBatchSize));
   }
 
   const allResults: FaceDetectionResult[] = [];
@@ -652,6 +665,7 @@ export async function detectFacesWithPool(
       }
       processed += batch.length;
       onProgress?.(Math.min(processed, total), total);
+      // 自用（问题 6）：按实测批次耗时补空闲（固定小间隔压不住 GPU 占用）
     }
   }
 

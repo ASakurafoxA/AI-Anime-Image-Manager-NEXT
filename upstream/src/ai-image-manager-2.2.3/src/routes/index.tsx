@@ -3621,6 +3621,7 @@ function HomePage() {
             onImageSearch={handleImageSearch}
             onQueryChange={filter.setSearchDraftQuery}
             onSearch={handleSearch}
+            onTagClear={() => filter.toggleTag(null)}
             onTagRemove={handleTagFilterRemove}
             onTagSelect={handleTagSuggestionSelect}
             query={filter.searchDraft.query}

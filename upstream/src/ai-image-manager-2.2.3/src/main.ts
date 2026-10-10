@@ -42,6 +42,7 @@ import {
   getTranslationModelFile,
 } from "@/services/ai/model-config";
 import { copyModelsOnce } from "@/services/ai/model-loader";
+import { releaseGpu, tryAcquireGpu } from "@/services/ai/gpu-queue";
 import { deletePhotoVectors, initVectorDB } from "@/services/ai-embedder";
 import {
   appendDiagnosticLog,
@@ -1432,11 +1433,39 @@ async function runHeadlessPixaiTagging(): Promise<number> {
   const { runPixaiTagging } = await import("@/services/ai/pixai-tagger");
   const modelsDir = await ensureLocalModel();
 
+  // 无头入口也走互斥：否则命令行打标会和界面里的建向量同时抢显卡
+  const blocked = tryAcquireGpu("tagging");
+  if (blocked) {
+    log.error(`[Headless] 打标未启动：${blocked}`);
+    return 2;
+  }
+
   // `--tag-limit=N` 只打前 N 张（快速验证用）
   const limitArg = process.argv.find((arg) => arg.startsWith("--tag-limit="));
   const maxPhotos = limitArg
     ? Number.parseInt(limitArg.slice("--tag-limit=".length), 10)
     : undefined;
+
+  /**
+   * 默认「全库重跑」，加 `--tag-resume` 则从断点续跑。
+   *
+   * ⚠️ 这里用的是 `resetCursor`：它现在的语义是**显式要求从头**（无条件归零）。
+   *    自用（需求 1）之后，界面上那条路（"生成 AI 标签"）传的是 `resetCursor: false`，
+   *    所以永远不会误伤已经在跑的断点。曾有一版把两者混在一个判定里，
+   *    结果本命令在**已有游标的库**上静默变成"续跑"（第 10 轮发现并修掉，
+   *    见 `services/ai/tagging-cursor.ts` 的注释）。
+   */
+  const resume = process.argv.includes("--tag-resume");
+  if (!resume) {
+    const { getPixaiTaggingBaseline } = await import("@/services/ai/pixai-tagger");
+    const before = getPixaiTaggingBaseline();
+    log.info(
+      `[Headless] 全库重跑：原进度约 ${before.done}/${before.total}，将从头开始；` +
+        "想从断点续跑请加 --tag-resume"
+    );
+  } else {
+    log.info("[Headless] --tag-resume：从断点续跑，不清空游标");
+  }
 
   log.info(
     `[Headless] PixAI 打标开始：modelsDir=${modelsDir}` +
@@ -1447,7 +1476,8 @@ async function runHeadlessPixaiTagging(): Promise<number> {
   let lastLoggedAt = 0;
   const result = await runPixaiTagging(modelsDir, {
     ...(maxPhotos && Number.isFinite(maxPhotos) ? { maxPhotos } : {}),
-    resetCursor: true,
+    // 默认全库重跑（它就是唯一会真正归零的开关）；--tag-resume 时保持续跑
+    resetCursor: !resume,
     // `--tag-gpu` 才尝试 DirectML：它快 10 倍以上（实测 0.6s vs 6.5s/张），
     // 但有原生崩溃风险（客户端会自动降级一次到 CPU，不会死循环）。
     useGpu: process.argv.includes("--tag-gpu"),
@@ -1464,11 +1494,94 @@ async function runHeadlessPixaiTagging(): Promise<number> {
     },
   });
 
+  releaseGpu("tagging");
   log.info(
     `[Headless] 完成：总数 ${result.total}、成功 ${result.tagged}、失败 ${result.failed}` +
       (result.cancelled ? "（被中止）" : "")
   );
   return result.failed > 0 ? 1 : 0;
+}
+
+/**
+ * 无头建向量（"特征提取"）：`--run-embedding [--embed-limit=N]`。
+ *
+ * 为什么要有它：**吞吐问题主要出在这条链上**（SigLIP + worker 池），
+ * 而它原本只能开界面点按钮才会跑，无法在命令行量化"多少张/秒"。
+ * 有了它就能：
+ *   1. 在隔离图库里跑基准（配 `AI_IMAGE_MANAGER_USER_DATA_DIR`），不影响真实库；
+ *   2. 改并发/批量/预处理后，用同一条命令做**前后对比**（这是唯一可信的对比方式）。
+ *
+ * 会处理"待建向量"的照片：`isAiProcessed = 0` 的照片，以及**已标记处理过但向量库里没有**的
+ * 照片（embedder 自己会重新排队）。所以想只测 N 张，先在隔离库把那 N 张的
+ * `is_ai_processed` 置 0（脚本里就这么做）。
+ *
+ * 退出码：`0` 正常跑完 / `1` 抛错 / `2` 前置条件不满足。
+ */
+async function runHeadlessEmbedding(): Promise<number> {
+  const limitArg = process.argv.find((arg) => arg.startsWith("--embed-limit="));
+  const limit = limitArg
+    ? Number.parseInt(limitArg.slice("--embed-limit=".length), 10)
+    : undefined;
+
+  const { embedAllPhotos } = await import("@/services/ai/embedder");
+
+  // 无头入口也走互斥：否则命令行建向量会和界面里的打标同时抢显卡
+  const blocked = tryAcquireGpu("embedding");
+  if (blocked) {
+    log.error(`[Headless] 建向量未启动：${blocked}`);
+    return 2;
+  }
+
+  if (limit && Number.isFinite(limit)) {
+    const { getDatabase } = await import("@/db");
+    const { photos } = await import("@/db/schema");
+    const { eq, sql } = await import("drizzle-orm");
+    // 只放开前 N 张"已处理"的照片 → embedder 会精确地只处理它们
+    const db = getDatabase();
+    const candidates = db
+      .select({ id: photos.id })
+      .from(photos)
+      .where(sql`${photos.isAiProcessed} = 1 AND ${photos.deletedAt} IS NULL`)
+      .limit(limit)
+      .all()
+      .map((row) => row.id);
+    for (const id of candidates) {
+      db.update(photos)
+        .set({ isAiProcessed: false })
+        .where(eq(photos.id, id))
+        .run();
+    }
+    log.info(
+      `[Headless] 已把 ${candidates.length} 张标记为待建向量（仅测这批）`
+    );
+  }
+
+  let lastLoggedAt = 0;
+  let totalProcessed = 0;
+  const startedAt = Date.now();
+  const embeddedCount = await embedAllPhotos((progress) => {
+    totalProcessed = Math.max(totalProcessed, progress.processed ?? 0);
+    const now = Date.now();
+    if (
+      now - lastLoggedAt < 10_000 &&
+      (progress.processed ?? 0) < (progress.total ?? 0)
+    ) {
+      return;
+    }
+    lastLoggedAt = now;
+    const elapsedSec = (now - startedAt) / 1000;
+    const rate = elapsedSec > 0 ? (totalProcessed / elapsedSec).toFixed(2) : "?";
+    log.info(
+      `[Headless] 建向量进度 ${progress.processed ?? 0}/${progress.total ?? 0}（${rate} 张/秒）`
+    );
+  });
+  const elapsedSec = (Date.now() - startedAt) / 1000;
+  releaseGpu("embedding");
+  log.info(
+    `[Headless] 建向量完成：处理 ${embeddedCount} 张，耗时 ${elapsedSec.toFixed(1)}s，` +
+      `平均 ${(elapsedSec / Math.max(1, embeddedCount)).toFixed(3)} 秒/张（${(embeddedCount / Math.max(0.001, elapsedSec)).toFixed(2)} 张/秒）`
+  );
+  return 0;
 }
 
 async function startBackgroundServices() {
@@ -1789,6 +1902,22 @@ app.whenReady().then(async () => {
       })();
     }
 
+    // ── 无头建向量：`--run-embedding [--embed-limit=N]` ────────────────
+    // 用于量化"特征提取多少张/秒"，以及改并发/批量后的前后对比。
+    if (process.argv.includes("--run-embedding")) {
+      void (async () => {
+        let exitCode = 2;
+        try {
+          await backgroundStartup;
+          exitCode = await runHeadlessEmbedding();
+        } catch (error) {
+          log.error({ err: error }, "[Headless] 建向量过程抛错");
+          exitCode = 1;
+        }
+        app.exit(exitCode);
+      })();
+    }
+
     // ── Background color data backfill (non-blocking, deferred 5s) ─────
     setTimeout(async () => {
       try {
@@ -1892,8 +2021,52 @@ async function waitForQuitCleanup(
   }
 }
 
+/**
+ * 退出前优雅收尾"建向量"（自用·吞吐修复 2026-10-09）。
+ *
+ * 问题（日志实测）：用户关窗口/退出时，主进程直接 `terminateTrackedChildProcessesSync()`
+ * 把正在推理的 embed worker 用 SIGTERM 杀掉 —— 上一批"已算完但还没落库/没写标记"的
+ * 照片就变成**半嵌入**状态（向量库里有、SQLite 标记说没有，或反过来）。
+ * 下次启动的自检会把这些照片重新排队甚至整批清理重跑，等于白跑。
+ *
+ * 做法：先请求取消（worker 会在**当前批次边界**停下），等它真正结束后再继续走原来的
+ * 终止流程。超时（30 秒）就放弃等待 —— 退出不能被一个卡死的 worker 拖住。
+ */
+async function settleRunningEmbeddingBeforeQuit(): Promise<void> {
+  try {
+    const { cancelEmbedding, isCurrentEmbeddingRun, activeEmbeddingRunId } =
+      await import("@/services/ai-embedder");
+    const runId = activeEmbeddingRunId;
+    if (runId <= 0) {
+      return;
+    }
+    log.info(`quit cleanup: 建向量仍在进行（run ${runId}），先请求停止并等待收尾`);
+    cancelEmbedding();
+    /**
+     * 等待上限。
+     *
+     * ⚠️ 2026-10-09 实测教训：原来是 30 秒，而一轮大批量建向量**刚被取消时会先跑清理
+     * （可能好几分钟）**，30 秒必然超时 → 进程直接退出 → 已建好的向量被回滚，
+     * 用户白跑 20 分钟。这里放宽到 5 分钟，让收尾有机会做完。
+     */
+    const deadline = Date.now() + 300_000;
+    while (isCurrentEmbeddingRun(runId) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    if (isCurrentEmbeddingRun(runId)) {
+      log.warn("quit cleanup: 等待建向量收尾超时（5 分钟），继续退出");
+    } else {
+      log.info("quit cleanup: 建向量已收尾");
+    }
+  } catch (error) {
+    log.warn({ err: error }, "quit cleanup: 收尾建向量时出错（忽略，继续退出）");
+  }
+}
+
 async function cleanupApplicationBeforeQuit(): Promise<void> {
   log.info("quit cleanup: started");
+  // 先让"建向量"在批次边界停下并落库，避免半嵌入（必须早于杀子进程）
+  await settleRunningEmbeddingBeforeQuit();
   const { suspendImportsForShutdown } = await import("@/services/import-queue");
   suspendImportsForShutdown();
   stopAutomaticChecks();
