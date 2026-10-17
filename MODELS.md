@@ -1,8 +1,9 @@
 # 模型文件怎么拿
 
 本仓库**不含模型权重**：GitHub 单文件硬上限 **100 MB**，而这里最大的几个（WD14 的 `model.onnx` 361 MB、
-SigLIP 的文字塔 106 MB、PixAI 的 onnx 1.86 GB）都放不下，即便塞进 Git LFS，免费额度（1 GB 存储 / 1 GB 月流量）
-也会被一次 clone 用光。所以仓库里只放**来源链接 + SHA256**，模型自己下（或走 Releases / 网盘）。
+中文 CLIP 的 `model_quantized.onnx` 182 MB、PixAI 的 onnx 1.86 GB、CCIP 的 366 MB）都放不下，
+即便塞进 Git LFS，免费额度（1 GB 存储 / 1 GB 月流量）也会被一次 clone 用光。
+所以仓库里只放**来源链接 + SHA256**，模型自己下（或走 Releases / 网盘）。
 
 小文件（tokenizer / vocab / `zh_names.csv` / `config.json` 等 17 个）**已经在仓库里**，不用另找。
 
@@ -12,7 +13,8 @@ SigLIP 的文字塔 106 MB、PixAI 的 onnx 1.86 GB）都放不下，即便塞�
 
 ```
 <图库>\models\SmilingWolf\wd-vit-tagger-v3\model.onnx
-<图库>\models\Xenova\siglip-base-patch16-224\onnx\vision_model_quantized.onnx
+<图库>\models\Xenova\chinese-clip-vit-base-patch16\onnx\model_quantized.onnx
+<图库>\models\ccip\model_feat.onnx
 ...
 ```
 
@@ -22,16 +24,17 @@ SigLIP 的文字塔 106 MB、PixAI 的 onnx 1.86 GB）都放不下，即便塞�
 
 | 放到 `<图库>\models\` 下 | 大小 | SHA256 | 来源 |
 |---|---|---|---|
-| `SmilingWolf\wd-vit-tagger-v3\model.onnx` | 361.0 MB | `6d1bef6b8d319838133489014666f368e9bd63c9a7b475ee5cb1bd557a10f916` | [SmilingWolf/wd-vit-tagger-v3](https://huggingface.co/SmilingWolf/wd-vit-tagger-v3) |
-| `Xenova\siglip-base-patch16-224\onnx\vision_model_quantized.onnx` | 94.9 MB | `ef14a954f3d57e1806666432bd9785004c1dc27100aa260eee0cb0f10a5de058` | [Xenova/siglip-base-patch16-224](https://huggingface.co/Xenova/siglip-base-patch16-224) |
-| `Xenova\siglip-base-patch16-224\onnx\text_model_quantized.onnx` | 106.3 MB | `ad0329b1f35acc66d8953ff2559ce358da8eb0a7011794cf951523d63a4dbce2` | 同上 |
-| `Xenova\opus-mt-zh-en\onnx\encoder_model_quantized.onnx` | 50.4 MB | `84d5e171b626bc8b6b220d022ac58696e9528c25deeacca62b5cbf4364547a99` | [Xenova/opus-mt-zh-en](https://huggingface.co/Xenova/opus-mt-zh-en) |
-| `Xenova\opus-mt-zh-en\onnx\decoder_model_merged_quantized.onnx` | 57.4 MB | `c6b7f04ff1ba0fbd1bf6852599b4c0cad6fe512d57cd887f44ef36cf705424cb` | 同上 |
-| `face\face_recognition_sface_2021dec.onnx` | 36.9 MB | `0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79` | [opencv_zoo → face_recognition_sface](https://github.com/opencv/opencv_zoo/blob/main/models/face_recognition_sface/README.md) |
-| `face\face_detection_yunet_2023mar.onnx` | 0.2 MB | `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4` | [opencv_zoo → face_detection_yunet](https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/README.md) —— **这一份已在仓库里** ✓ |
+| `SmilingWolf\wd-vit-tagger-v3\model.onnx` | 361.0 MB | `6d1bef6b8d319838133489014666f368e9bd63c9a7b475ee5cb1bd557a10f916` | [SmilingWolf/wd-vit-tagger-v3](https://huggingface.co/SmilingWolf/wd-vit-tagger-v3) —— **WD 版 / 本地版用它打标** |
+| `Xenova\chinese-clip-vit-base-patch16\onnx\model_quantized.onnx` | 182 MB | 见下方「本仓库自带」说明 | [Xenova/chinese-clip-vit-base-patch16](https://huggingface.co/Xenova/chinese-clip-vit-base-patch16) —— **语义搜索 / 以图搜图** |
+| `ccip\model_feat.onnx`（+ `metrics.json`） | 366 MB | `8681DB576D6096C84B29700D9A31B9753771C97E3622A7B5091B8EB00F806130`（整包 zip） | [deepghs/ccip_onnx](https://huggingface.co/deepghs/ccip_onnx) —— **角色识别（可选，外置）** |
 
-> 注意 ONNX 文件名/量化方式要对得上：SigLIP 与 opus 用的是 **Xenova 的 `*_quantized.onnx`**；
-> WD14 用的是 **SmilingWolf 原仓的 `model.onnx`**（非 quantized）；人脸两个来自 OpenCV Zoo 的 ONNX。
+> 说明（2026-10-18 更新）：
+> - **中文 CLIP 与 WD14 已随安装包提供**（本地版/WD 的 MSI 里两者都在；NEXT 的打标用 PixAI，WD14 不需要）。
+>   只有从源码自己构建、或者要换模型时，才需要按上表手动补。
+> - 以前的 **SigLIP + opus-mt（中译英）+ SFace/YuNet（人脸）已经整体移除**：语义搜索改用中文 CLIP，
+>   人脸链路整体删除（角色识别改用 CCIP）✓
+> - **CCIP 是可选模型**，三个版本共用同一个包 `CCIP模型-20261018.zip`（放在归档根目录），解压到 `<图库>\models\ccip\` ✓
+>   没有它角色识别会自动禁用并提示，其它功能不受影响。
 
 ## 校验
 
@@ -43,7 +46,16 @@ Get-FileHash "<刚下载的文件>" -Algorithm SHA256
 
 ## 许可
 
-各模型的权重各自遵循其原始许可（SmilingWolf / Xenova / OpenCV Zoo / PixAI 官方仓），请自行确认后再分发。
+各模型的权重各自遵循其原始许可（2026-10-18 核实）：
+
+| 模型 | 许可 | 依据 |
+|---|---|---|
+| 中文 CLIP（`OFA-Sys/chinese-clip-vit-base-patch16`，ONNX 版由 Xenova 转换） | **MIT** | 上游 GitHub 仓库 `OFA-Sys/Chinese-CLIP` 的 LICENSE（GitHub API 元数据 `spdx_id: MIT`）；**HF 模型卡未单独声明**，以仓库为准 |
+| WD14 Tagger（`SmilingWolf/wd-vit-tagger-v3`） | **Apache License 2.0** | 模型卡声明 |
+| CCIP（`deepghs/ccip_onnx`） | **MIT** | ONNX 仓库声明 |
+| PixAI Tagger v1.0 | **未能核实**（官方仓只给 safetensors，公开 ONNX 来源不可考） | 建议只自用，不再分发；见下方 NEXT 专节 |
+
+本项目的代码许可见 [LICENSE](LICENSE)（MIT）。
 ---
 
 ## 本版本（NEXT）额外需要的 PixAI 模型

@@ -3,6 +3,18 @@
 > **本项目是「AI Image Manager」的修改版** —— 基于 [Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) **v2.2.3** 修改而来。
 > 上游采用 MIT License（Copyright © 2025 Luan Roger）；本仓库为个人自用修改版，与上游作者无关。
 
+
+> ### 版本关系（2026-10-18 起）
+>
+> | 版本 | 状态 | 打标模型 | 安装包 |
+> |---|---|---|---|
+> | **本地版**（`AI-Anime-Image-Manager`） | **已冻结**（2026-10-18 最后一次同步，不再更新） | WD14 | 713 MB |
+> | **WD**（`AI-Anime-Image-Manager-WD`，**2026-10-18 由 LAN 版改名**） | 持续维护 | WD14 | 713 MB |
+> | **NEXT**（**本仓库**） | 持续维护 | PixAI Tagger v1.0 | 378 MB |
+>
+> 三个版本**共用同一个 CCIP 角色识别模型包**：`CCIP模型-20261018.zip`（339 MB）→ 解压到 `<图库>\models\ccip\`。
+> 语义搜索都改用**中文 CLIP**（182 MB，随安装包提供）；旧文档里的 SigLIP / OPUS-MT / SFace / YuNet 均已移除。
+
 基于 **[Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) v2.2.3**（MIT License，Copyright © 2025 Luan Roger）的**个人自用修改版**。
 上游原始源码**不在本仓库里**（50.9 MB，属于构建输入；放在仓库会触发 GitHub 的 50 MB 警告，
 且本项目的三个仓库会重复存三份）。它在 Releases 里作为附件提供：
@@ -139,7 +151,7 @@ NEXT 版**同样带局域网访问功能，用法与 LAN 版完全一致**：设
 同一网段内的手机、平板用浏览器打开 `http://<电脑IP>:<端口>` 即可检索并下载原图；
 **网络端强制只读** —— 禁用删除和标签编辑，由服务端拒绝（不是只藏按钮）。
 
-> 详细说明见 [AI-Anime-Image-Manager-LAN](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-LAN)。
+> 详细说明见 [AI-Anime-Image-Manager-WD](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-WD)（2026-10-18 前叫 LAN 版）。
 
 ![局域网访问设置：端口 + 永久/临时双口令（默认关闭）](screenshots/03-lan-access.png)
 
@@ -182,12 +194,24 @@ git apply --whitespace=nowarn ../patches/next.patch
 |---|---|
 | **三个版本的直装包（MSI）** | <https://pan.baidu.com/s/17cWEESG8xjdpgqCWtIvsVA?pwd=6666>　提取码：`6666` |
 | **PixAI 模型**（只有本版本需要）| <https://pan.baidu.com/s/1pQvKSz0p1-cRJUQvngDasw?pwd=6666>　提取码：`6666` |
-| 模型（WD14 打标）| https://huggingface.co/SmilingWolf/wd-vit-tagger-v3 |
-| 模型（SigLIP 语义搜索）| https://huggingface.co/Xenova/siglip-base-patch16-224 |
-| 模型（中文翻译 opus）| https://huggingface.co/Xenova/opus-mt-zh-en |
-| 模型（人脸 SFace / YuNet）| https://github.com/opencv/opencv_zoo |
+| 模型（中文 CLIP 语义搜索）| https://huggingface.co/Xenova/chinese-clip-vit-base-patch16 |
+| 模型（CCIP 角色识别，可选）| https://huggingface.co/deepghs/ccip_onnx |
+| 模型（WD14 打标，仅 WD/本地版源码构建时需要）| https://huggingface.co/SmilingWolf/wd-vit-tagger-v3 |
 
 > ⚠️ **版本号仍是 2.2.3**：如果你装过同一版本的旧安装包，请**先卸载旧的、再装新的**（卸载不会删图库和设置）。
+
+### 2026-10-18 这一版的安装包
+
+| 版本 | MSI | 大小 |
+|---|---|---|
+| 本地版（已冻结） | `AI Anime Image Manager-2.2.3-20261018.msi` | 713 MB（WD14 模型在包内）|
+| **WD**（原 LAN 版） | `AI Anime Image Manager WD-2.2.3-20261018.msi` | 713 MB（同上）|
+| **NEXT** | `AI Anime Image Manager NEXT-2.2.3-20261018.msi` | **378 MB**（打标用 PixAI，模型不进包）|
+
+**三个版本共用的 CCIP 模型包**：`CCIP模型-20261018.zip`（339 MB）→ 解压到 `<图库>\models\ccip\` ✓
+
+> 体积说明：本版比上一版小，是因为**换掉了模型**——SigLIP（200 MB）+ OPUS-MT 中译英（90 MB）+ 人脸模型（42 MB）
+> 全部移除，语义搜索改用**中文 CLIP 单文件 182 MB**，人脸链路整条删除（角色识别改用 CCIP，外置）✓
 
 
 ## 构建
@@ -197,7 +221,10 @@ npm install
 node node_modules/@electron-forge/cli/dist/electron-forge.js make
 ```
 > 必须从**纯 ASCII 路径**构建（例如 `F:\AIM-build`），中文/空格路径会让 WiX 的 `light.exe` 失败。
-> 打包产物在 `out/make/`（MSI + Squirrel + 便携 ZIP）。
+> 另外两条实测坑（2026-10-18）：
+> ① 打包路径总长**不能超过 260 字符**（`onnxruntime-node` 嵌套太深会撞上）→ 把该依赖提到 `node_modules` 顶层即可；
+> ② `package.json` 的 `description` 必须是**纯 ASCII**（MSI 数据库用 1252 代码页，中文会报 `LGHT0311`）。
+> 打包产物在 `out/make/`（本版只出 **MSI**）。
 
 ## 不包含什么（体积原因）
 
