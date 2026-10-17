@@ -605,9 +605,21 @@ export const checkMirrorHealth = os.handler(async () => {
 const VIRTUAL_GPU_RE =
   /virtual|mumu|oray|remote\s*display|basic\s*display|hyper-?v|vmware|virtualbox|citrix|parsec|indirect\s*display/i;
 
-export const getGpuSettings = os.handler(() => {
+export const getGpuSettings = os.handler(async () => {
   const enabled = getSetting("gpu.enabled") === "true";
   const promptShown = getSetting("gpu.promptShown") === "true";
+  // 自用新增：手选显卡（"auto" 或适配器序号）
+  const deviceId = getSetting("gpu.deviceId") ?? "auto";
+  // 自用新增：以图搜图特征来源（thumbnail = 快 / original = 保真）
+  const { getSearchImageSource } = await import(
+    "@/services/ai/search-image-source"
+  );
+  const searchImageSource = getSearchImageSource();
+  // 自用新增：多卡模式（一张卡一个 worker）与勾选的适配器序号
+  const { isMultiGpuEnabled, getSelectedDeviceIds, resolveWorkerDevices } =
+    await import("@/services/gpu-detector");
+  const multiGpuEnabled = isMultiGpuEnabled();
+  const deviceIds = getSelectedDeviceIds();
   let detected: Record<string, unknown> | null = null;
   const raw = getSetting("gpu.detected");
   if (raw) {
@@ -626,19 +638,85 @@ export const getGpuSettings = os.handler(() => {
       /* ignore malformed */
     }
   }
-  return { enabled, detected, promptShown };
+  return {
+    deviceId,
+    deviceIds,
+    enabled,
+    detected,
+    /** 多卡模式下每个 worker 实际绑定的设备序号（单卡模式只有 1 个）。 */
+    effectiveDevices: resolveWorkerDevices(),
+    multiGpuEnabled,
+    promptShown,
+    searchImageSource,
+  };
 });
 
 export const setGpuSettings = os
   .input(
     z.object({
+      deviceId: z.string().optional(),
       enabled: z.boolean(),
+      /** 自用新增：以图搜图特征来源（缩略图快 / 原图保真） */
+      searchImageSource: z.enum(["thumbnail", "original"]).optional(),
+      /** 自用新增：多卡模式开关 */
+      multiGpuEnabled: z.boolean().optional(),
+      /** 自用新增：多卡模式下勾选的适配器序号（最多 3 张） */
+      deviceIds: z.array(z.number().int().min(0)).max(3).optional(),
     })
   )
-  .handler(({ input }) => {
+  .handler(async ({ input }) => {
     setSetting("gpu.enabled", String(input.enabled));
+    if (input.deviceId !== undefined) {
+      setSetting("gpu.deviceId", input.deviceId);
+    }
+    if (input.searchImageSource !== undefined) {
+      const { setSearchImageSource } = await import(
+        "@/services/ai/search-image-source"
+      );
+      setSearchImageSource(input.searchImageSource);
+    }
+    if (input.multiGpuEnabled !== undefined) {
+      const { MULTI_GPU_ENABLED_KEY } = await import("@/services/gpu-detector");
+      setSetting(MULTI_GPU_ENABLED_KEY, String(input.multiGpuEnabled));
+    }
+    if (input.deviceIds !== undefined) {
+      const { MULTI_GPU_DEVICES_KEY, MAX_MULTI_GPU_DEVICES } = await import(
+        "@/services/gpu-detector"
+      );
+      const unique = [...new Set(input.deviceIds)].slice(
+        0,
+        MAX_MULTI_GPU_DEVICES
+      );
+      setSetting(MULTI_GPU_DEVICES_KEY, JSON.stringify(unique));
+    }
     return { ok: true };
   });
+
+/**
+ * 自用（多卡）：每张卡的**实时速度**（张/秒）—— 设置页每 3 秒轮询一次。
+ *
+ * 现在只有"图像嵌入"这条链会随"每张卡一个 worker"变化，
+ * 打标（PixAI）那条的每设备统计接口也一并接上，等有第二张卡即用。
+ */
+export const getGpuSpeeds = os.handler(async () => {
+  const { resolveWorkerDevices } = await import("@/services/gpu-detector");
+  const { getPixaiPerDeviceStats } = await import(
+    "@/services/ai/pixai-tagger-client"
+  );
+  const devices = resolveWorkerDevices();
+  const pixai = getPixaiPerDeviceStats();
+  // 没在跑任务时速率计为空 → 速度 0（界面显示"空闲"）
+  const speeds = devices.map((deviceId, index) => {
+    const stat =
+      pixai.find((item) => item.deviceId === deviceId) ?? pixai[index];
+    return {
+      deviceId,
+      label: stat?.label ?? null,
+      perSecond: Math.round((stat?.perSecond ?? 0) * 10) / 10,
+    };
+  });
+  return { speeds };
+});
 
 export const checkGpuCapability = os.handler(async () => {
   const { probeGpuCapability, cacheDetectionResult, findModelsDir } =

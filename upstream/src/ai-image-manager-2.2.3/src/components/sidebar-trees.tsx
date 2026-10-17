@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { tagRootRank } from "@/config/tag-root-order";
 import {
   Tooltip,
   TooltipContent,
@@ -31,6 +32,8 @@ interface TagTreeNode {
   children: TagTreeNode[];
   /** 自用版：所属一级标签的 id —— 小点颜色按它取，于是整棵子树的色签一致（= 归属） */
   dotColorId?: number;
+  /** 自用（问题 2）：所属一级标签的**解析后颜色**（主类显式色优先，其次默认色）。 */
+  dotColor?: string;
   tag: TagInfo;
 }
 
@@ -783,7 +786,7 @@ export function FolderTree({
  * 自用版：一级标签（角色 / 通用）的显示顺序。
  * 不在表里的按原顺序排在后面。
  */
-const TAG_ROOT_ORDER = ["角色", "通用"];
+/** 主类顺序见 `config/tag-root-order.ts`（与局域网网页端共用）。 */
 
 /**
  * 自用版：标签小点的**默认颜色**。
@@ -794,21 +797,16 @@ const TAG_ROOT_ORDER = ["角色", "通用"];
  *
  * 用户为某个标签单独设过颜色（`tags.color`）时优先用自定义色。
  */
-const ROOT_TAG_DOT_COLORS = [
-  "#f97316", // 橙
-  "#22c55e", // 绿
-  "#3b82f6", // 蓝
-  "#a855f7", // 紫
-  "#ec4899", // 粉
-  "#14b8a6", // 青
-  "#eab308", // 黄
-  "#ef4444", // 红
-];
-
-export function defaultTagDotColor(rootTagId: number): string {
-  const index = Math.abs(Math.trunc(rootTagId)) % ROOT_TAG_DOT_COLORS.length;
-  return ROOT_TAG_DOT_COLORS[index];
-}
+/*
+ * 自用（问题 2）：色点规则已抽到 `utils/tag-dot-color.ts`（主进程的缩略图角标也要用同一套）。
+ * 这里 import 进来自己用，并原样再导出，保持既有 import（Sidebar / SearchBar 从本文件取）不变。
+ */
+import { defaultTagDotColor } from "@/utils/tag-dot-color";
+export {
+  defaultTagDotColor,
+  resolveTagDotColor,
+  ROOT_TAG_DOT_COLORS,
+} from "@/utils/tag-dot-color";
 
 export function buildTagTree(tags: TagInfo[]): TagTreeNode[] {
   const nodeMap = new Map<number, TagTreeNode>();
@@ -829,28 +827,45 @@ export function buildTagTree(tags: TagInfo[]): TagTreeNode[] {
     }
   }
 
-  // 自用版：把「角色」提到「通用」上面（其余根节点保持原有相对顺序）
-  const rankOf = (node: TagTreeNode): number => {
-    const index = TAG_ROOT_ORDER.indexOf(node.tag.name);
-    return index === -1 ? TAG_ROOT_ORDER.length : index;
-  };
+  // 自用版：把「角色」提到「通用」上面（其余根节点保持原有相对顺序）。
+  // 顺序常量与局域网网页端共用一份，见 `config/tag-root-order.ts`。
   const sortedRoots = roots
     .map((node, index) => ({ index, node }))
-    .sort((a, b) => rankOf(a.node) - rankOf(b.node) || a.index - b.index)
+    .sort(
+      (a, b) =>
+        tagRootRank(a.node.tag.name) - tagRootRank(b.node.tag.name) ||
+        a.index - b.index
+    )
     .map((entry) => entry.node);
 
-  // 自用版：整棵子树继承一级标签的色签 id（色点 = 归属标识）
-  const assignDotColorId = (node: TagTreeNode, rootId: number): void => {
+  // 自用版：整棵子树继承一级标签的色签 id 与颜色（色点 = 归属标识）
+  const assignDotColorId = (
+    node: TagTreeNode,
+    rootId: number,
+    rootColor: string
+  ): void => {
     node.dotColorId = rootId;
+    node.dotColor = rootColor;
     for (const child of node.children) {
-      assignDotColorId(child, rootId);
+      assignDotColorId(child, rootId, rootColor);
     }
   };
   for (const root of sortedRoots) {
-    assignDotColorId(root, root.tag.id);
+    assignDotColorId(
+      root,
+      root.tag.id,
+      root.tag.color || defaultTagDotColor(root.tag.id)
+    );
   }
   return sortedRoots;
 }
+
+/**
+ * 自用（需求 2 / 问题 1）：标签树"主类吸顶"用的**一行高度兜底值**（px）。
+ * 渲染后由 Sidebar 实测真实行高并回填 —— 叠放位置 = 序号 × 行高，行高错了就会出现缝隙。
+ * 另外 Sidebar 会在滚动区顶部放一层同高的**不透明背板**，保证叠放区绝不透出后面的列表。
+ */
+export const TAG_TREE_GROUP_ROW_HEIGHT_FALLBACK = 26;
 
 export function renderTagTree(
   nodes: TagTreeNode[],
@@ -865,23 +880,54 @@ export function renderTagTree(
   onDragLeave: (e: React.DragEvent) => void,
   onDrop: (e: React.DragEvent, id: number) => void,
   dragOverId: number | null,
-  language: string
+  language: string,
+  groupRowHeight: number = TAG_TREE_GROUP_ROW_HEIGHT_FALLBACK
 ): ReactNode[] {
+  /*
+   * 自用（需求 2 / 问题 1）：主类（一级分类）吸顶 —— **多个同时展开时依次往下叠**。
+   *
+   * 做法：只统计"已展开的主类"，按顺序给它们 0、1、2… 的叠放槽位（top = 序号 × 行高）。
+   *   · 折叠的主类不占槽位 → 不会白留一条高度；
+   *   · 行高由 Sidebar 实测后传入（字号/缩放变化会自动纠正）；
+   *   · 叠放区的"透底"问题由 Sidebar 的**不透明背板**兜住（见那里的注释）：
+   *     即使某一行的背景有缝隙，看到的也是背板而不是后面的列表。
+   */
+  const groupStackTops = new Map<number, number>();
+  if (depth === 0) {
+    // 自用（问题 1 四次修正）：槽位间距留 1px 重叠 —— 即使行高测量差 1px，也**不可能**露出缝
+    const slotStep = Math.max(1, groupRowHeight - 1);
+    let stackIndex = 0;
+    for (const node of nodes) {
+      if (node.children.length > 0 && expandedIds.has(node.tag.id)) {
+        groupStackTops.set(node.tag.id, stackIndex * slotStep);
+        stackIndex += 1;
+      }
+    }
+  }
+
   return nodes.flatMap((node) => {
     const hasChildren = node.children.length > 0;
     const isExpanded = expandedIds.has(node.tag.id);
     const isActive = activeIds.includes(node.tag.id);
     const isDragOver = dragOverId === node.tag.id;
+    // 自用（问题 1）：已展开主类 → 按槽位吸顶（多个同时展开时依次叠放）
+    const stickyTop = groupStackTops.get(node.tag.id);
 
     const row = (
       <div
         aria-expanded={hasChildren ? isExpanded : undefined}
         aria-level={depth + 1}
         aria-selected={isActive}
-        className="flex items-center"
+        className={`flex items-center ${
+          stickyTop === undefined
+            ? ""
+            : "sticky z-20 bg-[var(--sidebar)] shadow-[0_1px_0_0_color-mix(in_srgb,var(--foreground)_8%,transparent)]"
+        }`}
+        data-tag-depth={depth}
         data-tag-id={node.tag.id}
         key={node.tag.id}
         role="treeitem"
+        style={stickyTop === undefined ? undefined : { top: stickyTop }}
         tabIndex={-1}
       >
         <button
@@ -924,6 +970,7 @@ export function renderTagTree(
             style={{
               background:
                 node.tag.color ||
+                node.dotColor ||
                 defaultTagDotColor(node.dotColorId ?? node.tag.id),
             }}
           />
@@ -937,25 +984,29 @@ export function renderTagTree(
       </div>
     );
 
-    return hasChildren && isExpanded
-      ? [
-          row,
-          ...renderTagTree(
-            node.children,
-            depth + 1,
-            expandedIds,
-            onToggle,
-            activeIds,
-            onSelect,
-            onContextMenu,
-            onDragOver,
-            onDragEnter,
-            onDragLeave,
-            onDrop,
-            dragOverId,
-            language
-          ),
-        ]
-      : [row];
+    if (!(hasChildren && isExpanded)) {
+      return [row];
+    }
+
+    const childRows = renderTagTree(
+      node.children,
+      depth + 1,
+      expandedIds,
+      onToggle,
+      activeIds,
+      onSelect,
+      onContextMenu,
+      onDragOver,
+      onDragEnter,
+      onDragLeave,
+      onDrop,
+      dragOverId,
+      language,
+      groupRowHeight
+    );
+
+    // 自用（问题 1）：不再包容器 —— 保持"扁平行"才能让多个主类标题同时吸顶叠放
+    //（包了容器，上一个主类的标题会被它自己的容器边界顶走，那就是用户看到的"被顶上去"）
+    return [row, ...childRows];
   });
 }

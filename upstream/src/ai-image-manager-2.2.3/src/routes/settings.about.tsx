@@ -9,9 +9,9 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { AboutAuthor } from "@/components/about/about-author";
+import { AboutAuthor, AboutProjectAuthor } from "@/components/about/about-author";
 import { AboutGallery } from "@/components/about/about-gallery";
-import { PRIVATE_BUILD } from "@/config/private-build";
+import { APP_REPOSITORY_URL, PRIVATE_BUILD } from "@/config/private-build";
 import "@/components/about/about.css";
 import { AnimatedGitHubButton } from "@/components/animated-github-button";
 import { ConfettiOverlay } from "@/components/ConfettiOverlay";
@@ -151,12 +151,12 @@ function AboutSettingsPage() {
               <AboutAuthor />
             </div>
 
-            {/* 自用新增：本项目作者 */}
+            {/* 自用新增：本项目作者（需求 8：点名字跳个人主页，悬停显示网址） */}
             <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-border border-t pt-3">
               <span className="text-[13px] text-muted-foreground">
                 {t("settingsProjectAuthor")}
               </span>
-              <span className="text-[13px] text-foreground">ASakurafoxA</span>
+              <AboutProjectAuthor />
             </div>
           </div>
         </section>
@@ -172,8 +172,10 @@ function AboutSettingsPage() {
             跳转 https://ai-image-manager.uyoungvision.cn/），按要求改成项目链接按钮。 */}
         <div className="flex min-w-0 flex-wrap items-center gap-3 pt-1">
           <AnimatedGitHubButton href="https://github.com/Uyoung666/ai-image-manager" />
+          {/* 自用（需求 8）：这里原来三个版本都跳个人主页，现在跳**本版本的仓库**；
+              跳个人主页的功能移到了上面的「本项目作者」名字上。 */}
           <AnimatedGitHubButton
-            href="https://github.com/ASakurafoxA"
+            href={APP_REPOSITORY_URL}
             label={t("settingsGitHubMine")}
             variant="mine"
           />

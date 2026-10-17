@@ -103,8 +103,14 @@ const EMBED_SIZE = 112; // SFace / ArcFace both expect 112x112 input
  * Load ONNX models for detection and embedding.
  * Reports init-progress messages so the UI can show real loading progress.
  */
-async function initModels(modelsDir, useGPU = false) {
+async function initModels(modelsDir, useGPU = false, deviceId = null) {
   const { InferenceSession } = await loadOrt();
+  // 自用：跟随「设置 → GPU 加速 → 使用显卡」选中的适配器序号。
+  // 不传就交给 DirectML 用系统默认适配器（双显卡笔记本上通常是核显）。
+  const dmlProvider =
+    Number.isInteger(deviceId) && deviceId >= 0
+      ? { name: "dml", deviceId }
+      : "dml";
 
   const detModelPath = path.join(
     modelsDir,
@@ -139,7 +145,7 @@ async function initModels(modelsDir, useGPU = false) {
     // By trying DML-only first we get an explicit error when DML is broken.
     try {
       detectionSession = await InferenceSession.create(detModelPath, {
-        executionProviders: ["dml"],
+        executionProviders: [dmlProvider],
         logSeverityLevel: 3,
       });
       console.error("[FaceWorker] ✓ DirectML GPU ACTIVE");
@@ -173,7 +179,7 @@ async function initModels(modelsDir, useGPU = false) {
     if (dmlActive) {
       try {
         embeddingSession = await InferenceSession.create(embModelPath, {
-          executionProviders: ["dml"],
+          executionProviders: [dmlProvider],
           logSeverityLevel: 3,
         });
         console.error("[FaceWorker] ✓ Embedding model DML ACTIVE");
@@ -432,10 +438,10 @@ let modelsDir = null;
 let modelsReady = false;
 
 async function handleInitMessage(msg) {
-  const { modelsDir: md, useGPU } = msg;
+  const { modelsDir: md, useGPU, deviceId } = msg;
   modelsDir = md || path.join(process.cwd(), "models");
   try {
-    await initModels(modelsDir, useGPU);
+    await initModels(modelsDir, useGPU, deviceId);
     modelsReady = true;
     process.send?.({ type: "ready" });
   } catch (err) {

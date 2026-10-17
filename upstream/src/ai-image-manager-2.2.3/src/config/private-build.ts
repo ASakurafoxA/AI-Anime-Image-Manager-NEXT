@@ -30,6 +30,16 @@
  */
 export const APP_DISPLAY_NAME = "AI Anime Image Manager NEXT";
 
+/**
+ * 自用（需求 8）：本版本的仓库地址 —— "关于"页里"本项目主页"按钮跳这里。
+ * ⚠️ 三个版本各有一份 private-build.ts，所以这里天然按版本区分，改的时候别复制错。
+ */
+export const APP_REPOSITORY_URL =
+  "https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT";
+
+/** 作者个人主页（三个版本相同）：点击"本项目作者"名字跳这里。 */
+export const AUTHOR_HOMEPAGE_URL = "https://github.com/ASakurafoxA";
+
 export const PRIVATE_BUILD = {
   /** 隐藏左侧主导航与命令面板里的「数据仪表盘」入口 */
   hideDashboard: true,
@@ -131,8 +141,15 @@ export const PRIVATE_BUILD = {
    * 实测（68 张真实测试图）：角色命中 41%、通用标签 100% 命中、0.23 秒/张。
    *
    * 关闭此项会退回上游的 SigLIP 打标行为。
+   *
+   * NEXT（2026-10）：**改为 false** —— 本版已全面改用 PixAI Tagger v1.0
+   * （`usePixaiTagger` 见下方），WD14 那套只作为保留代码存在，不再参与运行：
+   * 打标分派由 `getActiveTagger()` 决定，PixAI 为 true 时它就是 "pixai"，
+   * WD14 的三条路径（自动打标 / 界面全库打标 / 以图搜图）都进不去。
+   * 关掉它的意义：明确表达"不再用旧模型"，并避免将来把 `usePixaiTagger` 改回 false 时
+   * 又悄悄退回 WD14（那样会得到 upstream = SigLIP 打标）。
    */
-  useWd14Tagger: true,
+  useWd14Tagger: false,
 
   /**
    * 隐藏「AI 标签」相关的界面提示，共两处：
@@ -152,8 +169,13 @@ export const PRIVATE_BUILD = {
    *
    * 特征表还没有数据、或 WD14 worker 不可用时，会**自动回退**到原来的 SigLIP 路径，
    * 所以开启它不会让"以图搜图"整体失效。
+   *
+   * NEXT（2026-10）：**改为 false** —— 以图搜图改用 PixAI Tagger v1.0 的 1024 维动漫特征
+   * （见 `searchByPixaiImage`）。PixAI 生效时那条链**刻意不回退 WD14**：
+   * 两个模型维度不同（1024 / 768）、向量空间不通，混用只会给出"看着有结果但不可比"的排序；
+   * PixAI 特征表还空时直接落到 SigLIP 的通用特征。
    */
-  useWd14ImageSearch: true,
+  useWd14ImageSearch: false,
 
   /**
    * 删除照片时，**把原文件移动进应用自己的回收站**（而不是只做软删除）。
@@ -203,13 +225,17 @@ export const PRIVATE_BUILD = {
   hideDiagnosticsNotice: true,
 
   /**
-   * 自用版：整体停用「帮助与诊断」功能（设置 → 帮助与诊断）。
+   * 自用版：**重新启用**「帮助与诊断」（设置 → 帮助与诊断）。
    *
-   * 停用后该页面只显示一句说明：不再列出待反馈故障、也不能生成反馈报告。
-   * 故障仍会记进本地 `diagnostics/incidents.jsonl`，需要时直接看文件即可。
-   * 崩溃时的致命错误对话框不受影响（那种情况仍然能直接生成报告）。
+   * 起因：当初觉得"不太会有 bug"就整体停用了。后来发现真实需求不是"提 issue"，
+   * 而是"出问题时能导出一份**给 AI 看的日志**，自己或朋友都能自查" ——
+   * 所以现在启用回来，并在表单最前面加了「复制诊断日志 / 导出 .md」两个按钮
+   * （单个 Markdown 文件，AI 直接可读，不用解压 ZIP）。
+   *
+   * 顺带说明：诊断内容本来就是本地生成 + 自动脱敏，不会自动上传；
+   * 「去 GitHub 反馈」按钮已指向本版自己的仓库，不再指向上游。
    */
-  disableDiagnostics: true,
+  disableDiagnostics: false,
 
   /**
    * 搜索界面精简（与本地工作区保持一致，见根目录「需跟进到局域网工作区的改动.md」）：
@@ -239,8 +265,12 @@ export const PRIVATE_BUILD = {
    *   WD14  768 维（动漫）   : +0.149  ✅ 区分度是 SigLIP 的 2.7 倍
    *
    * 特征与标签是**同一次推理的两个输出**，所以采集它不增加任何推理成本。
+   *
+   * NEXT（2026-10）：**改为 false** —— 这一项只影响 WD14 打标那条链
+   * （`wd14-tagger.ts` 里 `includeEmbedding` / 写 `wd14_embeddings` 表），
+   * 而本版已不再运行 WD14，改由下面的 `storePixaiEmbeddings` 采集 1024 维特征。
    */
-  storeWd14Embeddings: true,
+  storeWd14Embeddings: false,
 
   /**
    * 打标模型：**PixAI Tagger v1.0**（NEXT 版，2026-10 起默认，替换 WD14）。
@@ -316,7 +346,6 @@ export const PRIVATE_BUILD = {
     "/settings/cloud-sync",
     "/settings/watermark",
     "/settings/update",
-    "/settings/diagnostics",
   ],
 } as const;
 

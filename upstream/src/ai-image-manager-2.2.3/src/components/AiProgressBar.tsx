@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { openExternalLink } from "@/actions/shell";
+import { useProgressRate } from "@/hooks/use-progress-rate";
 import { ipc } from "@/ipc/manager";
 
 interface AiProgress {
@@ -33,6 +34,27 @@ export function AiProgressBar({ disabled = false }: { disabled?: boolean }) {
   const [isMutating, setIsMutating] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const pollingRef = useRef(false);
+
+  /*
+   * 自用（需求 7）：特征提取 / 打标阶段显示"处理速度 + 预估剩余时间"。
+   * 只在这两个（含重建索引）阶段采样 —— 加载模型、已完成、空闲没有意义。
+   * ⚠️ 必须在下面的提前 return 之前调用（React Hooks 规则）。
+   */
+  const counting =
+    progress !== null &&
+    (progress.phase === "embedding" ||
+      progress.phase === "tagging" ||
+      progress.phase === "repairing");
+  const { pending: ratePending, remainingText, speedText } = useProgressRate(
+    counting && progress
+      ? {
+          isActive: progress.isActive,
+          phase: progress.phase,
+          processed: progress.processed,
+          total: progress.total,
+        }
+      : null
+  );
 
   const fetchProgress = useCallback(async () => {
     try {
@@ -75,13 +97,13 @@ export function AiProgressBar({ disabled = false }: { disabled?: boolean }) {
         setProgress(p);
       }
       if (p?.isActive) {
-        timer = setTimeout(poll, 500);
+        timer = setTimeout(poll, 1000);
       } else {
         pollingRef.current = false;
       }
     };
 
-    timer = setTimeout(poll, 500);
+    timer = setTimeout(poll, 1000);
 
     return () => {
       disposed = true;
@@ -114,10 +136,10 @@ export function AiProgressBar({ disabled = false }: { disabled?: boolean }) {
         slowPollRef.current = false;
         return;
       }
-      timer = setTimeout(poll, 2000);
+      timer = setTimeout(poll, 1000);
     };
 
-    timer = setTimeout(poll, 2000);
+    timer = setTimeout(poll, 1000);
 
     return () => {
       disposed = true;
@@ -330,9 +352,21 @@ export function AiProgressBar({ disabled = false }: { disabled?: boolean }) {
           {progress.repairReason}
         </p>
       )}
-      <div className="mb-1 flex items-center justify-between">
-        <span className="text-[11px] text-muted-foreground">{phaseLabel}</span>
-        <span className="font-medium text-[11px] text-primary">{pct}%</span>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <span className="min-w-0 truncate text-[11px] text-muted-foreground">
+          {phaseLabel}
+        </span>
+        <span className="flex flex-shrink-0 items-center gap-1.5">
+          {/* 自用（需求 7）：百分比左侧显示处理速度与预估剩余时间 */}
+          {!paused && !cancelling && (speedText || remainingText || ratePending) && (
+            <span className="text-[10px] text-muted-foreground/70 tabular-nums">
+              {speedText ?? ""}
+              {speedText && remainingText ? " · " : ""}
+              {remainingText ?? (speedText ? "" : t("aiProgressEtaCalculating"))}
+            </span>
+          )}
+          <span className="font-medium text-[11px] text-primary">{pct}%</span>
+        </span>
       </div>
       <div className="h-1 overflow-hidden rounded-full bg-secondary">
         <div

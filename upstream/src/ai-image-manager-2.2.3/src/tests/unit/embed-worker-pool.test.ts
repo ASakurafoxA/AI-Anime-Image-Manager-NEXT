@@ -40,6 +40,14 @@ const childProcessMock = vi.hoisted(() => {
 
 const gpuDetectorMock = vi.hoisted(() => ({
   probeEmbeddingGpuCapability: vi.fn(),
+  resolveDmlDeviceId: vi.fn(async () => null),
+  getDmlDeviceId: vi.fn(() => null),
+  recordEmbeddingProbeResult: vi.fn(),
+  // 自用（多卡）：默认关闭 → 返回空数组表示"按单卡逻辑走原有并发数"
+  resolveWorkerDevices: vi.fn(() => []),
+  isMultiGpuEnabled: vi.fn(() => false),
+  hasDuplicatedWorkerDevice: vi.fn(() => false),
+  MAX_MULTI_GPU_DEVICES: 3,
 }));
 
 function getWorkerIdentity(child: (typeof childProcessMock.children)[number]): {
@@ -63,6 +71,16 @@ function normalizedVector(): number[] {
   return [1, ...Array.from({ length: 767 }, () => 0)];
 }
 
+/**
+ * 让被 mock 的异步链路跑完（不要"数微任务步数"——代码里多一个 await 就会数漏）。
+ * 用于等 GPU 路径（先解析 deviceId，再探测，再 fork worker）推进到 fork 那一步。
+ */
+async function flushAsyncChain(): Promise<void> {
+  for (let i = 0; i < 12; i++) {
+    await Promise.resolve();
+  }
+}
+
 vi.mock("node:child_process", () => ({
   default: {
     fork: childProcessMock.fork,
@@ -71,6 +89,8 @@ vi.mock("node:child_process", () => ({
 }));
 
 vi.mock("@/services/gpu-detector", () => gpuDetectorMock);
+
+// 占用限制走的是真实设置存储（需要 Electron 的 app 路径），测试里固定为"不限制"。
 
 vi.mock("electron", () => ({
   app: {
@@ -229,8 +249,7 @@ describe("embed worker pool lifecycle", () => {
         "@/services/embed-worker-pool"
       );
       const initialization = initWorkerPool("model-path", true);
-      await Promise.resolve();
-      await Promise.resolve();
+      await flushAsyncChain();
 
       const child = childProcessMock.children[0];
       expect(child).toBeDefined();
@@ -262,15 +281,13 @@ describe("embed worker pool lifecycle", () => {
         "@/services/embed-worker-pool"
       );
       const initialization = initWorkerPool("model-path", true);
-      await Promise.resolve();
-      await Promise.resolve();
+      await flushAsyncChain();
 
       const gpuChild = childProcessMock.children[0];
       expect(gpuChild).toBeDefined();
       gpuChild?.emit("exit", 1, null);
       await vi.advanceTimersByTimeAsync(50);
-      await Promise.resolve();
-      await Promise.resolve();
+      await flushAsyncChain();
 
       const cpuChild = childProcessMock.children[1];
       expect(cpuChild).toBeDefined();

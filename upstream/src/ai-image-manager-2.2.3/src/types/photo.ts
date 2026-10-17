@@ -5,6 +5,8 @@ export type SearchMatch =
       kind: "hybrid";
       evidence: ("semantic" | "tag")[];
       tagNames: string[];
+      /** 自用（问题 2）：与 `tagNames` 一一对应的"所属主类"颜色（角标按它上色）。 */
+      tagColors?: string[];
       /** 语义证据存在时的余弦相似度（用于归一化角标百分比） */
       score?: number;
     }
@@ -13,6 +15,8 @@ export type SearchMatch =
       origin: "manual" | "auto";
       /** 自用新增：这张图命中了你所选标签中的哪几个（最多 3 个），用于缩略图角标 */
       tagNames?: string[];
+      /** 自用（问题 2）：与 `tagNames` 一一对应的"所属主类"颜色（角标按它上色）。 */
+      tagColors?: string[];
     }
   | { kind: "image"; score: number }
   | { kind: "semantic"; score: number };

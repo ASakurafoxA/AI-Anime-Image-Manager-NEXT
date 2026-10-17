@@ -41,12 +41,15 @@ export function FilterDropdown({
   disabled = false,
   editable = false,
   id,
+  multiple = false,
   onChange,
+  onValuesChange,
   options,
   placeholder,
   showOptionColors = false,
   showSelectedCheck = false,
   value,
+  values,
   wrapperClassName,
 }: {
   ariaLabel?: string;
@@ -55,12 +58,21 @@ export function FilterDropdown({
   disabled?: boolean;
   editable?: boolean;
   id?: string;
+  /**
+   * 自用（多卡）：多选模式。开启后 `values` 才是选中集合，
+   * 点选项是**切换**而不是"选中即关闭"，选中项用勾号表示。
+   * 默认 false —— 现有单选用法行为完全不变。
+   */
+  multiple?: boolean;
   onChange: (value: string) => void;
+  onValuesChange?: (values: string[]) => void;
   options: FilterDropdownOption[];
   placeholder: string;
   showOptionColors?: boolean;
   showSelectedCheck?: boolean;
   value: string;
+  /** 多选模式的选中集合（`multiple` 为 true 时使用）。 */
+  values?: string[];
   wrapperClassName?: string;
 }) {
   const inputId = useId();
@@ -82,9 +94,22 @@ export function FilterDropdown({
       option.label.toLocaleLowerCase().includes(query)
     );
   }, [editable, options, value]);
+  const selectedSet = useMemo(
+    () => new Set(multiple ? (values ?? []) : []),
+    [multiple, values]
+  );
+  const isSelected = (optionValue: string) =>
+    multiple ? selectedSet.has(optionValue) : optionValue === value;
   const displayValue = editable
     ? value
-    : (options.find((option) => option.value === value)?.label ?? "");
+    : multiple
+      ? (values ?? [])
+          .map(
+            (item) => options.find((option) => option.value === item)?.label
+          )
+          .filter((label): label is string => Boolean(label))
+          .join("、")
+      : (options.find((option) => option.value === value)?.label ?? "");
   const selectedOption = options.find((option) => option.value === value);
   const selectedIndex = visibleOptions.findIndex(
     (option) => option.value === value
@@ -143,6 +168,15 @@ export function FilterDropdown({
   }, [open]);
 
   function selectOption(option: FilterDropdownOption) {
+    if (multiple) {
+      // 多选：切换选中状态，**不关闭**下拉（方便连续勾选）
+      const current = values ?? [];
+      const next = current.includes(option.value)
+        ? current.filter((item) => item !== option.value)
+        : [...current, option.value];
+      onValuesChange?.(next);
+      return;
+    }
     onChange(option.value);
     setOpen(false);
     setActiveIndex(-1);
@@ -340,10 +374,10 @@ export function FilterDropdown({
         >
           {visibleOptions.map((option, index) => (
             <button
-              aria-selected={option.value === value}
+              aria-selected={isSelected(option.value)}
               className={cn(
                 "flex w-full items-center justify-between truncate px-2.5 py-1.5 text-left text-[12px] text-foreground hover:bg-foreground/5",
-                option.value === value && "bg-foreground/5",
+                isSelected(option.value) && "bg-foreground/5",
                 index === activeIndex && "bg-foreground/10"
               )}
               id={`${inputId}-option-${index}`}
@@ -366,7 +400,7 @@ export function FilterDropdown({
                 )}
                 <span className="truncate">{option.label}</span>
               </span>
-              {showSelectedCheck && option.value === value && (
+              {showSelectedCheck && isSelected(option.value) && (
                 <Check
                   aria-hidden="true"
                   className="ml-2 h-3.5 w-3.5 shrink-0 text-foreground"

@@ -63,6 +63,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useAiStatus } from "@/hooks/useAiStatus";
+import { useProgressRate } from "@/hooks/use-progress-rate";
 import { ipc } from "@/ipc/manager";
 import { getTagDisplayName } from "@/localization/tag-display";
 import { queryClient } from "@/providers/QueryProvider";
@@ -76,6 +77,8 @@ import {
   type FolderTreeNode,
   pinFolderTreeNodes,
   renderTagTree,
+  resolveTagDotColor,
+  TAG_TREE_GROUP_ROW_HEIGHT_FALLBACK,
   type TagInfo,
 } from "./sidebar-trees";
 
@@ -280,7 +283,11 @@ interface SidebarProps {
   onToggleCollapse: () => void;
   onToggleTag?: (tagId: number | null) => void;
   onToggleTagMode?: () => void;
+  /** 自用（需求 3）：单选 / 多选 切换（常驻按钮）。 */
+  onToggleTagSelectMode?: () => void;
   tagMode: "and" | "or";
+  /** 自用（需求 3）：默认 "single"。 */
+  tagSelectMode?: "single" | "multi";
   totalPhotos: number;
 }
 
@@ -289,6 +296,7 @@ export function Sidebar({
   activeFolderId,
   activeTagIds,
   tagMode,
+  tagSelectMode = "single",
   collapsed,
   favoriteActive,
   onSelectFolder,
@@ -298,6 +306,7 @@ export function Sidebar({
   onSelectAllPhotos,
   onToggleTag,
   onToggleTagMode,
+  onToggleTagSelectMode,
   onToggleCollapse,
   totalPhotos,
 }: SidebarProps) {
@@ -431,6 +440,13 @@ export function Sidebar({
     new Set()
   );
   const [expandedTagIds, setExpandedTagIds] = useState<Set<number>>(new Set());
+  /*
+   * 自用（需求 2 / 问题 1）：主类吸顶要把多个展开的主类**依次叠放**，
+   * 叠放槽位 = 序号 × 行高，所以行高必须准 → 渲染后实测一次（26 是兜底值）。
+   */
+  const [tagGroupRowHeight, setTagGroupRowHeight] = useState(
+    TAG_TREE_GROUP_ROW_HEIGHT_FALLBACK
+  );
   const [deleteTagTarget, setDeleteTagTarget] = useState<{
     id: number;
     name: string;
@@ -464,14 +480,48 @@ export function Sidebar({
   const [tagColorHex, setTagColorHex] = useState("#f97316");
   const [tagColorInput, setTagColorInput] = useState("#f97316");
   const tagTreeScrollRef = useRef<HTMLDivElement>(null);
+  /** 自用（问题 1）：记住上一次实测到的行高，避免滚动时反复 setState。 */
+  const tagGroupRowHeightRef = useRef(TAG_TREE_GROUP_ROW_HEIGHT_FALLBACK);
   const [tagTreeHasMoreBelow, setTagTreeHasMoreBelow] = useState(false);
   const [_tagPopoverOpen, _setTagPopoverOpen] = useState(false);
   const [batchTagLoading, setBatchTagLoading] = useState(false);
   const { data: aiStatus } = useAiStatus();
-  const aiTagging = aiStatus?.embeddingProgress.phase === "tagging";
+  /*
+   * 自用（问题 2）：色点按"所属主类"取色，与标签树同一套规则（见 resolveTagDotColor）。
+   * 这里建一张 id → tag 的表，chips 用它向上找主类。
+   */
+  const tagById = useMemo(
+    () => new Map(tags.map((tag) => [tag.id, tag])),
+    [tags]
+  );
+  const aiTagPhase = aiStatus?.embeddingProgress.phase;
+  const aiTagging = aiTagPhase === "tagging";
+  // 自用（需求 1）：打标被暂停（游标保留，点"继续"从断点接着打）
+  const aiTaggingPaused = aiTagPhase === "tagging-paused";
   const aiTagPipelineActive = Boolean(
     batchTagLoading || aiTagging || aiStatus?.isEmbedding
   );
+  /*
+   * 自用（需求 7）：侧边栏这一行也要能看到"处理速度 + 预估剩余时间"。
+   * 这里的数据来自 `useAiStatus`（打标中每 3 秒刷新一次），
+   * 所以速度大约在 6 秒后出现，比 AiProgressBar 的 500ms 粗一些，但足够看趋势。
+   */
+  const {
+    remainingText: aiTagRemainingText,
+    speedText: aiTagSpeedText,
+  } = useProgressRate(
+    aiTagging && aiStatus
+      ? {
+          isActive: Boolean(aiStatus.isEmbedding),
+          phase: String(aiStatus.embeddingProgress.phase),
+          processed: aiStatus.embeddingProgress.processed ?? 0,
+          total: aiStatus.embeddingProgress.total ?? 0,
+        }
+      : null
+  );
+  const aiTagRateText = [aiTagSpeedText, aiTagRemainingText]
+    .filter(Boolean)
+    .join(" · ");
 
   const updatePinnedFolderIds = useCallback((next: number[]) => {
     const normalized = [...new Set(next)].slice(0, MAX_PINNED_FOLDERS);
@@ -549,9 +599,13 @@ export function Sidebar({
   if (batchTagLoading && !aiTagging) {
     aiTagStatusText = t("tagUpdating");
   } else if (aiTagging) {
+    // 自用（方案 A · 问题 6）：数字是累计口径（已完成 / 全库），"本次还需" = 两者之差
+    const tagDone = aiStatus?.embeddingProgress.processed ?? 0;
+    const tagAll = aiStatus?.embeddingProgress.total ?? 0;
     aiTagStatusText = t("tagGeneratingProgress", {
-      processed: aiStatus?.embeddingProgress.processed ?? 0,
-      total: aiStatus?.embeddingProgress.total ?? 0,
+      processed: tagDone,
+      remaining: Math.max(0, tagAll - tagDone),
+      total: tagAll,
     });
   }
 
@@ -752,54 +806,82 @@ export function Sidebar({
     );
   }
 
+  // 供下面「加载标签」的 effect 使用。
+  //
+  // ⚠️ 性能关键（2026-10 定位到「点一下标签要等 4 秒」的根因）：
+  //    `activeTagIds`（数组）和 `onToggleTag`（函数）**每次渲染都是新引用**，
+  //    一旦放进 effect 依赖里，就会变成「选中标签 → effect 重跑 → 重新拉一遍
+  //    全部 3 万个标签 → setTags 触发渲染 → 再重跑」的循环。
+  //    而 `getTags` 内部那条徽标统计（12.4 百万行 JOIN + 去重分组）实测要 4 秒，
+  //    于是主进程一直忙着跑这条查询，用户的点击只能排在后面 —— 表现就是「卡 4 秒」。
+  //    改用 ref 读取当前值，effect 依赖里不再出现它们。
+  const activeTagIdsRef = useRef(activeTagIds);
+  activeTagIdsRef.current = activeTagIds;
+  const onToggleTagRef = useRef(onToggleTag);
+  onToggleTagRef.current = onToggleTag;
+
   useEffect(() => {
     let running = true;
-    let interval: ReturnType<typeof setInterval> | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-    async function loadTags() {
+    /** 拉一次标签；返回拿到的标签数量（0 表示还没生成出来）。 */
+    async function loadTags(): Promise<number> {
       try {
         const result = await ipc.client.photos.getTags({
           folderId: activeFolderId ?? undefined,
         });
         if (!running) {
-          return;
+          return 0;
         }
         const tagList = (result as TagInfo[]) || [];
         setTags(tagList);
         // Clear active tags that are no longer in the filtered list
+        const selected = activeTagIdsRef.current;
         if (
-          activeTagIds.length > 0 &&
-          activeTagIds.some((id) => !tagList.some((t) => t.id === id))
+          selected.length > 0 &&
+          selected.some((id) => !tagList.some((t) => t.id === id))
         ) {
-          for (const id of activeTagIds) {
+          for (const id of selected) {
             if (!tagList.some((t) => t.id === id)) {
-              onToggleTag?.(id);
+              onToggleTagRef.current?.(id);
             }
           }
         }
-        // Stop polling once tags appear
-        if (tagList.length > 0 && interval) {
-          clearInterval(interval);
-          interval = null;
-        }
+        return tagList.length;
       } catch (err) {
         console.error("[Sidebar loadTags] failed:", err);
+        return 0;
       }
     }
 
-    loadTags();
-    // Poll for tags if photos exist but tags haven't loaded yet
-    if (totalPhotos > 0) {
-      interval = setInterval(loadTags, 5000);
-    }
+    // 先立即拉一次；**只有一张标签都没有时**才继续轮询（等 AI 打标产出标签）。
+    // 用「递归 setTimeout」而不是 setInterval：这样第一次调用时就能确定要不要继续，
+    // 不会出现「interval 还没赋值 → 停不下来」的漏洞。
+    void (async () => {
+      const count = await loadTags();
+      if (!running || count > 0) {
+        return;
+      }
+      const tick = async () => {
+        if (!running) {
+          return;
+        }
+        const next = await loadTags();
+        if (!running || next > 0) {
+          return;
+        }
+        timer = setTimeout(tick, 5000);
+      };
+      timer = setTimeout(tick, 5000);
+    })();
 
     return () => {
       running = false;
-      if (interval) {
-        clearInterval(interval);
+      if (timer) {
+        clearTimeout(timer);
       }
     };
-  }, [totalPhotos, activeFolderId, activeTagIds, onToggleTag]);
+  }, [totalPhotos, activeFolderId]);
 
   useEffect(() => {
     function handler(event: MessageEvent) {
@@ -1273,10 +1355,53 @@ export function Sidebar({
       setTagTreeHasMoreBelow(false);
       return;
     }
+    /*
+     * 自用（问题 1 三次修正）：叠放槽位 = 序号 × 行高，"缝隙"就是因为行高与实际不符。
+     * 这里每次滚动都重新实测一次第一行的高度（一次 offsetHeight，开销可忽略），
+     * 值变了才 setState —— 于是叠放位置永远等于真实行高，缝隙自然消失，
+     * 而且不需要任何幕布/背板（前两版的幕布会把未吸顶的行也盖住）。
+     */
+    const firstRow = element.querySelector<HTMLElement>('[data-tag-depth="0"]');
+    const measured = firstRow?.offsetHeight ?? 0;
+    if (measured > 0 && measured !== tagGroupRowHeightRef.current) {
+      tagGroupRowHeightRef.current = measured;
+      setTagGroupRowHeight(measured);
+    }
     setTagTreeHasMoreBelow(
       element.scrollHeight - element.scrollTop - element.clientHeight > 2
     );
   }, []);
+
+  /*
+   * 自用（需求 2 / 问题 1）：主类吸顶要把第 2、3… 个展开的主类依次往下叠，
+   * 叠放间距必须等于真实行高，所以渲染后量一次（字号/缩放/主题变化时会自动纠正）。
+   */
+  useEffect(() => {
+    const row = tagTreeScrollRef.current?.querySelector<HTMLElement>(
+      '[data-tag-depth="0"]'
+    );
+    const height = row?.offsetHeight ?? 0;
+    if (height > 0 && height !== tagGroupRowHeight) {
+      tagGroupRowHeightRef.current = height;
+      setTagGroupRowHeight(height);
+    }
+    /*
+     * 自用（问题 1 四次修正）：`activeTagIds` 也在依赖里 ——
+     * 用户实测"选了很多标签后点清空，缝又出现了"：此时侧边栏 chips 行的高度变化
+     * 会牵动上面的布局，必须在这次重渲染后再量一次，否则叠放槽位还是旧行高。
+     */
+  }, [tagGroupRowHeight, tags, expandedTagIds, activeTagIds]);
+
+  /*
+   * 自用（问题 1）：吸顶区要垫一层**不透明背板**。
+   *
+   * 为什么需要：多个主类依次叠放时，槽位之间理论上没有缝，但一旦行高与实际差 1–2px，
+   * 或者某个未吸顶的行正好滑过那个高度，就会"透出后面的列表"。
+   * 背板高度 = 吸顶数量 × 行高，固定在滚动区顶部（负 margin 让它不占布局高度），
+   * 于是叠放区里看到的永远是背板颜色，不可能透出列表。
+   */
+  /* 自用（问题 1 三次修正）：不再需要"吸顶数量"（幕布已移除），
+     留下的只有"实测行高"，见 updateTagTreeFade。 */
 
   useEffect(() => {
     if (resourceView !== "tags") {
@@ -1447,6 +1572,63 @@ export function Sidebar({
   }
 
   // Collapsed: icon-only bar
+
+  /*
+   * 自用（需求 1）：打标状态行 —— 进行中给「暂停」、已暂停给「继续」。
+   *
+   * ⚠️ 侧边栏有**两处**会渲染它：标签树那一块（有标签时）和标签为空时的兜底块。
+   * 抽成一份共用，否则改了一处、另一处还是旧行为（第一版就踩了这个坑）。
+   */
+  const tagPipelineRow = aiTagPipelineActive ? (
+    <div className="flex items-center gap-1.5 rounded-[6px] border border-primary/20 bg-primary/5 px-2 py-1.5 text-[11px] text-primary">
+      <ScanSearch className="h-3.5 w-3.5 shrink-0 animate-pulse" />
+      <span className="min-w-0 truncate">{aiTagStatusText}</span>
+      {aiTagRateText ? (
+        <span className="ml-auto flex-shrink-0 text-[10px] text-muted-foreground/70 tabular-nums">
+          {aiTagRateText}
+        </span>
+      ) : null}
+      {aiTagging ? (
+        <button
+          className="flex-shrink-0 rounded-[4px] px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+          onClick={async () => {
+            await ipc.client.photos.pauseTagging({});
+            await queryClient.invalidateQueries({ queryKey: ["aiStatus"] });
+          }}
+          type="button"
+        >
+          {t("aiPause")}
+        </button>
+      ) : null}
+    </div>
+  ) : aiTaggingPaused ? (
+    <div className="flex items-center gap-1.5 rounded-[6px] border border-border bg-card px-2 py-1.5 text-[11px] text-muted-foreground">
+      <span className="min-w-0 truncate">
+        {t("aiPaused")}
+        <span className="ml-1 text-[10px] text-muted-foreground/70">
+          {t("tagPausedHint")}
+        </span>
+      </span>
+      <button
+        className="ml-auto flex-shrink-0 rounded-[4px] px-1.5 py-0.5 text-[10px] font-medium text-primary transition-colors hover:bg-primary/10"
+        disabled={batchTagLoading}
+        onClick={handleBatchGenerateTags}
+        type="button"
+      >
+        {t("aiResume")}
+      </button>
+    </div>
+  ) : (
+    <button
+      className="flex w-full items-center justify-center gap-1.5 rounded-[6px] border border-primary/30 bg-primary/10 px-2 py-1.5 text-[11px] text-primary transition-colors hover:bg-primary/20 disabled:opacity-60"
+      disabled={batchTagLoading}
+      onClick={handleBatchGenerateTags}
+      type="button"
+    >
+      <ScanSearch className="h-3.5 w-3.5" />
+      {t("tagBatchGenerate")}
+    </button>
+  );
 
   return (
     <>
@@ -1682,12 +1864,7 @@ export function Sidebar({
                 onClick={() => navigate({ to: "/settings/update" })}
               />
             )}
-            <RailButton
-              active={location.pathname.startsWith("/settings")}
-              icon={<Settings className="h-4 w-4" />}
-              label={t("sidebarSettings")}
-              onClick={() => navigate({ to: "/settings" })}
-            />
+            {/* 自用（需求 4）：快捷键提示在上、设置在下 —— 设置在左下角更符合操作直觉 */}
             <RailButton
               icon={<CircleHelp className="h-4 w-4" />}
               label={t("keyboardHelpTitle")}
@@ -1696,6 +1873,12 @@ export function Sidebar({
                   new KeyboardEvent("keydown", { key: "?" })
                 )
               }
+            />
+            <RailButton
+              active={location.pathname.startsWith("/settings")}
+              icon={<Settings className="h-4 w-4" />}
+              label={t("sidebarSettings")}
+              onClick={() => navigate({ to: "/settings" })}
             />
           </div>
         </nav>
@@ -1887,15 +2070,29 @@ export function Sidebar({
                           <div className="flex flex-wrap gap-1 px-1 pb-1">
                             {activeTagIds.slice(0, 3).map((id) => {
                               const tag = tags.find((t) => t.id === id);
+                              /*
+                               * 自用（问题 2）：chip 的底色/文字色**按所属标签（主类）来**，
+                               * 不再跟主题色走 —— 颜色是"归属标识"，跟着主题变色就失去意义了。
+                               */
+                              const chipColor = tag
+                                ? resolveTagDotColor(tag, tagById)
+                                : "#888";
                               return (
                                 <span
-                                  className="inline-flex items-center gap-1 rounded-[4px] border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[10px]"
+                                  className="inline-flex items-center gap-1 rounded-[4px] border px-1.5 py-0.5 text-[10px]"
                                   key={id}
+                                  style={{
+                                    backgroundColor: `color-mix(in srgb, ${chipColor} 14%, transparent)`,
+                                    borderColor: `color-mix(in srgb, ${chipColor} 38%, transparent)`,
+                                    color: chipColor,
+                                  }}
                                 >
                                   <span
                                     className="inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full"
                                     style={{
-                                      backgroundColor: tag?.color ?? "#888",
+                                      backgroundColor: tag
+                                        ? resolveTagDotColor(tag, tagById)
+                                        : "#888",
                                     }}
                                   />
                                   <span className="max-w-[90px] truncate">
@@ -1931,22 +2128,77 @@ export function Sidebar({
                             )}
                           </div>
                         )}
-                        {activeTagIds.length >= 2 && onToggleTagMode && (
+                        {/*
+                          自用（需求 3）：
+                          · 这一行**常驻**显示，右端放「多选 / 单选」切换键（默认单选）；
+                          · 原来的 AND / OR（正选 / 反选）键**往左挪一格**，只在多选且选了 ≥2 个标签时出现。
+                        */}
+                        {onToggleTagSelectMode && (
                           <div className="flex items-center justify-between px-1 pb-1">
                             <span className="text-[10px] text-muted-foreground/70">
                               {t("tagFilterMode")}
                             </span>
-                            <button
-                              aria-label={t("tagFilterMode")}
-                              aria-pressed={tagMode === "and"}
-                              className="rounded-[3px] border border-border px-1.5 py-0 font-medium text-[10px] text-primary transition-colors hover:bg-primary/10"
-                              onClick={onToggleTagMode}
-                              type="button"
-                            >
-                              {tagMode.toUpperCase()}
-                            </button>
+                            <span className="flex items-center gap-1">
+                              {/* 自用（问题 3）：一键清空已选标签 */}
+                              {activeTagIds.length > 1 && onToggleTag && (
+                                <button
+                                  aria-label={t("tagClearAll")}
+                                  className="rounded-[3px] border border-border px-1.5 py-0 font-medium text-[10px] text-muted-foreground/80 transition-colors hover:border-danger/40 hover:text-danger"
+                                  onClick={() => onToggleTag(null)}
+                                  title={t("tagClearAll")}
+                                  type="button"
+                                >
+                                  {t("tagClearAll")}
+                                </button>
+                              )}
+                              {activeTagIds.length >= 2 && onToggleTagMode && (
+                                <button
+                                  aria-label={t("tagFilterMode")}
+                                  aria-pressed={tagMode === "and"}
+                                  className="rounded-[3px] border border-border px-1.5 py-0 font-medium text-[10px] text-primary transition-colors hover:bg-primary/10"
+                                  onClick={onToggleTagMode}
+                                  type="button"
+                                >
+                                  {tagMode.toUpperCase()}
+                                </button>
+                              )}
+                              <button
+                                aria-label={t("tagSelectModeHint")}
+                                aria-pressed={tagSelectMode === "multi"}
+                                className={`rounded-[3px] border px-1.5 py-0 font-medium text-[10px] transition-colors hover:bg-primary/10 ${
+                                  tagSelectMode === "multi"
+                                    ? "border-primary/40 bg-primary/10 text-primary"
+                                    : "border-border text-muted-foreground/80"
+                                }`}
+                                onClick={onToggleTagSelectMode}
+                                title={t("tagSelectModeHint")}
+                                type="button"
+                              >
+                                {tagSelectMode === "single"
+                                  ? t("tagSelectModeSingle")
+                                  : t("tagSelectModeMulti")}
+                              </button>
+                            </span>
                           </div>
                         )}
+                        {!onToggleTagSelectMode &&
+                          activeTagIds.length >= 2 &&
+                          onToggleTagMode && (
+                            <div className="flex items-center justify-between px-1 pb-1">
+                              <span className="text-[10px] text-muted-foreground/70">
+                                {t("tagFilterMode")}
+                              </span>
+                              <button
+                                aria-label={t("tagFilterMode")}
+                                aria-pressed={tagMode === "and"}
+                                className="rounded-[3px] border border-border px-1.5 py-0 font-medium text-[10px] text-primary transition-colors hover:bg-primary/10"
+                                onClick={onToggleTagMode}
+                                type="button"
+                              >
+                                {tagMode.toUpperCase()}
+                              </button>
+                            </div>
+                          )}
                         <div className="px-1 pb-1">
                           <div className="relative">
                             <SmoothInput
@@ -1988,7 +2240,7 @@ export function Sidebar({
                         </div>
                         <div
                           aria-label={t("sidebarTags")}
-                          className="resource-tree-scroll flex-1 overflow-y-auto"
+                          className="resource-tree-scroll relative flex-1 overflow-y-auto"
                           data-bottom-fade={tagTreeHasMoreBelow}
                           data-resource-tree-scroll="true"
                           data-surface="resource-tree"
@@ -2033,6 +2285,13 @@ export function Sidebar({
                           role="tree"
                           tabIndex={0}
                         >
+                          {/*
+                            自用（问题 1 三次修正）：**不再放任何幕布/背板**。
+                            前两版（sticky 背板、绝对定位幕布）都会把未吸顶的行也盖住 ——
+                            用户实测"角色主目录消失""遮罩效果不对"。
+                            现在回到"只靠吸顶标题自己叠放"的版本（用户认可的效果），
+                            "缝隙"改用**每次滚动重新实测行高**来消除（见 updateTagTreeFade）。
+                          */}
                           {(() => {
                             // 自用改动：**只显示"有照片"的标签**。
                             // WD14 词表有 10,861 个标签，若把没有命中的也列出来，
@@ -2041,19 +2300,26 @@ export function Sidebar({
                             // 只要有子孙命中就 > 0，所以目录结构不会塌掉；
                             // 被过滤掉的祖先会由下面那段循环补回来。
                             const hiddenSet = expandHiddenTagIdSet();
+                            const needle = debouncedTagSearch
+                              ? debouncedTagSearch.toLowerCase()
+                              : "";
                             const filtered = tags.filter(
                               (t) =>
                                 t.photoCount > 0 &&
                                 !hiddenSet.has(t.id) &&
-                                (debouncedTagSearch
-                                  ? t.name
-                                      .toLowerCase()
-                                      .includes(
-                                        debouncedTagSearch.toLowerCase()
-                                      )
+                                (needle
+                                  ? t.name.toLowerCase().includes(needle)
                                   : true)
                             );
                             const allIds = new Set(filtered.map((t) => t.id));
+                            // 性能关键（2026-10 定位）：这里原本是
+                            //     const parent = tags.find((p) => p.id === currentId);
+                            // 放在「遍历上万个标签」的循环里 → 约 11,660 × 30,896
+                            // ≈ 3.6 亿次比较；而这段代码写在 JSX 的内联函数里，
+                            // **每次界面重渲染都会重跑**（光是选中一个标签就会触发），
+                            // 实测卡顿 3~4 秒。
+                            // 先建一次 Map 再查：结果完全相同，耗时降到几毫秒。
+                            const tagById = new Map(tags.map((t) => [t.id, t]));
                             for (const t of filtered) {
                               let cur: number | null = t.parentId;
                               while (cur !== null) {
@@ -2061,9 +2327,7 @@ export function Sidebar({
                                 if (allIds.has(currentId)) {
                                   break;
                                 }
-                                const parent = tags.find(
-                                  (p) => p.id === currentId
-                                );
+                                const parent = tagById.get(currentId);
                                 if (parent) {
                                   allIds.add(cur);
                                   cur = parent.parentId;
@@ -2117,7 +2381,9 @@ export function Sidebar({
                               },
                               (e, id) => handleDropOnTag(e, id),
                               dragOverTagId,
-                              i18n.language
+                              i18n.language,
+                              // 自用（问题 1）：吸顶叠放的槽位间距 = 实测行高
+                              tagGroupRowHeight
                             );
                           })()}
                         </div>
@@ -2126,22 +2392,8 @@ export function Sidebar({
                             于是库里一旦有标签，这个按钮就彻底消失了 —— 用户根本找不到。
                             现在改为：不在打标时显示按钮，打标中显示进度。 */}
                         <div className="px-1 py-1">
-                            {aiTagPipelineActive ? (
-                              <div className="flex items-center gap-1.5 rounded-[6px] border border-primary/20 bg-primary/5 px-2 py-1.5 text-[11px] text-primary">
-                                <ScanSearch className="h-3.5 w-3.5 animate-pulse" />
-                                {aiTagStatusText}
-                              </div>
-                            ) : (
-                              <button
-                                className="flex w-full items-center justify-center gap-1.5 rounded-[6px] border border-primary/30 bg-primary/10 px-2 py-1.5 text-[11px] text-primary transition-colors hover:bg-primary/20 disabled:opacity-60"
-                                disabled={batchTagLoading}
-                                onClick={handleBatchGenerateTags}
-                                type="button"
-                              >
-                                <ScanSearch className="h-3.5 w-3.5" />
-                                {t("tagBatchGenerate")}
-                              </button>
-                            )}
+                          {/* 自用（需求 1）：状态行见 tagPipelineRow（含暂停/继续） */}
+                          {tagPipelineRow}
                         </div>
                         {/* 自用版：标签黑名单。
                             刻意放在上面那个滚动容器**之外**，所以它固定在底部、
@@ -2184,22 +2436,8 @@ export function Sidebar({
                       </>
                     ) : (
                       <div className="px-3 py-1">
-                        {aiTagPipelineActive ? (
-                          <div className="flex items-center gap-1.5 rounded-[6px] border border-primary/20 bg-primary/5 px-2 py-1.5 text-[11px] text-primary">
-                            <ScanSearch className="h-3.5 w-3.5 animate-pulse" />
-                            {aiTagStatusText}
-                          </div>
-                        ) : (
-                          <button
-                            className="flex w-full items-center gap-1.5 rounded-[6px] border border-border px-2 py-1.5 text-[11px] text-muted-foreground transition-colors hover:border-primary/40 hover:text-primary disabled:opacity-60"
-                            disabled={batchTagLoading}
-                            onClick={handleBatchGenerateTags}
-                            type="button"
-                          >
-                            <ScanSearch className="h-3.5 w-3.5" />
-                            {t("tagBatchGenerate")}
-                          </button>
-                        )}
+                        {/* 自用（需求 1）：与标签树那处共用同一个状态行 */}
+                        {tagPipelineRow}
                       </div>
                     )}
                     {/* 自用：隐藏「AI 标签由本地模型自动生成，仅供辅助参考」说明

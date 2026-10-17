@@ -6,6 +6,7 @@ const PHOTOS_TITLE_PATTERN = /Photos/;
 const TRAVEL_TITLE_PATTERN = /Travel/;
 const {
   batchGenerateTagsMock,
+  pauseTaggingMock,
   toastErrorMock,
   toastInfoMock,
   toastSuccessMock,
@@ -13,6 +14,7 @@ const {
   useAiStatusMock,
 } = vi.hoisted(() => ({
   batchGenerateTagsMock: vi.fn(),
+  pauseTaggingMock: vi.fn(),
   toastErrorMock: vi.fn(),
   toastInfoMock: vi.fn(),
   toastSuccessMock: vi.fn(),
@@ -28,6 +30,15 @@ vi.mock("@/ipc/manager", () => ({
       },
       photos: {
         batchGenerateTags: batchGenerateTagsMock,
+        pauseTagging: pauseTaggingMock,
+        // 自用 Sidebar 会读"已隐藏文件夹/标签"；补上 mock，
+        // 否则渲染或交互时的异步调用会变成未处理异常，把整个文件的用例都判失败。
+        getHiddenFolders: vi
+          .fn()
+          .mockResolvedValue({ paths: [], resolvedFolderIds: [] }),
+        getHiddenTags: vi.fn().mockResolvedValue([]),
+        setFolderHidden: vi.fn().mockResolvedValue({ hidden: {} }),
+        setTagHidden: vi.fn().mockResolvedValue({ ok: true }),
         getTags: vi.fn(() => new Promise(() => undefined)),
         updateFolderAppearance: updateFolderAppearanceMock,
       },
@@ -109,7 +120,7 @@ describe("Sidebar", () => {
 
   it("does not repeat the total photo count in the resource panel", () => {
     render(<Sidebar {...baseProps} />);
-    expect(screen.queryByText("1,250 张照片")).not.toBeInTheDocument();
+    expect(screen.queryByText("1,250 张图片")).not.toBeInTheDocument();
   });
 
   it("shows Add Folder button", () => {
@@ -130,7 +141,7 @@ describe("Sidebar", () => {
   it("shows all photos button", () => {
     render(<Sidebar {...baseProps} />);
     expect(
-      screen.getAllByRole("button", { name: "全部照片" }).length
+      screen.getAllByRole("button", { name: "全部图片" }).length
     ).toBeGreaterThan(0);
   });
 
@@ -138,7 +149,7 @@ describe("Sidebar", () => {
     const onSelectAllPhotos = vi.fn();
     render(<Sidebar {...baseProps} onSelectAllPhotos={onSelectAllPhotos} />);
 
-    fireEvent.click(screen.getAllByRole("button", { name: "全部照片" })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "全部图片" })[0]);
 
     expect(onSelectAllPhotos).toHaveBeenCalledTimes(1);
     expect(baseProps.onSelectFolder).not.toHaveBeenCalled();
@@ -250,7 +261,7 @@ describe("Sidebar", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "全部照片" })
+      screen.getByRole("button", { name: "全部图片" })
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: PHOTOS_TITLE_PATTERN })
@@ -843,10 +854,22 @@ describe("Sidebar", () => {
     expect(screen.getByText("尚未添加文件夹")).toBeInTheDocument();
   });
 
-  it("has dashboard and settings links", () => {
+  it("keeps the settings link and puts it at the very bottom (自用需求 4)", () => {
     render(<Sidebar {...baseProps} />);
-    expect(screen.getByRole("button", { name: "仪表盘" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
+    // 自用版隐藏了「仪表盘」入口，这里不再断言它存在。
+    expect(
+      screen.queryByRole("button", { name: "仪表盘" })
+    ).not.toBeInTheDocument();
+
+    const settings = screen.getByRole("button", { name: "设置" });
+    expect(settings).toBeInTheDocument();
+
+    // 需求 4：设置要落在最底部 —— 即位于「快捷键提示」之后。
+    const help = screen.getByRole("button", {
+      name: /keyboardHelpTitle|快捷键/,
+    });
+    const relation = help.compareDocumentPosition(settings);
+    expect(Boolean(relation & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
   });
 
   it("shows automatic tag status instead of a batch action while AI is pending", () => {
@@ -880,6 +903,58 @@ describe("Sidebar", () => {
     await waitFor(() => expect(batchGenerateTagsMock).toHaveBeenCalledWith({}));
     expect(toastSuccessMock).not.toHaveBeenCalled();
     expect(toastErrorMock).not.toHaveBeenCalled();
-    expect(toastInfoMock).toHaveBeenCalledWith("暂无可生成标签的照片");
+    expect(toastInfoMock).toHaveBeenCalledWith("暂无可生成标签的图片");
+  });
+
+  // 自用（需求 1）：打标可暂停；暂停后能从断点继续（不重打）
+  describe("tagging pause and resume (自用需求 1)", () => {
+    it("offers a pause control while tagging is running", async () => {
+      useAiStatusMock.mockReturnValue({
+        data: {
+          coverageState: "partial",
+          embeddingProgress: { phase: "tagging", processed: 40, total: 100 },
+          isEmbedding: false,
+          pendingPhotos: 60,
+        },
+      });
+      pauseTaggingMock.mockResolvedValue({ paused: true });
+
+      render(<Sidebar {...baseProps} />);
+      fireEvent.click(screen.getByRole("button", { name: "标签" }));
+
+      fireEvent.click(screen.getByRole("button", { name: "aiPause" }));
+      await waitFor(() => expect(pauseTaggingMock).toHaveBeenCalledWith({}));
+    });
+
+    it("shows the paused state and resumes from the breakpoint", async () => {
+      useAiStatusMock.mockReturnValue({
+        data: {
+          coverageState: "partial",
+          embeddingProgress: {
+            phase: "tagging-paused",
+            processed: 40,
+            total: 100,
+          },
+          isEmbedding: false,
+          pendingPhotos: 60,
+        },
+      });
+      batchGenerateTagsMock.mockResolvedValue({
+        skipped: 0,
+        tagged: 60,
+        total: 60,
+      });
+
+      render(<Sidebar {...baseProps} />);
+      fireEvent.click(screen.getByRole("button", { name: "标签" }));
+
+      // 说清楚"继续=接着打"，而不是从头
+      expect(
+        screen.getByText("继续会从断点接着打，已完成的不会重打")
+      ).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "aiResume" }));
+      await waitFor(() => expect(batchGenerateTagsMock).toHaveBeenCalledWith({}));
+    });
   });
 });

@@ -7,6 +7,11 @@ export interface TagInfo {
   color: string | null;
   id: number;
   name: string;
+  /**
+   * 自用（问题 2）：`getTags` 返回的行里本来就有 `parentId`，
+   * 补上它才能"向上找到所属主类"、让色点与标签树一致（见 resolveTagDotColor）。
+   */
+  parentId?: number | null;
 }
 
 export interface TimePreset {

@@ -165,7 +165,7 @@ describe("PhotoLightbox", () => {
       screen.queryByRole("button", { name: "2: second.jpg" })
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("complementary", { name: "照片详情" })
+      screen.getByRole("complementary", { name: "图片详情" })
     ).toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByText("Sony A7")).toBeInTheDocument()

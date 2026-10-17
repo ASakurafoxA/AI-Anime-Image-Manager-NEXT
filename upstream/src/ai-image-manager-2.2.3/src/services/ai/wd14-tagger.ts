@@ -21,6 +21,7 @@ import { photos, photoTags, tags } from "@/db/schema";
 import { getSetting, setSetting } from "@/services/settings-manager";
 import { invalidateTagSearch } from "@/services/tag-search-revision";
 import { createLogger } from "@/utils/logger";
+import { shouldResetTaggingCursor } from "./tagging-cursor";
 import {
   categorizeWd14Tag,
   WD14_TAG_CATEGORIES,
@@ -332,9 +333,29 @@ export function isWd14VocabularyImported(): boolean {
   return getSetting(VOCAB_KEY) === VOCAB_VERSION;
 }
 
+/**
+ * 自用（方案 A · 问题 6）：开始前的"累计基线"（库里已打标 / 全库张数）。
+ */
+export function getWd14TaggingBaseline(): { done: number; total: number } {
+  const libraryTotal = countRemaining(0);
+  return {
+    done: Math.max(0, libraryTotal - countRemaining(readCursor())),
+    total: libraryTotal,
+  };
+}
+
 /** 是否已经跑完过一次全库重扫（决定下次点按钮是否重置游标）。 */
 export function isFullWd14RunDone(): boolean {
   return getSetting(FULL_RUN_KEY) === "1";
+}
+
+/**
+ * 自用（需求 1）：**强制**下次从第 0 张开始全库重扫。
+ * 只在用户明确要求"换了模型、旧标签全部重打"时用；日常续跑不要碰它。
+ */
+export function resetWd14TaggingProgress(): void {
+  setSetting(CURSOR_KEY, "0");
+  setSetting(FULL_RUN_KEY, "0");
 }
 
 /** 确认词表已导入；必要时执行导入。 */
@@ -540,7 +561,8 @@ async function processBatch(
  *
  * @param modelsDir `<dataPath>/models`
  * @param options.photoIds    只打这些照片；不传则按游标增量推进全库
- * @param options.resetCursor 从头开始（全库重跑）
+ * @param options.resetCursor **显式要求从头**（无条件清空游标 → 全库重跑）。
+ *   界面上点"生成 AI 标签"传的是 false（断点续跑）；只有明确要重打才传 true。
  * @param options.maxPhotos   最多处理多少张（用于小范围试点）
  */
 export async function runWd14Tagging(
@@ -572,13 +594,17 @@ export async function runWd14Tagging(
     // 读取该设置的既有写法见 face-detector.ts 的 getSetting("gpu.enabled") === "true"。
     const useGpu = options.useGpu ?? (getSetting("gpu.enabled") === "true");
     log.info({ useGpu, explicit: options.useGpu !== undefined }, "WD14 推理设备");
-    await initWd14Tagger(modelsDir, useGpu);
+    // 自用：打标也跟随「设置 → GPU 加速 → 使用显卡」选中的那块卡。
+    const { getDmlDeviceId } = await import("@/services/gpu-detector");
+    await initWd14Tagger(modelsDir, useGpu, getDmlDeviceId());
     const tagIds = loadTagIdMap();
 
     let done = 0;
     let tagged = 0;
     let failed = 0;
     let total: number;
+    // 自用：批量受「占用限制」缩放（100% 时不变）。
+    const batchSize = BATCH_SIZE;
 
     if (options.photoIds && options.photoIds.length > 0) {
       const ids = [...new Set(options.photoIds)];
@@ -586,11 +612,11 @@ export async function runWd14Tagging(
         ? ids.slice(0, options.maxPhotos)
         : ids;
       total = limited.length;
-      for (let i = 0; i < limited.length; i += BATCH_SIZE) {
+      for (let i = 0; i < limited.length; i += batchSize) {
         if (cancelRequested) {
           break;
         }
-        const chunk = limited.slice(i, i + BATCH_SIZE);
+        const chunk = limited.slice(i, i + batchSize);
         const rows = loadPhotosByIds(chunk);
         const { written } = await processBatch(rows, tagIds);
         done += chunk.length;
@@ -599,17 +625,28 @@ export async function runWd14Tagging(
         options.onProgress?.({ done, total, tagged, failed });
       }
     } else {
-      if (options.resetCursor && !isFullWd14RunDone()) {
-        // 只在**第一次**全库重扫时把游标归零。
-        // 之后即便中途关掉应用再点一次，也会从上次的游标继续，而不是从头再来
-        //（全库 CPU 跑一遍约 4 小时，重头开始代价太大）。
+      if (
+        shouldResetTaggingCursor(options, {
+          cursor: readCursor(),
+          fullRunDone: isFullWd14RunDone(),
+        })
+      ) {
+        // 只有"一张都还没打过"才会走到这里（等于没变化）。
+        // ⚠️ 修正（自用·需求 1）：原来只判断 `!isFullWd14RunDone()`，而该标记只在
+        //    **完整跑完**时才置位 —— 于是"跑到一半崩溃/关软件/取消"后再点按钮会
+        //    把游标归零、从头重打（全库 CPU 跑一遍约 4 小时，代价极大）。
+        //    要强制全库重扫，用 `resetWd14TaggingProgress()`。
         setSetting(CURSOR_KEY, "0");
       }
       let cursor = readCursor();
-      total = countRemaining(cursor);
-      if (options.maxPhotos) {
-        total = Math.min(total, options.maxPhotos);
-      }
+      /*
+       * 自用（方案 A · 问题 6）：进度用**累计口径**上报（processed=库里已完成+本次，
+       * total=全库张数），避免界面显示"0 / 剩余"那种像从头重跑的数字。
+       */
+      const libraryTotal = countRemaining(0);
+      done = Math.max(0, libraryTotal - countRemaining(cursor));
+      total = libraryTotal;
+      options.onProgress?.({ done, failed, tagged, total });
       for (;;) {
         if (cancelRequested) {
           break;
@@ -617,7 +654,7 @@ export async function runWd14Tagging(
         if (options.maxPhotos && done >= options.maxPhotos) {
           break;
         }
-        const rows = loadPhotosAfterCursor(cursor, BATCH_SIZE);
+        const rows = loadPhotosAfterCursor(cursor, batchSize);
         if (rows.length === 0) {
           break;
         }

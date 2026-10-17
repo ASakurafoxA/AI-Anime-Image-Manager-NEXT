@@ -10,6 +10,7 @@ import { MakerZIP } from "@electron-forge/maker-zip";
 import { FusesPlugin } from "@electron-forge/plugin-fuses";
 import { VitePlugin } from "@electron-forge/plugin-vite";
 import type { ForgeConfig } from "@electron-forge/shared-types";
+import { PRIVATE_BUILD } from "./src/config/private-build";
 import { MODEL_MANIFEST } from "./src/services/model-downloader";
 
 const packageTempSuffix = process.env.AIM_PACKAGE_TEMP_SUFFIX;
@@ -19,6 +20,8 @@ const packageTempSuffix = process.env.AIM_PACKAGE_TEMP_SUFFIX;
 // developer build from accidentally contacting the release bucket.
 const squirrelRemoteReleases = process.env.AIM_SQUIRREL_REMOTE_RELEASES?.trim();
 const RELEASE_MODELS_DIR = path.resolve("models-release");
+/** 自用：旧 WD14 打标模型所在的子路径（见上面的打包跳过规则）。 */
+const LEGACY_WD14_SUBPATH = "SmilingWolf/wd-vit-tagger-v3";
 const SQUIRREL_SETUP_ICON_PATH = path.resolve("assets/icon.ico");
 const SQUIRREL_RCEDIT_PATH = path.resolve(
   "node_modules/electron-winstaller/vendor/rcedit.exe"
@@ -59,6 +62,20 @@ function stageReleaseModels(): void {
   let stagedCount = 0;
   for (const entry of MODEL_MANIFEST) {
     if (entry.bundled === false) {
+      continue;
+    }
+    // 自用（NEXT，2026-10）：本版打标已改用 PixAI Tagger v1.0，不再需要 WD14 模型，
+    // 所以**绝不**把它打进安装包（`model.onnx` 379 MB + `selected_tags.csv`）。
+    // 判据直接读本版的开关：`useWd14Tagger === false` 就跳过。
+    // ⚠️ 例外：`zh_names.csv`（标签中文名映射，PixAI 也在用）不在 MODEL_MANIFEST 里，
+    //    由下面专门的一段单独打包，不受这里影响。
+    if (
+      !PRIVATE_BUILD.useWd14Tagger &&
+      entry.subPath === LEGACY_WD14_SUBPATH
+    ) {
+      console.log(
+        `[release-models] 跳过旧模型（本版改用 PixAI）：${entry.fileName}`
+      );
       continue;
     }
     const source = path.join("models", entry.subPath, entry.fileName);

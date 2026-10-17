@@ -18,6 +18,8 @@ const mocks = vi.hoisted(() => ({
   dismissDuplicates: vi.fn(),
   getDuplicateGroupPhotos: vi.fn(),
   findDuplicates: vi.fn(),
+  /** 自用：进页面只读上次结果（不扫描）的接口 */
+  getSavedDuplicateGroups: vi.fn(),
 }));
 const IGNORED_FILTER = /duplicateIgnored/;
 
@@ -183,7 +185,8 @@ function save(group: DuplicateGroupSummary) {
     ignoreState: "ACTIVE",
   };
 }
-function mount(
+/** 只渲染、不触发扫描（用于验证"进页面不会自动开始"）。 */
+function mountWithoutStarting(
   client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
@@ -196,6 +199,23 @@ function mount(
       </QueryClientProvider>
     ),
   };
+}
+
+/**
+ * 自用改动：本页**不再一进就自动扫描**（用户反馈"一进入就自动开始"），
+ * 改成点「开始检测」才扫。所以这里渲染后点一下，
+ * 其余用例的语义（进页面即有结果）保持不变。
+ */
+function mount(
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+) {
+  const view = mountWithoutStarting(client);
+  fireEvent.click(
+    screen.getByRole("button", { name: "startFaceDetectionShort" })
+  );
+  return view;
 }
 async function decide(id: number, decision: "Keep" | "Delete" | "Undecided") {
   const button = screen.getByRole("button", {
@@ -215,6 +235,40 @@ function keepCount(value: string) {
 }
 
 describe("DuplicatesPage persisted review", () => {
+  it("进入页面不扫描：先走只读接口，点「开始检测」才真扫", async () => {
+    setupGroups([makeGroup("exact:1-2", "exact", [1, 2])]);
+    mountWithoutStarting();
+
+    // 关键：仅仅渲染不能触发扫描（以前是一进页面 queryFn 就跑扫描）
+    await waitFor(() =>
+      expect(mocks.getSavedDuplicateGroups).toHaveBeenCalledTimes(1)
+    );
+    expect(mocks.findDuplicates).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "startFaceDetectionShort" })
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "startFaceDetectionShort" })
+    );
+    await waitFor(() => expect(mocks.findDuplicates).toHaveBeenCalledTimes(1));
+  });
+
+  it("有历史结果时：进页面直接显示，不显示「开始检测」入口", async () => {
+    mocks.getSavedDuplicateGroups.mockResolvedValue({
+      groups: [makeGroup("exact:1-2", "exact", [1, 2])],
+      hasSavedResult: true,
+    });
+    mountWithoutStarting();
+
+    // 直接看到上次结果的成员，且没有开始按钮
+    expect(await screen.findByText("1.jpg")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "startFaceDetectionShort" })
+    ).toBeNull();
+    expect(mocks.findDuplicates).not.toHaveBeenCalled();
+  });
+
   it("allows unignore while keeping ignored review controls disabled", async () => {
     const group = makeGroup("exact:1-2-3", "exact", [1, 2, 3]);
     group.status = "dismissed";
@@ -246,6 +300,11 @@ describe("DuplicatesPage persisted review", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     setupGroups([makeGroup("exact:1-2-3", "exact", [1, 2, 3])]);
+    // 进页面先走只读接口：默认"没有任何历史结果" → 页面显示「开始检测」入口
+    mocks.getSavedDuplicateGroups.mockResolvedValue({
+      groups: [],
+      hasSavedResult: false,
+    });
     mocks.listDuplicateCleanupBatches.mockResolvedValue([]);
     mocks.getDuplicateScanProgress.mockResolvedValue({
       stage: "hashing",

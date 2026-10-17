@@ -31,10 +31,9 @@ import {
 const GLOB_WILDCARD_RE = /[*?[]/;
 
 import { deletePhotoVectors } from "@/services/ai-embedder";
-import {
-  getFolderSubtreeIds,
-  getFolderTotalPhotoCounts,
-} from "@/services/folder-hierarchy";
+import { getFolderSubtreeIds, getFolderTotalPhotoCounts } from "@/services/folder-hierarchy";
+import { clearTagCountCache } from "@/services/tag-count-cache";
+import { addRemovedFolderPath } from "@/services/folder-exclusions";
 import {
   getAllFolderPathItems,
   getHiddenFoldersState,
@@ -43,6 +42,7 @@ import {
   setFolderHiddenById,
 } from "@/services/folder-exclusions";
 import { normalizeFolderPath } from "@/utils/folder-exclusions";
+import { resolveTagDotColor } from "@/utils/tag-dot-color";
 import { reloadFolderMatcher } from "@/services/folder-matcher";
 import {
   cancelAllImports,
@@ -322,6 +322,13 @@ export const deleteFolder = os.input(IdSchema).handler(async ({ input }) => {
   // 6) Reload folder matcher so watchers pick up the change
   reloadFolderMatcher();
 
+  // 6b) 记下这个路径「已被用户移除」。
+  // 否则开机增量补扫（scheduleStartupCatchUpScan）重扫树根时，
+  // scanFolder 的 auto-discover 会把"含图片的子目录"重新建成文件夹记录 ——
+  // 用户明明删掉的文件夹下次开软件又回来了（实测用户反馈）。
+  // 用户以后**主动重新导入**这个路径时，scanFolder 会忘掉这条记录。
+  addRemovedFolderPath(folder.path);
+
   // 7) Flush COUNT cache so the frontend sees the updated total immediately
   invalidateCountCache();
 
@@ -337,12 +344,165 @@ const MAX_COUNT_CACHE = 50;
 /** 清空 COUNT 缓存，在导入/删除大批量照片后调用以确保计数即时准确。 */
 export function invalidateCountCache(): void {
   totalCache.clear();
+  // 标签树徽标统计（3 秒以上的递归 CTE）也跟着失效：
+  // 导入完成、删除照片、改文件夹黑名单都会走到这里。
+  clearTagCountCache();
 }
 const totalCache = new Map<string, { value: number; timestamp: number }>();
 
 // Photo listing
 /** 列表查询的输入类型（与 IPC 的 `ListSchema` 完全一致）。*/
 export type ListPhotosInput = z.infer<typeof ListSchema>;
+
+// ── 标签子树过滤用的临时表 ────────────────────────────────────────────
+// 为什么需要它（2026-10 在本机真实图库上实测：7.7 万图 / 3.1 万标签 / 420 万条 photo_tags，
+// 每张图平均挂 54.5 个标签）：
+//
+//   原写法 `photos.id IN (SELECT pt.photo_id FROM photo_tags pt WHERE pt.tag_id IN (…))`
+//   会被 SQLite 当作 LIST SUBQUERY **整体物化**。点根分类「通用」（子树 15,057 个标签、
+//   几乎命中全部图片）时，这一步要物化约 420 万行 → **首页要等 10.2 秒**。
+//   多标签 AND 更糟：实测「角色 AND 画风」的计数要 **57 秒**、首页 2.9 秒。
+//
+//   换成「逐图去探临时表的主键索引」后（EXISTS + 带主键的临时表）：
+//     首页最坏 10ms（原 10,233ms），计数最坏 0.63 秒（原 57,395ms），
+//     而且 6 个根分类**没有一个变差**（命中数逐项与原写法一致）。
+//
+// ⚠️ 临时表是**连接级**的。`getDatabase()` 返回的是模块级单例连接，
+//    并且本函数全程同步、不递归，所以两次查询不会交错、不会互相覆盖。
+const TAG_FILTER_TABLE = "_aim_tag_filter";
+
+/**
+ * 把「选中的标签子树」灌进临时表。
+ *
+ * @param groups OR 模式传 1 组（合并后的全部后代标签 id）；
+ *               AND 模式每个所选标签一组，组号按数组下标。
+ */
+function fillTagFilterTable(groups: number[][]): void {
+  const db = getDatabase();
+  // ⚠️ 每次都执行 `CREATE TEMP TABLE IF NOT EXISTS`（幂等、开销可忽略），
+  //    不要用「建过了就跳过」的模块级标志：临时表是连接级的，
+  //    一旦连接被 closeDatabase() 重建，标志还在但表已经没了 → 直接报错。
+  db.run(
+    sql.raw(
+      `CREATE TEMP TABLE IF NOT EXISTS ${TAG_FILTER_TABLE} (
+         group_id INTEGER NOT NULL,
+         tag_id INTEGER NOT NULL,
+         PRIMARY KEY (group_id, tag_id)
+       ) WITHOUT ROWID`
+    )
+  );
+  db.run(sql.raw(`DELETE FROM ${TAG_FILTER_TABLE}`));
+
+  const rows: { groupId: number; tagId: number }[] = [];
+  groups.forEach((ids, groupId) => {
+    for (const tagId of ids) {
+      rows.push({ groupId, tagId });
+    }
+  });
+
+  // 分批 INSERT：一次 2000 行（4000 个参数），远低于 SQLite 的 32766 上限，
+  // 也避免上万次单独执行带来的开销。
+  const CHUNK = 2000;
+  for (let index = 0; index < rows.length; index += CHUNK) {
+    const chunk = rows.slice(index, index + CHUNK);
+    const values = sql.join(
+      chunk.map((row) => sql`(${row.groupId}, ${row.tagId})`),
+      sql`, `
+    );
+    db.run(
+      sql`INSERT OR IGNORE INTO ${sql.raw(TAG_FILTER_TABLE)} (group_id, tag_id) VALUES ${values}`
+    );
+  }
+}
+
+/**
+ * 生成「这张图是否命中第 `groupId` 组标签」的 EXISTS 条件。
+ *
+ * 写成两层 EXISTS 是**性能关键**：内层让 SQLite 用临时表的
+ * `PRIMARY KEY (group_id, tag_id)` 做成员判断（计划里显示 `SEARCH f USING PRIMARY KEY`），
+ * 而不是像 `IN (SELECT …)` 那样退化成整表扫描（实测「角色」会因此慢 80 倍）。
+ */
+function tagGroupCondition(groupId: number): SQL {
+  return sql`EXISTS (
+    SELECT 1 FROM photo_tags pt
+    WHERE pt.photo_id = ${photos.id}
+      AND EXISTS (
+        SELECT 1 FROM ${sql.raw(TAG_FILTER_TABLE)} f
+        WHERE f.group_id = ${groupId} AND f.tag_id = pt.tag_id
+      )
+  )`;
+}
+
+/**
+ * 有界探针：第 `groupId` 组标签命中的**关联行数**（最多数到 `limit` 就停）。
+ *
+ * 为什么需要：AND 模式的计数想「从更窄的那一组出发」，但必须先知道哪一组窄。
+ * 真正的行数要全表扫，所以这里只数到上限为止 —— 命中上限就说明这一组"很宽"。
+ * 实测成本 3~6 ms（数 5 万条索引条目），完全可以每次查询都跑。
+ */
+function countGroupRowsUpTo(groupId: number, limit: number): number {
+  const db = getDatabase();
+  const row = db.get<{ c: number }>(
+    sql`SELECT count(*) AS c FROM (
+          SELECT 1 FROM photo_tags pt
+           WHERE pt.tag_id IN (
+             SELECT tag_id FROM ${sql.raw(TAG_FILTER_TABLE)} WHERE group_id = ${groupId}
+           )
+           LIMIT ${limit}
+        )`
+  );
+  return row?.c ?? 0;
+}
+
+/**
+ * 探针上限。实测（8 万图 / 32 万图两档、4 种标签组合）：
+ *   · 一组 ≤ 4.8 万行时，从它出发明显更快（32 万图：3315ms → 332~716ms）
+ *   · 一组 ≥ 7.7 万行时，从它出发反而**灾难性变慢**（实测 111 秒 / 54 秒）
+ * 所以 5 万是一个既能吃到收益、又留了安全边界的阈值。
+ */
+const TAG_GROUP_PROBE_LIMIT = 50_000;
+/**
+ * AND 模式的「计数」专用条件（返回 null 表示沿用列表那套写法）。
+ *
+ * 为什么单独做：AND 的结果 = 交集。逐图核对每一组标签的成本 ≈ **图片总数**
+ * （与命中的图有多少无关），实测 32 万图要 3.3 秒、且随图片数线性增长。
+ *
+ * 做法：**只有每一组都够窄时**，才改成在标签侧直接求交集
+ * （`SELECT photo_id … WHERE tag_id IN (第0组) INTERSECT …`），
+ * 只扫这几组标签命中的关联行，不扫全库图片。实测 32 万图 3,170ms → 388ms。
+ *
+ * 为什么不做「只有一组窄时从它出发」：实测那种写法**依赖 SQLite 的规划器选择**，
+ * 在真实数据上很快（332ms），但在另一种数据形状下会退化成 16 秒甚至 610 秒。
+ * 计数缓存只有 10 秒，宁可稳一点：**只要有一组很宽，就老实沿用原写法**。
+ */
+export function buildAndCountConditions(
+  groupCount: number,
+  // 只给测试用来缩小阈值（生产走 TAG_GROUP_PROBE_LIMIT）
+  probeLimit: number = TAG_GROUP_PROBE_LIMIT
+): SQL[] | null {
+  if (groupCount < 2) {
+    return null;
+  }
+  const allNarrow = Array.from({ length: groupCount }, (_, groupId) =>
+    countGroupRowsUpTo(groupId, probeLimit)
+  ).every((count) => count < probeLimit);
+
+  if (!allNarrow) {
+    // 有任意一组很宽 → 沿用原写法（可预测、且这种情况本来就快）
+    return null;
+  }
+
+  const selects = Array.from(
+    { length: groupCount },
+    (_, groupId) => sql`SELECT pt.photo_id AS pid FROM photo_tags pt
+                         WHERE pt.tag_id IN (
+                           SELECT tag_id FROM ${sql.raw(TAG_FILTER_TABLE)} WHERE group_id = ${groupId}
+                         )`
+  );
+  return [
+    sql`${photos.id} IN (SELECT pid FROM (${sql.join(selects, sql` INTERSECT `)}))`,
+  ];
+}
 
 /**
  * 列表查询的可复用核心。
@@ -447,6 +607,11 @@ export function queryPhotos(input: ListPhotosInput) {
     effectiveTagIds = [tagId];
   }
   let selectedDescendantIds: number[] = [];
+  // 标签条件在 `conditions` 里的范围；以及 AND 模式给「计数」单独选出来的条件
+  // （null = 沿用列表那套写法）。
+  let tagConditionStart = 0;
+  let tagConditionEnd = 0;
+  let tagCountConditions: SQL[] | null = null;
 
   if (effectiveTagIds && effectiveTagIds.length > 0) {
     // Collect all descendant tag IDs for each root tag
@@ -485,7 +650,7 @@ export function queryPhotos(input: ListPhotosInput) {
     }
 
     if (effectiveTagMode === "or") {
-      // OR mode: photo must have at least one tag from the merged descendant set
+      // OR 模式：命中「合并后的全部后代标签」中的任意一个即可
       const allDescendantIds = new Set<number>();
       for (const set of rootDescendantSets) {
         for (const id of set) {
@@ -495,31 +660,27 @@ export function queryPhotos(input: ListPhotosInput) {
       const idArray = [...allDescendantIds];
       selectedDescendantIds = idArray;
       if (idArray.length > 0) {
-        // sql.join builds parameterized IN clause: pt.tag_id IN ($1, $2, $3)
-        const inClause = sql.join(
-          idArray.map((id) => sql`${id}`),
-          sql`, `
-        );
-        conditions.push(
-          sql`${photos.id} IN (SELECT pt.photo_id FROM photo_tags pt WHERE pt.tag_id IN (${inClause}))`
-        );
+        // 全部后代标签合并成第 0 组
+        fillTagFilterTable([idArray]);
+        conditions.push(tagGroupCondition(0));
       }
     } else {
-      // AND mode: photo must have at least one tag from each root tag's descendant set
+      // AND 模式：每个所选标签各要命中一个（组号 = 数组下标）
       selectedDescendantIds = [
         ...new Set(rootDescendantSets.flatMap((set) => [...set])),
       ];
-      for (const descendantSet of rootDescendantSets) {
-        const idArray = [...descendantSet];
-        if (idArray.length > 0) {
-          const inClause = sql.join(
-            idArray.map((id) => sql`${id}`),
-            sql`, `
-          );
-          conditions.push(
-            sql`EXISTS (SELECT 1 FROM photo_tags pt WHERE pt.photo_id = ${photos.id} AND pt.tag_id IN (${inClause}))`
-          );
-        }
+      const groups = rootDescendantSets
+        .map((set) => [...set])
+        .filter((ids) => ids.length > 0);
+      if (groups.length > 0) {
+        fillTagFilterTable(groups);
+        tagConditionStart = conditions.length;
+        groups.forEach((_, groupId) => {
+          conditions.push(tagGroupCondition(groupId));
+        });
+        tagConditionEnd = conditions.length;
+        // 计数单独选型（只有 AND 且 ≥2 组才可能换写法）
+        tagCountConditions = buildAndCountConditions(groups.length);
       }
     }
   }
@@ -569,12 +730,21 @@ export function queryPhotos(input: ListPhotosInput) {
   if (cachedTotal && Date.now() - cachedTotal.timestamp < COUNT_CACHE_TTL) {
     total = cachedTotal.value;
   } else {
-    // Build filtered count query with same conditions
+    // 计数用的条件：AND 模式可能换成「从窄的那一组出发」的写法（见 buildAndCountConditions）。
+    // 标签条件在 conditions 里是连续的一段 [tagConditionStart, tagConditionEnd)，
+    // 所以只要把那一段替换掉即可，文件夹/搜索/收藏等条件原样保留。
+    const countConditions = tagCountConditions
+      ? [
+          ...conditions.slice(0, tagConditionStart),
+          ...tagCountConditions,
+          ...conditions.slice(tagConditionEnd),
+        ]
+      : conditions;
     let countQuery = db
       .select({ count: sql<number>`count(*)` })
       .from(photos)
       .$dynamic();
-    countQuery = countQuery.where(and(...conditions));
+    countQuery = countQuery.where(and(...countConditions));
     total = countQuery.get()?.count || 0;
 
     // Evict oldest entry if at capacity, then store
@@ -619,7 +789,22 @@ export function queryPhotos(input: ListPhotosInput) {
     );
     // 自用：缩略图角标要显示"这张图命中了你所选标签中的哪几个"（最多 3 个），
     // 所以在同一次查询里把命中的标签名也带上 —— 不额外增加查询。
+    //
+    // 自用（问题 2）：角标颜色也要**按所属主类**来（与标签树/顶部 chips 同一套规则），
+    // 所以这里顺带把每个命中标签的颜色也算出来（一次性读小表 tags，成本可忽略）。
+    const colorTagRows = db
+      .select({
+        color: tags.color,
+        id: tags.id,
+        name: tags.name,
+        parentId: tags.parentId,
+      })
+      .from(tags)
+      .all();
+    const colorTagByName = new Map(colorTagRows.map((row) => [row.name, row]));
+    const colorTagById = new Map(colorTagRows.map((row) => [row.id, row]));
     const namesByPhoto = new Map<number, string[]>();
+    const colorsByPhoto = new Map<number, string[]>();
     for (const row of matchingTagSources) {
       // photo_tags.photo_id 在 schema 里可空，这里必须挡住 null
       if (!row.tagName || row.photoId === null) {
@@ -631,6 +816,15 @@ export function queryPhotos(input: ListPhotosInput) {
         namesByPhoto.set(photoId, [row.tagName]);
       } else if (list.length < 3 && !list.includes(row.tagName)) {
         list.push(row.tagName);
+      } else {
+        // 名字已满 3 个（或重复）→ 颜色也保持一一对应
+        continue;
+      }
+      const tagRow = colorTagByName.get(row.tagName);
+      if (tagRow) {
+        const colors = colorsByPhoto.get(photoId) ?? [];
+        colors.push(resolveTagDotColor(tagRow, colorTagById));
+        colorsByPhoto.set(photoId, colors);
       }
     }
     items = items.map((photo) => ({
@@ -640,6 +834,7 @@ export function queryPhotos(input: ListPhotosInput) {
         origin: trustedPhotoIds.has(photo.id)
           ? ("manual" as const)
           : ("auto" as const),
+        tagColors: colorsByPhoto.get(photo.id) ?? [],
         tagNames: namesByPhoto.get(photo.id) ?? [],
       },
     }));

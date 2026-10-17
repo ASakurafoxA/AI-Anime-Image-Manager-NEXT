@@ -18,6 +18,7 @@ vi.mock("@/ipc/manager", () => ({
         getAppSetting: vi.fn(),
         getDataPathInfo: vi.fn(),
         getGpuSettings: vi.fn(),
+        getGpuSpeeds: vi.fn().mockResolvedValue({ speeds: [] }),
         markGpuPromptShown: vi.fn(),
         setAppSetting: vi.fn(),
         setDataPath: vi.fn(),
@@ -92,8 +93,13 @@ describe("OnboardingOverlay", () => {
     });
     vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
       detected: null,
+      deviceId: "auto",
       enabled: false,
       promptShown: false,
+      searchImageSource: "thumbnail",
+      deviceIds: [],
+      effectiveDevices: [],
+      multiGpuEnabled: false,
     });
     vi.mocked(ipc.client.shell.openFolderDialog).mockResolvedValue({
       path: "D:\\NewData",

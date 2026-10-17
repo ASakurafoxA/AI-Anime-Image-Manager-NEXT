@@ -10,7 +10,13 @@ import {
 } from "@/services/ai/state";
 import { suggestTags as aiSuggestTags } from "@/services/ai-embedder";
 import { getFolderSubtreeIds } from "@/services/folder-hierarchy";
-import { invalidateTagSearch } from "@/services/tag-search-revision";
+import {
+  persistTagCounts,
+  readPersistedTagCounts,
+  readTagCountCache,
+  writeTagCountCache,
+} from "@/services/tag-count-cache";
+import { getTagSearchRevision, invalidateTagSearch } from "@/services/tag-search-revision";
 import {
   getHiddenTagsState,
   setTagHiddenById,
@@ -105,8 +111,52 @@ export const getPhotoTagAnalysisStatus = os
  *
  * @param folderId 给定时只统计该文件夹子树内的照片（桌面侧边栏按文件夹收窄时用）。
  */
+/**
+ * 读图库指纹 —— 用来判断落盘快照是否过期。
+ * 三个数任意一个变了都说明图库内容动过：图片数（导入/删除）、
+ * 关联行数（标签增删）、关联最大 id（自增，任何新增都会变大）。
+ * 成本实测：8 万图 47ms / 32 万图 180ms，只在「内存缓存未命中且是全局视图」时跑一次。
+ */
+function readTagCountFingerprint() {
+  const db = getDatabase();
+  const photoRow = db.get<{ c: number; d: number }>(
+    sql`SELECT count(*) AS c,
+               count(CASE WHEN deleted_at IS NOT NULL THEN 1 END) AS d
+          FROM photos`
+  );
+  const linkRow = db.get<{ c: number; m: number | null }>(
+    sql`SELECT count(*) AS c, max(id) AS m FROM photo_tags`
+  );
+  return {
+    photoCount: photoRow?.c ?? 0,
+    // 软删除的照片数也要进指纹：删图不会改变任何行数
+    deletedPhotoCount: photoRow?.d ?? 0,
+    linkCount: linkRow?.c ?? 0,
+    maxLinkId: linkRow?.m ?? 0,
+  };
+}
+
 export function queryTagPhotoCounts(folderId?: number): Map<number, number> {
   const db = getDatabase();
+
+  // 这条统计要 3 秒以上（见 tag-count-cache.ts 的说明），而它只在图库内容变化时才变，
+  // 所以先查内存缓存，再查落盘快照。
+  const cacheKey = folderId ?? null;
+  const revision = getTagSearchRevision();
+  const cached = readTagCountCache(cacheKey, revision);
+  if (cached) {
+    return cached;
+  }
+
+  // 落盘快照只对「全局视图」有效 —— 按文件夹统计的口径不同，不能复用。
+  const fingerprint = cacheKey === null ? readTagCountFingerprint() : null;
+  if (fingerprint) {
+    const persisted = readPersistedTagCounts(fingerprint);
+    if (persisted) {
+      writeTagCountCache(cacheKey, revision, persisted);
+      return persisted;
+    }
+  }
 
   const folderIds = folderId
     ? getFolderSubtreeIds(
@@ -147,6 +197,11 @@ export function queryTagPhotoCounts(folderId?: number): Map<number, number> {
   const counts = new Map<number, number>();
   for (const row of countRows) {
     counts.set(Number(row.tag_id), Number(row.c));
+  }
+  writeTagCountCache(cacheKey, revision, counts);
+  if (fingerprint) {
+    // 落盘：下次（含重启后）就不用再跑这条 3 秒以上的统计
+    persistTagCounts(fingerprint, counts);
   }
   return counts;
 }

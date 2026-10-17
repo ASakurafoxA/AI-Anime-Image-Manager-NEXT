@@ -205,7 +205,8 @@ function waitForReady(slot: WorkerSlot, timeoutMs: number): Promise<void> {
  */
 export async function initWd14Tagger(
   modelsDir: string,
-  useGpu: boolean
+  useGpu: boolean,
+  deviceId: number | null = null
 ): Promise<void> {
   if (!PRIVATE_BUILD.useWd14Tagger) {
     return;
@@ -228,7 +229,12 @@ export async function initWd14Tagger(
     for (let i = 0; i < WORKER_COUNT; i++) {
       const slot = spawnSlot(i);
       slots.push(slot);
-      slot.process.send({ type: "init", modelsDir, useGPU: useGpu });
+      slot.process.send({
+        deviceId: deviceId ?? undefined,
+        modelsDir,
+        type: "init",
+        useGPU: useGpu,
+      });
     }
     await Promise.all(slots.map((slot) => waitForReady(slot, 120_000)));
     log.info({ workers: slots.length, useGpu }, "WD14 tagger ready");

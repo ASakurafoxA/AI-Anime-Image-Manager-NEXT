@@ -223,7 +223,7 @@ async function handleFatalError(
         "请将资源管理器中选中的诊断 TXT 拖到这里。",
       ].join("\n");
       const issueUrl =
-        "https://github.com/Uyoung666/ai-image-manager/issues/new?" +
+        "https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/issues/new?" +
         new URLSearchParams({
           title: `[Bug][v${app.getVersion()}] 启动失败`,
           body,

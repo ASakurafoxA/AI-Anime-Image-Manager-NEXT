@@ -30,6 +30,8 @@ export interface EmbedProgress {
     | "loading"
     | "embedding"
     | "tagging"
+    /** 自用（需求 1）：打标被用户暂停 —— 游标已保留，点"继续"从断点接着打 */
+    | "tagging-paused"
     | "complete"
     | "error"
     | "tag-error"

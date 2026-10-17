@@ -35,6 +35,8 @@ interface SidebarFilterState {
   favoriteOnly: boolean;
   searchDraft: { filters: ExifFilters; query: string };
   searchResetVersion: number;
+  /** 自用（需求 3）：标签筛选是单选还是多选，默认单选。 */
+  tagSelectMode: "single" | "multi";
   tagMode: "and" | "or";
   totalPhotos: number;
 }
@@ -46,6 +48,8 @@ export interface BrowseCriteriaState {
   favoriteOnly: boolean;
   searchDraft: { filters: ExifFilters; query: string };
   searchResetVersion: number;
+  /** 自用（需求 3）：标签筛选是单选还是多选，默认单选。 */
+  tagSelectMode: "single" | "multi";
   tagMode: "and" | "or";
 }
 
@@ -59,7 +63,8 @@ export type BrowseCriteriaAction =
   | { type: "setDraftFilters"; update: SetStateAction<ExifFilters> }
   | { type: "setDraftQuery"; query: string }
   | { type: "toggleTag"; tagId: number | null }
-  | { type: "toggleTagMode" };
+  | { type: "toggleTagMode" }
+  | { type: "toggleTagSelectMode" };
 
 export const initialBrowseCriteriaState: BrowseCriteriaState = {
   activeFolderId: null,
@@ -68,6 +73,8 @@ export const initialBrowseCriteriaState: BrowseCriteriaState = {
   favoriteOnly: false,
   searchDraft: { filters: {}, query: "" },
   searchResetVersion: 0,
+  // 自用（需求 3）：默认单选 —— 点哪个 tag 就只看哪个 tag 的图
+  tagSelectMode: "single",
   tagMode: "or",
 };
 
@@ -154,9 +161,16 @@ export function browseCriteriaReducer(
     case "toggleTag": {
       let activeTagIds: number[] = [];
       if (action.tagId !== null) {
-        activeTagIds = state.activeTagIds.includes(action.tagId)
-          ? state.activeTagIds.filter((id) => id !== action.tagId)
-          : [...state.activeTagIds, action.tagId];
+        if (state.tagSelectMode === "single") {
+          // 自用（需求 3）：单选模式下"点谁就只看谁"；再点同一个 = 取消。
+          activeTagIds = state.activeTagIds.includes(action.tagId)
+            ? []
+            : [action.tagId];
+        } else {
+          activeTagIds = state.activeTagIds.includes(action.tagId)
+            ? state.activeTagIds.filter((id) => id !== action.tagId)
+            : [...state.activeTagIds, action.tagId];
+        }
       }
       return {
         ...state,
@@ -167,6 +181,18 @@ export function browseCriteriaReducer(
     }
     case "toggleTagMode":
       return { ...state, tagMode: state.tagMode === "or" ? "and" : "or" };
+    case "toggleTagSelectMode": {
+      const nextMode = state.tagSelectMode === "single" ? "multi" : "single";
+      return {
+        ...state,
+        // 切回单选时只保留最后点的那一个，避免"看着只选了一个、实际筛了三个"。
+        activeTagIds:
+          nextMode === "single"
+            ? state.activeTagIds.slice(-1)
+            : state.activeTagIds,
+        tagSelectMode: nextMode,
+      };
+    }
     default:
       return state;
   }
@@ -189,6 +215,8 @@ interface SidebarFilterActions {
   toggleFavorites: () => void;
   toggleTag: (tagId: number | null) => void;
   toggleTagMode: () => void;
+  /** 自用（需求 3）：单选 / 多选 切换。 */
+  toggleTagSelectMode: () => void;
 }
 
 type SidebarFilterContextValue = SidebarFilterState & SidebarFilterActions;
@@ -213,6 +241,7 @@ export function SidebarFilterProvider({ children }: { children: ReactNode }) {
     searchDraft,
     searchResetVersion,
     tagMode,
+    tagSelectMode,
   } = criteria;
 
   // --- Sidebar UI state ---
@@ -254,6 +283,10 @@ export function SidebarFilterProvider({ children }: { children: ReactNode }) {
 
   const toggleTagMode = useCallback(() => {
     dispatchCriteria({ type: "toggleTagMode" });
+  }, []);
+
+  const toggleTagSelectMode = useCallback(() => {
+    dispatchCriteria({ type: "toggleTagSelectMode" });
   }, []);
 
   const applySearch = useCallback((search: SearchCriteria) => {
@@ -408,6 +441,7 @@ export function SidebarFilterProvider({ children }: { children: ReactNode }) {
       activeTagIds,
       favoriteOnly,
       tagMode,
+      tagSelectMode,
       collapsed,
       totalPhotos,
       appliedSearch,
@@ -426,6 +460,7 @@ export function SidebarFilterProvider({ children }: { children: ReactNode }) {
       toggleFavorites,
       toggleTag,
       toggleTagMode,
+      toggleTagSelectMode,
       handleAddFolder,
       handleDeleteFolder,
       toggleCollapsed,
@@ -436,6 +471,7 @@ export function SidebarFilterProvider({ children }: { children: ReactNode }) {
       activeTagIds,
       favoriteOnly,
       tagMode,
+      tagSelectMode,
       collapsed,
       totalPhotos,
       appliedSearch,
@@ -453,6 +489,7 @@ export function SidebarFilterProvider({ children }: { children: ReactNode }) {
       toggleFavorites,
       toggleTag,
       toggleTagMode,
+      toggleTagSelectMode,
       handleAddFolder,
       handleDeleteFolder,
       toggleCollapsed,

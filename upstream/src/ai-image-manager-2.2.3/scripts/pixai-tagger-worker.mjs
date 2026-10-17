@@ -171,6 +171,13 @@ function pickOutputs() {
 async function handleInit(message) {
   modelsDir = message.modelsDir;
   const useGPU = Boolean(message.useGPU);
+  // 自用：跟随「设置 → GPU 加速 → 使用显卡」选中的适配器序号。
+  const deviceId =
+    Number.isInteger(message.deviceId) && message.deviceId >= 0
+      ? Number(message.deviceId)
+      : null;
+  const dmlProvider =
+    deviceId === null ? "dml" : { name: "dml", deviceId };
   const dir = path.join(modelsDir, "pixai-tagger-v1.0");
   const modelPath = path.join(dir, "pixai-tagger-v1.0.onnx");
   const configPath = path.join(dir, "config.json");
@@ -186,9 +193,9 @@ async function handleInit(message) {
   const ortNs = loadOrt();
   const providers =
     useGPU && process.platform === "win32" && process.arch === "x64"
-      ? ["dml", "cpu"]
+      ? [dmlProvider, "cpu"]
       : ["cpu"];
-  activeProvider = providers[0];
+  activeProvider = providers[0] === "cpu" ? "cpu" : "dml";
 
   const createSession = (executionProviders) =>
     ortNs.InferenceSession.create(modelPath, {

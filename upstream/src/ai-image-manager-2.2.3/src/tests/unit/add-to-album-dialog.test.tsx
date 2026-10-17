@@ -198,7 +198,7 @@ describe("AddToAlbumDialog", () => {
 
     fireEvent.click(albumButton);
     await waitFor(() => {
-      expect(toast.success).toHaveBeenCalledWith("已添加 2 张照片到「旅行」");
+      expect(toast.success).toHaveBeenCalledWith("已添加 2 张图片到「旅行」");
       expect(onClose).toHaveBeenCalledTimes(1);
     });
   });
@@ -231,7 +231,7 @@ describe("AddToAlbumDialog", () => {
         albumId: 2,
         photoIds: [1, 2],
       });
-      expect(toast.success).toHaveBeenCalledWith("已添加 2 张照片到「新相册」");
+      expect(toast.success).toHaveBeenCalledWith("已添加 2 张图片到「新相册」");
       expect(onClose).toHaveBeenCalledTimes(1);
     });
   });
@@ -290,7 +290,7 @@ describe("AddToAlbumDialog", () => {
     fireEvent.click(albumButton);
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith(
-        "已添加 2 张照片到「已创建相册」"
+        "已添加 2 张图片到「已创建相册」"
       );
       expect(onClose).toHaveBeenCalledTimes(1);
     });

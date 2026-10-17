@@ -9,12 +9,14 @@ import {
   Eye,
   Images,
   RefreshCw,
+  ScanSearch,
   ShieldCheck,
   Trash2,
 } from "lucide-react";
 import {
   memo,
   type ReactNode,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -64,18 +66,66 @@ const DECISION_LABELS = {
 } as const;
 
 function useDuplicatesQuery() {
+  const queryClient = useQueryClient();
+  /*
+   * 自用：**不再一进页面就自动扫描**，但也**不是空白等用户点**。
+   *
+   * 同一个 query 走两条路：
+   *   · 用户还没主动点过 → `getSaved()`：纯只读，把已保存的配对整理成分组，
+   *     很快（不查全部图片、不做 fs.statSync、不算修订号、不新建检测运行）。
+   *   · 用户点过「开始检测 / 重新扫描」→ `scan(false)`：真正的扫描。
+   *
+   * 这样一个 queryKey 就够了，不用维护两份缓存。
+   */
+  const scanStartedRef = useRef(false);
+  const [scanStarted, setScanStarted] = useState(false);
   const query = useQuery({
     queryKey: ["duplicates"],
-    queryFn: () => duplicateActions.scan(false) as Promise<DuplicatesResult>,
+    queryFn: () =>
+      (scanStartedRef.current
+        ? duplicateActions.scan(false)
+        : duplicateActions.getSaved()) as Promise<DuplicatesResult>,
     staleTime: 30_000,
     refetchOnWindowFocus: false,
     retry: false,
   });
+  /** 只标记"已开始"，不触发请求（给「重新扫描」用，它自己有 mutation）。 */
+  const markScanStarted = useCallback(() => {
+    scanStartedRef.current = true;
+    setScanStarted(true);
+  }, []);
+  /** 标记 + 立刻按「扫描」路径取一次（给「开始检测」用）。 */
+  const beginScan = useCallback(async () => {
+    scanStartedRef.current = true;
+    setScanStarted(true);
+    /*
+     * ⚠️ 不能只 `query.refetch()`：进页面那次只读请求可能还在飞，
+     * 同 key 的在飞请求会把 refetch 去重掉，结果扫描根本没发生。
+     * 先取消在飞的，再显式以 staleTime=0 强制取一次。
+     */
+    await queryClient.cancelQueries({ queryKey: ["duplicates"] });
+    try {
+      await queryClient.fetchQuery({
+        queryKey: ["duplicates"],
+        queryFn: () =>
+          duplicateActions.scan(false) as Promise<DuplicatesResult>,
+        staleTime: 0,
+      });
+    } catch {
+      // 失败已经写进 query 状态，由界面上的错误提示展示
+    }
+  }, [queryClient]);
   const initialQueryFailed = query.isError && !query.data;
   return {
     ...query,
+    beginScan,
+    hasSavedResult:
+      (query.data as { hasSavedResult?: boolean } | undefined)
+        ?.hasSavedResult === true,
     initialQueryFailed,
+    markScanStarted,
     queryReady: !(query.isLoading || initialQueryFailed),
+    scanStarted,
   };
 }
 
@@ -741,14 +791,23 @@ export function DuplicatesPage() {
     return () => observer.disconnect();
   }, []);
 
+  /*
+   * 自用：进页面先只读显示上次结果；只有用户点过扫描才开始真扫。
+   * `showStartPanel` = 从来没扫过（连历史结果都没有）→ 显示「开始检测」入口。
+   */
   const {
+    beginScan,
     data,
+    hasSavedResult,
     initialQueryFailed,
     isFetching,
     isLoading,
+    markScanStarted,
     queryReady,
     refetch,
+    scanStarted,
   } = useDuplicatesQuery();
+  const showStartPanel = !(scanStarted || hasSavedResult);
   const groups = data?.groups ?? EMPTY_GROUPS;
   const decisionsByGroup = useMemo(
     () =>
@@ -1243,7 +1302,12 @@ export function DuplicatesPage() {
             <button
               className="flex items-center gap-1.5 rounded-[6px] border border-border px-3 py-1.5 font-medium text-[13px] text-foreground transition-colors hover:bg-foreground/5"
               disabled={scanBusy || reviewBusy}
-              onClick={() => rescan.mutate()}
+              onClick={() => {
+                // 重新扫描：先标记"已开始"（否则结果区会被当成"未开始"），
+                // 再走 forced mutation（它自己会把结果写进 query 缓存）
+                markScanStarted();
+                rescan.mutate();
+              }}
               type="button"
             >
               <RefreshCw
@@ -1357,7 +1421,28 @@ export function DuplicatesPage() {
               DUPLICATES_TOOLBAR_CONTENT_GAP,
           }}
         >
-          {isLoading ? (
+          {showStartPanel ? (
+            /* 自用：没有历史结果时的入口（以前是一进页面就自动扫） */
+            <div className="flex h-full items-center justify-center text-center">
+              <div>
+                <ScanSearch className="mx-auto h-10 w-10 text-muted-foreground/40" />
+                <p className="mt-3 font-medium text-[16px]">
+                  {t("duplicateScanStage_idle")}
+                </p>
+                <p className="mt-2 text-[13px] text-muted-foreground">
+                  {t("duplicateStartScanHint")}
+                </p>
+                <button
+                  className="mt-4 rounded-[6px] bg-primary px-4 py-1.5 font-medium text-[13px] text-white transition-opacity hover:opacity-90"
+                  onClick={beginScan}
+                  type="button"
+                >
+                  {t("startFaceDetectionShort")}
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {!showStartPanel && isLoading ? (
             <div className="space-y-4">
               {[0, 1, 2].map((item) => (
                 <div
@@ -1372,9 +1457,9 @@ export function DuplicatesPage() {
               refetch();
             }}
             retrying={isFetching}
-            visible={initialQueryFailed}
+            visible={!showStartPanel && initialQueryFailed}
           />
-          {queryReady && filteredGroups.length === 0 ? (
+          {!showStartPanel && queryReady && filteredGroups.length === 0 ? (
             <div className="flex h-full items-center justify-center text-center">
               <div>
                 <CheckCircle2 className="mx-auto h-10 w-10 text-success/60" />
@@ -1391,7 +1476,7 @@ export function DuplicatesPage() {
               </div>
             </div>
           ) : null}
-          {queryReady && filteredGroups.length > 0 ? (
+          {!showStartPanel && queryReady && filteredGroups.length > 0 ? (
             <div
               className="relative w-full"
               style={{ height: `${virtualizer.getTotalSize()}px` }}

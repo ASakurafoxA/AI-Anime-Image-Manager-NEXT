@@ -164,8 +164,14 @@ async function handleInit(message) {
   });
   const { InferenceSession } = loadOrt();
   const useDirectML = execution.provider === "directml";
+  const requestedDeviceId =
+    Number.isInteger(execution.deviceId) && execution.deviceId >= 0
+      ? Number(execution.deviceId)
+      : null;
   activeExecutionProvider = useDirectML ? "directml" : "cpu";
-  const executionProviders = useDirectML ? ["dml"] : ["cpu"];
+  const executionProviders = useDirectML
+    ? [requestedDeviceId === null ? "dml" : { name: "dml", deviceId: requestedDeviceId }]
+    : ["cpu"];
   process.send?.({
     type: "init-progress",
     adapterId: activeAdapter.adapterId,
@@ -176,7 +182,12 @@ async function handleInit(message) {
   ortSession = await InferenceSession.create(onnxPath, {
     executionProviders,
     logSeverityLevel: 3,
-    graphOptimizationLevel: useDirectML ? "basic" : "all",
+    // ⚠️ DML 时必须是 "disabled"（2026-10-08 实测）：这个量化过的 SigLIP vision
+    // 模型会让 ORT 1.26 的图优化器在部分环境下**原生崩溃**（0xC0000005，进程直接死），
+    // 而 DML worker 的原生崩溃在进程内接不住，只会让整轮嵌入回退 CPU
+    // （见 embed-worker-pool.ts 的 failGpuPool）。DML 自身的图融合不受此开关影响，
+    // 实测性能无差异。CPU 路径保持 "all" 不变。
+    graphOptimizationLevel: useDirectML ? "disabled" : "all",
     ...(useDirectML
       ? { enableMemPattern: false }
       : { enableCpuMemArena: true }),

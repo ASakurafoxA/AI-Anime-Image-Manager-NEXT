@@ -294,6 +294,26 @@ export const PhotoCard = memo(function PhotoCard({
     return undefined;
   }, [dominantColors]);
 
+  /*
+   * 自用（问题 2）：命中标签的角标数据（名字 + 所属主类颜色）。
+   * 颜色由主进程算好（与标签树同一套规则，见 utils/tag-dot-color.ts）。
+   */
+  const matchTagBadges = useMemo(() => {
+    if (!match || match.kind !== "tagFilter") {
+      return [];
+    }
+    const names = match.tagNames ?? [];
+    const colors = match.tagColors ?? [];
+    // 只有真的拿到颜色时才改成分块渲染（拿不到就沿用原来的单块文案，行为不变）
+    if (!colors.some(Boolean)) {
+      return [];
+    }
+    return names.slice(0, 3).map((name: string, index: number) => ({
+      color: colors[index],
+      name,
+    }));
+  }, [match]);
+
   const searchMatchLabel = useMemo(() => {
     if (!match) {
       return null;
@@ -656,11 +676,31 @@ export const PhotoCard = memo(function PhotoCard({
         </Tooltip>
       )}
 
-      {searchMatchLabel && (
+      {/*
+        自用（问题 2）：命中标签的角标 —— 颜色按**所属主类**来（与标签树/顶部 chips 一致），
+        不再统一用主题色；多个命中标签各自一个色块，方便一眼看出为什么被筛出来。
+      */}
+      {matchTagBadges.length > 0 ? (
+        <div className="absolute top-2 left-2 flex max-w-[calc(100%-1rem)] flex-wrap items-center gap-1">
+          {matchTagBadges.map((badge) => (
+            <span
+              className="truncate rounded-[4px] px-1.5 py-0.5 font-medium text-[10px] text-white backdrop-blur-sm"
+              key={badge.name}
+              style={{
+                backgroundColor: badge.color
+                  ? `color-mix(in srgb, ${badge.color} 78%, black)`
+                  : "color-mix(in srgb, var(--primary) 80%, transparent)",
+              }}
+            >
+              {badge.name}
+            </span>
+          ))}
+        </div>
+      ) : searchMatchLabel ? (
         <div className="absolute top-2 left-2 rounded-[4px] bg-primary/80 px-1.5 py-0.5 font-medium text-[10px] text-white backdrop-blur-sm">
           {searchMatchLabel}
         </div>
-      )}
+      ) : null}
 
       {/* Selection indicator */}
       {isSelected && (
