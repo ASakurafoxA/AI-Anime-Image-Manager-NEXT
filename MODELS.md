@@ -31,8 +31,7 @@
 > 说明（2026-10-18 更新）：
 > - **中文 CLIP 与 WD14 已随安装包提供**（本地版/WD 的 MSI 里两者都在；NEXT 的打标用 PixAI，WD14 不需要）。
 >   只有从源码自己构建、或者要换模型时，才需要按上表手动补。
-> - 以前的 **SigLIP + opus-mt（中译英）+ SFace/YuNet（人脸）已经整体移除**：语义搜索改用中文 CLIP，
->   人脸链路整体删除（角色识别改用 CCIP）✓
+> - 本版只需要三类模型：**中文 CLIP**（语义搜索，随包）、**WD14 或 PixAI**（打标）、**CCIP**（角色识别，可选）✓
 > - **CCIP 是可选模型**，三个版本共用同一个包 `CCIP模型-20261018.zip`（339 MB，含 `model_feat.onnx` + `metrics.json`），
 >   网盘：<https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>　提取码：`6666`　→ 解压到 `<图库>\models\ccip\` ✓
 >   没有它角色识别会自动禁用并提示，其它功能不受影响。
@@ -88,4 +87,4 @@ Get-FileHash "<刚下载的文件>" -Algorithm SHA256
 | `pixai-tagger-v1.0.zip`（仅 NEXT 需要）| `pixai-tagger-v1.0.onnx` + `config.json` | `<图库>\models` |
 
 > **网盘链接（PixAI 模型）**：<https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>　提取码：`6666`
-> 其余几个（WD14 / SigLIP / opus / 人脸）都可以直接走官方源，不必放网盘。
+> 其余模型（中文 CLIP / WD14）都可以直接走官方源，不必放网盘。

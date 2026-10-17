@@ -1,245 +1,57 @@
-# AI Anime Image Manager NEXT（PixAI Tagger v1.0 · 自用修改）
+# AI Anime Image Manager NEXT（PixAI 打标）
 
-> **本项目是「AI Image Manager」的修改版** —— 基于 [Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) **v2.2.3** 修改而来。
-> 上游采用 MIT License（Copyright © 2025 Luan Roger）；本仓库为个人自用修改版，与上游作者无关。
-
-
-> ### 版本关系（2026-10-18 起）
+> **一句话**：本地动漫图库管理器：打标换成 PixAI Tagger v1.0（词表 30,877），语义搜索用中文 CLIP，角色识别用 CCIP；支持局域网/手机网页。
 >
-> | 版本 | 状态 | 打标模型 | 安装包 |
-> |---|---|---|---|
-> | **本地版**（`AI-Anime-Image-Manager`） | **已冻结**（2026-10-18 最后一次同步，不再更新） | WD14 | 713 MB |
-> | **WD**（`AI-Anime-Image-Manager-WD`，**2026-10-18 由 LAN 版改名**） | 持续维护 | WD14 | 713 MB |
-> | **NEXT**（**本仓库**） | 持续维护 | PixAI Tagger v1.0 | 378 MB |
->
-> 三个版本**共用同一个 CCIP 角色识别模型包**：`CCIP模型-20261018.zip`（339 MB）→ 解压到 `<图库>\models\ccip\`。
-> 语义搜索都改用**中文 CLIP**（182 MB，随安装包提供）；旧文档里的 SigLIP / OPUS-MT / SFace / YuNet 均已移除。
+> 基于上游 [Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) v2.2.3（MIT，© 2025 Luan Roger）的**个人自用修改版**，与本仓库作者无关。
 
-基于 **[Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) v2.2.3**（MIT License，Copyright © 2025 Luan Roger）的**个人自用修改版**。
-上游原始源码**不在本仓库里**（50.9 MB，属于构建输入；放在仓库会触发 GitHub 的 50 MB 警告，
-且本项目的三个仓库会重复存三份）。它在 Releases 里作为附件提供：
+## 三个版本怎么选
 
-- 下载：<https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases/download/upstream-v2.2.3/ai-image-manager-v2.2.3.zip>
-- 校验：`Get-FileHash ai-image-manager-v2.2.3.zip -Algorithm SHA256` → `b3679a512ea3298e2693a8d457b5485521aa7e69fe8e50874d89b0564fefc7ee`
-- 页面：<https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases/tag/upstream-v2.2.3>
+| 版本 | 打标模型 | 局域网/手机 | 状态 |
+|---|---|---|---|
+| 本地版（`AI-Anime-Image-Manager`） | WD14（在安装包里） | 无 | **已冻结**（2026-10-18 最后一次更新） |
+| **WD**（`AI-Anime-Image-Manager-WD`，2026-10-18 由 LAN 版改名） | WD14（在安装包里） | **有** | 持续维护 |
+| **NEXT**（`AI-Anime-Image-Manager-NEXT`） | **PixAI Tagger v1.0**（和 NEXT 安装包放同一处） | **有** | 持续维护 |
 
-本仓库内容如下（`upstream/src/` 与 `patches/` 都是文本，体积很小）：
+> 三个版本的**语义搜索**都是中文 CLIP（在安装包里），**角色识别**都用 CCIP（外置模型，三版共用一份）。
 
-```
-（上游原始源码请从上面 Releases 链接下载，仓库内不再保留该 zip）
-upstream/src/ai-image-manager-2.2.3/     ← 本版本的工作树（= 上游 + 补丁）
-patches/                                  ← 相对上游的补丁（干净解压 + git apply 可逐字节还原本工作树）
-```
+## 怎么装（3 步）
 
-## 性能数据从哪来
+1. **装本体**：双击 `AI Anime Image Manager NEXT-2.2.3-20261018.msi`（378 MB，打标模型不进包），按向导走（会要管理员权限）；
+2. **放模型**：把 **PixAI 打标模型**解压到图库的 `models\pixai-tagger-v1.0\`（和 NEXT 安装包放在同一处，约 1.7 GB）
+3. **打开**：开始菜单里的「AI Anime Image Manager NEXT」，先选一个图库文件夹（放你图片的目录）。
 
-本文里的速度 / 命中率 / 体积等数字**都来自本机实测**，不是估算：
+> 角色识别想用的话，还要放 CCIP 模型：见 [CCIP模型安装说明.md](CCIP模型安装说明.md)（339 MB，三版共用）。
 
-| 项目 | 值 |
+## 下载
+
+| 内容 | 地址 |
 |---|---|
-| 显卡 | NVIDIA GeForce RTX 4070 Ti SUPER（DirectML） |
-| CPU | AMD Ryzen 7 9700X |
-| 系统 | Windows，`onnxruntime-node` 1.26（DirectML） |
-| 图库规模 | 约 8 万张动漫插画 |
+| **安装包**（三个版本） | <https://pan.baidu.com/s/1jDBvv4tL9v5_BgYhRDJcGQ?pwd=6666> 提取码 `6666` |
+| **PixAI 打标模型**（只有 NEXT 需要；和 **NEXT 的安装包**放在同一处） | <https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666> 提取码 `6666` |
+| **CCIP 角色识别模型**（三版共用，339 MB，**单独一份**，不和 PixAI 打包在一起） | 见 [CCIP模型安装说明.md](CCIP模型安装说明.md) |
 
-⚠️ **这些数字换一台机器就会变**（尤其 CPU 侧的解码与缩略图，以及显卡的显存大小）。
-按模型不同：WD14 约 **0.23 秒/张**（CPU）、PixAI 约 **0.59 秒/张**（GPU）。
+- 最新版与**历史版本**都在 [Releases](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases)（一版一个 tag，旧版不会被覆盖）；
+- 模型文件的路径、SHA256、许可见 [MODELS.md](MODELS.md)。
 
-**逐条可核对**：每处改动的具体实现都在 `patches/` 里，按提交历史能查到。
+## 更新了什么
 
-## 功能
+见 [CHANGELOG.md](CHANGELOG.md)（最近一次：2026-10-18，新增角色识别、语义搜索换中文 CLIP）。
 
-![主界面（与本地版一致）](screenshots/01-main-interface.png)
+## 功能细节
 
-<p align="center"><em>主界面（与本地版一致）</em></p>
+[功能说明.md](功能说明.md) —— 打标、搜索、角色识别、整理、局域网，逐项说明。
 
-
-### 继承自上游的能力
-
-| 功能 | 说明 |
-|---|---|
-| **图像管理** | 添加任意文件夹，自动索引、生成缩略图、按目录树浏览 |
-| **重复图像识别** | 感知哈希比对，找出重复/近似重复的图，支持分组查看 |
-| **以图搜图** | 用一张图去找相似的图 |
-| **语义搜索** | 用自然语言描述画面找图 |
-| **收藏 / 日期 / 文件夹筛选** | 按时间范围、按目录快速过滤 |
-
-### 本版独有：动漫化标签体系
-
-> 上游的 AI 打标是为**真人摄影**设计的（153 个英文概念），套在动漫插画上产出的是噪声
-> （本机实测出现过「猫咪 42,632 张」）。本版换成 **Danbooru 标签体系**并重建了整个标签系统。
-
-| 功能 | 说明 |
-|---|---|
-| **PixAI 自动打标** | 30,877 个 Danbooru 标签（六分类：通用 / 角色 / 作品系列 / 画风 / 元信息 / 分级） |
-| **角色识别** | 直接认出是哪个角色，落库为 `中文 (english)`，如 **初音未来 (hatsune_miku)**、**鹿目圆 (kaname_madoka)** |
-| **画师 / 角色 / 作品系列中文化** | 覆盖 **10,600+** 条（角色 87% / 作品系列 87% / 画师 25%），来自 [Danbooru 中文对照表](https://github.com/ffdkj/ffdkj-Danbooru_Tag-Chinese-English-Translation-Table)；查不到的**保持罗马音原名，绝不硬造** |
-| **画师汉化只取原名** | 画师**不做翻译** —— 只采用真正的原名（日文汉字名 / 中文名）。外号式（`炸虾人`）、混英文（`大川bkub`）一律丢弃 |
-| **同作品差分区分** | 同一角色的不同差分带标注，如 **初音未来（Append）**、**噶呜·古拉（第一套服装）**；不同作品的重名角色**不额外区分** |
-| **通用标签中文化** | 落库为 `中文 (english)`，如 `长发 (long_hair)` → **中文和英文都能搜** |
-| **标签二级分类** | `通用` 下按 **13 个类型**建目录（头发 / 服装与配饰 / 面部与表情 …），不再平铺 |
-| **只显示有图的标签** | 词表三万个，只渲染库里真正用到的 |
-| **标签黑名单** | 右键移入；集中到面板**底部固定区域**，不随标签树滚动；左键筛选、右键移出；**只影响显示不删数据** |
-| **标签重命名** | 只改中文显示名，**英文标识自动保留在括号里** → 标签身份恒定，中英文检索始终有效 |
-| **标签颜色** | 支持十六进制（`#f97316`、`#f93`）和 RGB（`rgb(249,115,22)`）；一级子树按归属共用颜色 |
-| **批量打标签 / 全库重跑** | 多选批量加标签；「生成 AI 标签」按钮支持全库重跑，**可断点续跑**，手动标签不受影响 |
-
-![标签树：多了「分级」和「作品系列」两个 PixAI 新维度](screenshots/02-tag-tree.png)
-
-<p align="center"><em>标签树：多了「分级」和「作品系列」两个 PixAI 新维度</em></p>
-
-### 本版独有：其他改动
-
-| 功能 | 说明 |
-|---|---|
-| **应用内回收站** | 删除时原文件移入 `<图库>/回收站/`，**30 天自动清理**，可恢复且**恢复后日期不变**；移动失败则不删库记录 |
-| **界面精简** | 隐藏 仪表盘 / 相册 / 选片 / 云端 / 序列 / EXIF 筛选 / 7 个设置页（**代码保留，可恢复**）|
-| **照片右键精简** | 去掉「导出」「添加到相册」；多选时**只剩「收藏」和「删除」**；新增右键「多选」 |
-| **搜索界面精简** | 去掉「试试这样搜索」引导区与示例词（**保留**日期快捷筛选和标签建议）|
-| **监听器精简** | 上游每个子文件夹建一个监听器（本机 4,414 个）→ **只监听根目录** |
-| **开机增量补扫** | 关机期间存进目录的图，开机后自动补上 |
-| **新图自动处理** | 软件开着时存进来的图会自动索引 + 打标 |
-| **以图搜图升级** | 改用 WD14 动漫特征（实测区分同一角色的能力约为通用模型的 **2.7 倍**）|
-| **进度显示修复** | 底部状态栏原来把 `{{remaining}}` **原样显示**出来（漏传参数），已修；同一个任务的**速度与剩余时间现在上下一致**（原来两处各自采样、轮询间隔差 6 倍 → 1.7 vs 2.0 张/秒）|
-| **英文文案修复** | 本季改「照片→图片」时误伤英文插值变量名与一个词条 key，导致英文界面几处**显示空白**或直接显示 `photos`；已全部改回 |
-| **以图搜图特征来源可选** | 缩略图（默认，**快 6 倍**）或原图（更保真）。实测重建向量 **3.3 → 20~22 张/秒**（同一台机、同一模型）|
-| **🆕 GPU 多卡模式** | 设置 → GPU 加速 里可开「多卡模式」：**一张卡一个常驻 worker**，勾几张卡就并行几个任务（最多 3 张）。实测**同一张卡上多开会互相踩**（1 个 1.70 张/秒 vs 2 个 0.82 张/秒），所以一卡一 worker 才有效 |
-| **删掉「AI 占用限制」** | 原滑块是"干一批歇一段"的 PWM 式限速，对**偶发高负载突发**达不到目的（突发那一下照样满占用），已按需求**整体删除** |
-
-> **多卡提示**：只勾独立显卡，**不要勾核显** —— Ryzen 核显算力低一个数量级还要共享内存带宽，
-> 跑 1.86 GB 的模型会**比 8 线程 CPU 还慢**，只会拖慢整体。
-
-
-### 🆕 本版独有（NEXT 版）：识图模型更新
-
-换用 **PixAI Tagger v1.0**（Apache-2.0）替换 WD14，词表从 10,861 扩到 **30,877**，数据截止 **2026 年 5 月**。
-
-| 指标 | WD14 | **PixAI v1.0** |
-|---|---|---|
-| 词表规模 | 10,861 | **30,877** |
-| 普通图角色命中 | 41% | 40%（持平）|
-| **NSFW / 同人角色命中** | **10%** | **30%**（**3 倍**）|
-| 通用标签/张 | 41 | **46.5 ~ 58.5** |
-| **内容分级**（rating）| ❌ 丢弃 | ✅ **100%**（`rating:g/s/q/e`，实测分布合理）|
-| **作品系列**（copyright）| ❌ 无 | ✅ **85% ~ 100%** |
-| **画风**（style）| ❌ 无 | ✅ 有（连画师风格都能认）|
-| 特征维度 | 768 | **1024** |
-
-#### 新增三个维度的价值
-
-| 维度 | 用途 |
-|---|---|
-| **内容分级** | 自动区分 `rating:g/s/q/e` → 可以**只看安全内容**、按分级隔离或筛选 |
-| **作品系列** | 认出 `blue_archive` / `genshin_impact` 这类 IP → **按作品筛选**，比按单个角色更好用 |
-| **画风** | 认出画师风格标签 → 按画风找图 |
-
-#### ⚠️ 两个实际代价（务必知道）
-
-| 代价 | 说明 |
-|---|---|
-| **🔴 新模型建库明显更慢** | 单张 **0.59 秒**（WD14 是 **0.23 秒**，慢约 **2.6 倍**）<br>**8 万张推算约 13.1 小时**（WD14 约 4 小时）<br>**可以随时中断，下次从断点继续** |
-| **模型体积大 5 倍** | 1.86 GB（WD14 是 361 MB）→ 打包体积变大 |
-
-> **首次建库建议**：先放一个子文件夹试跑，确认效果满意再对全库跑。
-> 跑的时候机器可以继续用，只是 AI 处理会占一些资源。
-
-
-### 🖥️ 局域网查看（与 LAN 版相同）
-
-NEXT 版**同样带局域网访问功能，用法与 LAN 版完全一致**：设置里配监听端口 +
-**永久口令 / 临时口令**（临时可选 1/3/6/12/24 小时，默认关闭）；
-同一网段内的手机、平板用浏览器打开 `http://<电脑IP>:<端口>` 即可检索并下载原图；
-**网络端强制只读** —— 禁用删除和标签编辑，由服务端拒绝（不是只藏按钮）。
-
-> 详细说明见 [AI-Anime-Image-Manager-WD](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-WD)（2026-10-18 前叫 LAN 版）。
-
-![局域网访问设置：端口 + 永久/临时双口令（默认关闭）](screenshots/03-lan-access.png)
-
-<p align="center"><em>局域网访问设置：端口 + 永久/临时双口令（默认关闭）</em></p>
-
-#### 网页端长这样（电脑浏览器）
-
-![网页端：图库浏览（右下角可切换 小/中/大/特大 视图尺寸）](screenshots/04-web-gallery-desktop.png)
-
-<p align="center"><em>网页端图库浏览 —— 顶栏可切「小/中/大/特大」视图尺寸、按日期/名称/大小排序</em></p>
-
-![网页端：标签树（默认全部折叠，点哪层展开哪层）](screenshots/05-web-tag-tree-desktop.png)
-
-<p align="center"><em>网页端标签树 —— 默认折叠；标签中文名与桌面端一致</em></p>
-
-#### 手机端
-
-<p align="center">
-  <img src="screenshots/06-web-gallery-mobile.jpg" width="300" style="height:auto" alt="手机端：图库浏览" />
-  &nbsp;&nbsp;&nbsp;
-  <img src="screenshots/07-web-tag-tree-mobile.jpg" width="300" style="height:auto" alt="手机端：标签树" />
-</p>
-
-<p align="center"><em>手机端：图库浏览（左）　标签树（右）</em></p>
-
-## 校验补丁（可复现）
-
-```powershell
-# 1) 解压上游源码，得到 ai-image-manager-2.2.3/
-# 2) 套补丁
-cd ai-image-manager-2.2.3
-git apply --whitespace=nowarn ../patches/next.patch
-# 3) 与 upstream/src/ai-image-manager-2.2.3/ 逐字节比对 → 应完全一致
-```
-本补丁已按上面流程验收：**逐字节全部一致，`git apply` 退出码 0**。
-
-## 下载（网盘）
-
-| 内容 | 链接 |
-|---|---|
-| **安装包（三个版本的 MSI）** | <https://pan.baidu.com/s/1jDBvv4tL9v5_BgYhRDJcGQ?pwd=6666>　提取码：`6666` |
-| **外置模型包（PixAI 打标 + CCIP 角色识别）** | <https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>　提取码：`6666` |
-| 模型（中文 CLIP 语义搜索）| https://huggingface.co/Xenova/chinese-clip-vit-base-patch16 |
-| 模型（CCIP 角色识别，可选）| https://huggingface.co/deepghs/ccip_onnx |
-| 模型（WD14 打标，仅 WD/本地版源码构建时需要）| https://huggingface.co/SmilingWolf/wd-vit-tagger-v3 |
-
-> ⚠️ **版本号仍是 2.2.3**：如果你装过同一版本的旧安装包，请**先卸载旧的、再装新的**（卸载不会删图库和设置）。
-
-### 2026-10-18 这一版的安装包
-
-| 版本 | MSI | 大小 |
-|---|---|---|
-| 本地版（已冻结） | `AI Anime Image Manager-2.2.3-20261018.msi` | 713 MB（WD14 模型在包内）|
-| **WD**（原 LAN 版） | `AI Anime Image Manager WD-2.2.3-20261018.msi` | 713 MB（同上）|
-| **NEXT** | `AI Anime Image Manager NEXT-2.2.3-20261018.msi` | **378 MB**（打标用 PixAI，模型不进包）|
-
-**三个版本共用的 CCIP 模型包**：`CCIP模型-20261018.zip`（339 MB）→ 解压到 `<图库>\models\ccip\` ✓
-
-> 体积说明：本版比上一版小，是因为**换掉了模型**——SigLIP（200 MB）+ OPUS-MT 中译英（90 MB）+ 人脸模型（42 MB）
-> 全部移除，语义搜索改用**中文 CLIP 单文件 182 MB**，人脸链路整条删除（角色识别改用 CCIP，外置）✓
-
-
-## 构建
+## 自己构建
 
 ```powershell
 npm install
-node node_modules/@electron-forge/cli/dist/electron-forge.js make
+node node_modules/@electron-forge/cli/dist/electron-forge.js make --targets @electron-forge/maker-wix
 ```
-> 必须从**纯 ASCII 路径**构建（例如 `F:\AIM-build`），中文/空格路径会让 WiX 的 `light.exe` 失败。
-> 另外两条实测坑（2026-10-18）：
-> ① 打包路径总长**不能超过 260 字符**（`onnxruntime-node` 嵌套太深会撞上）→ 把该依赖提到 `node_modules` 顶层即可；
-> ② `package.json` 的 `description` 必须是**纯 ASCII**（MSI 数据库用 1252 代码页，中文会报 `LGHT0311`）。
-> 打包产物在 `out/make/`（本版只出 **MSI**）。
 
-## 不包含什么（体积原因）
-
-`node_modules/`、`out/`、`models-release/` 都是可再生成的；模型权重（`models/**/*.onnx`，几百 MB 到 1.8 GB）
-与安装包（`*.msi` / `*.nupkg`）不在仓库里 —— 它们走 Releases / 网盘分发。
-
-## 模型文件（不含在仓库里）
-
-下载链接、SHA256 与放置路径见 **[MODELS.md](MODELS.md)**；
-
-## 使用说明
-
-装好之后怎么用（第一次打开、加照片、打标、搜索、局域网手机端、常见问题）见 **[使用说明.md](使用说明.md)**。
+- 必须从**纯 ASCII、尽量短**的路径构建（中文/空格路径会让 WiX 失败；打包路径总长别超过 260 字符）；
+- `package.json` 的 `description` 必须是**纯 ASCII**（MSI 数据库用 1252 代码页）；
+- 详细约定见 [仓库维护规范.md](仓库维护规范.md)。
 
 ## 许可
 
-上游为 MIT，本仓库的修改同样以 MIT 提供，**保留原始版权声明**（见 `upstream/src/ai-image-manager-2.2.3/LICENSE`）。
-这是个人自用修改版，与上游作者无关。
+本项目代码 **MIT**（保留上游版权声明，见 [LICENSE](LICENSE)）；第三方模型各自遵循其许可（中文 CLIP = MIT、WD14 = Apache-2.0、CCIP = MIT、PixAI 未核实 → 只自用不分发），详见 [MODELS.md](MODELS.md) 的许可表。
