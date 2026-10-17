@@ -171,10 +171,16 @@ git apply --whitespace=nowarn ../patches/next.patch
 
 ```powershell
 npm install
-node node_modules/@electron-forge/cli/dist/electron-forge.js make
+# 1) 打包（解出完整的运行目录）
+node node_modules/@electron-forge/cli/dist/electron-forge.js package --platform win32 --arch x64
+# 2) 打 MSI（自写 WiX 源，参数见 仓库维护规范.md）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-msi-wix.ps1 `
+  -ProductName "AI Anime Image Manager NEXT" -ExeName "ai-anime-image-manager-next.exe" -UpgradeCode "2636577f-93de-46c0-8217-f4a360fa2ebf" -Version 2.2.3.0
 ```
-> 必须从**纯 ASCII 路径**构建（例如 `F:\AIM-build`），中文/空格路径会让 WiX 的 `light.exe` 失败。
-> 打包产物在 `out/make/`（WiX 的 MSI，以及 Squirrel 安装包）。
+
+> 产物在 `msi-out/`。**不要**用 `make --targets @electron-forge/maker-wix`：它打出来的包
+> 快捷方式没有图标、目标指向不存在的壳 exe、装完目录是空的（2026-10-18 实测）。
+> 中文/空格路径不影响这套脚本（`heat` + `candle` + `light` 都能处理），但如果路径太长仍建议放 `F:\` 根下。
 
 ## 不包含什么（体积原因）
 
