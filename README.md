@@ -192,8 +192,8 @@ git apply --whitespace=nowarn ../patches/next.patch
 
 | 内容 | 链接 |
 |---|---|
-| **三个版本的直装包（MSI）** | <https://pan.baidu.com/s/17cWEESG8xjdpgqCWtIvsVA?pwd=6666>　提取码：`6666` |
-| **PixAI 模型**（只有本版本需要）| <https://pan.baidu.com/s/1pQvKSz0p1-cRJUQvngDasw?pwd=6666>　提取码：`6666` |
+| **安装包（三个版本的 MSI）** | <https://pan.baidu.com/s/1jDBvv4tL9v5_BgYhRDJcGQ?pwd=6666>　提取码：`6666` |
+| **外置模型包（PixAI 打标 + CCIP 角色识别）** | <https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>　提取码：`6666` |
 | 模型（中文 CLIP 语义搜索）| https://huggingface.co/Xenova/chinese-clip-vit-base-patch16 |
 | 模型（CCIP 角色识别，可选）| https://huggingface.co/deepghs/ccip_onnx |
 | 模型（WD14 打标，仅 WD/本地版源码构建时需要）| https://huggingface.co/SmilingWolf/wd-vit-tagger-v3 |
