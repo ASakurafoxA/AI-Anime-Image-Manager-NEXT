@@ -174,7 +174,7 @@ npm install
 # 1) 打包（解出完整的运行目录）
 node node_modules/@electron-forge/cli/dist/electron-forge.js package --platform win32 --arch x64
 # 2) 打 MSI（自写 WiX 源，参数见 仓库维护规范.md）
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-msi-wix.ps1 `
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-msi-wix.ps1 `
   -ProductName "AI Anime Image Manager NEXT" -ExeName "ai-anime-image-manager-next.exe" -UpgradeCode "2636577f-93de-46c0-8217-f4a360fa2ebf" -Version 2.2.3.0
 ```
 
