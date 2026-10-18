@@ -1603,6 +1603,7 @@ i18n.use(initReactI18next).init({
         aiOpenMirrorSite: "打开镜像站点",
         aiMirrorSettingsHint: "或在下方「AI 镜像设置」中配置",
         aiRetry: "重试",
+        aiStartIndex: "开始 AI 索引",
         aiRebuildIndex: "重建向量索引",
         aiRebuildIndexHint:
           "向量库与当前嵌入模型不兼容（换过模型或旧版本建的索引）。会清空已建向量与「已处理」标记后从头重建，不会动照片和标签。",

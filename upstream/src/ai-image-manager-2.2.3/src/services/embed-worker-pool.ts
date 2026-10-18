@@ -97,6 +97,11 @@ const BATCH_RETRY_LIMIT = 3;
 const RETRY_SLOT_WAIT_MS = 120_000;
 
 let slots: WorkerSlot[] = [];
+/**
+ * 派发轮转游标：旧写法从 0 号 worker 开始找，靠前的卡会被喂满、靠后的卡空闲，
+ * 表现为「一张 52 张/秒、另一张 5 张/秒」。现在从游标往后找，命中后 +1。
+ */
+let dispatchCursor = 0;
 let requestQueue: QueuedRequest[] = [];
 let modelPath: string | null = null;
 let workerAdapter: SerializedWorkerAdapter | null = null;
@@ -622,7 +627,7 @@ function handleWorkerDeath(slot: WorkerSlot): void {
 
 function drainQueue(): void {
   while (requestQueue.length > 0) {
-    const idleSlot = slots.find((s) => s.status === "idle");
+    const idleSlot = pickIdleSlotRotating();
     if (!idleSlot) {
       break;
     }
@@ -998,6 +1003,24 @@ export function initWorkerPool(mp: string, useGPU = false): Promise<void> {
  */
 let dispatchChain: Promise<unknown> = Promise.resolve();
 
+/** 从 dispatchCursor 开始轮转找空闲 worker（避免总是选第一个，导致一张卡吃满）。 */
+function pickIdleSlotRotating(): (typeof slots)[number] | undefined {
+  const total = slots.length;
+  if (total === 0) {
+    return undefined;
+  }
+  const start = dispatchCursor % total;
+  for (let offset = 0; offset < total; offset++) {
+    const index = (start + offset) % total;
+    const slot = slots[index];
+    if (slot && slot.status === "idle") {
+      dispatchCursor = (index + 1) % total;
+      return slot;
+    }
+  }
+  return undefined;
+}
+
 function dispatchBatch(
   photos: Array<{ id: number; path: string }>
 ): Promise<EmbedResult[]> {
@@ -1027,7 +1050,7 @@ function dispatchBatchNow(
       }
       initWorkerPool(modelPath, poolUseGPU)
         .then(() => {
-          const idleSlot = slots.find((s) => s.status === "idle");
+          const idleSlot = pickIdleSlotRotating();
           if (idleSlot) {
             dispatchToSlot(idleSlot, photos, resolve, reject);
           } else {
@@ -1038,7 +1061,7 @@ function dispatchBatchNow(
       return;
     }
 
-    const idleSlot = slots.find((s) => s.status === "idle");
+    const idleSlot = pickIdleSlotRotating();
     if (idleSlot) {
       dispatchToSlot(idleSlot, photos, resolve, reject);
     } else {

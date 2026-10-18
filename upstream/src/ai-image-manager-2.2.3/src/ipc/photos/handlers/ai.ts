@@ -68,6 +68,26 @@ export const startAiIndexing = os.handler(async () => {
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
       releaseGpu("tagging");
+      // 顶栏同步成"已暂停"，否则它还停在"进行中 / 估算中 0%"
+      const tagProgress = getEmbeddingProgress();
+      setCurrentProgress({
+        processed: tagProgress.processed,
+        total: tagProgress.total,
+        phase: "tagging-paused",
+        currentFile: "",
+      });
+      const { BrowserWindow } = require("electron");
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (win.isDestroyed()) {
+          continue;
+        }
+        win.webContents.send("ai-progress", {
+          phase: "tagging-paused",
+          processed: tagProgress.processed,
+          total: tagProgress.total,
+          isPaused: true,
+        });
+      }
     }
     const retryBlocked = tryAcquireGpu("embedding");
     if (retryBlocked) {
@@ -193,6 +213,22 @@ export const pauseTagging = os.handler(async () => {
   const pixaiRunning = isPixaiTaggingRunning();
   const wd14Running = isWd14TaggingRunning();
   if (!(pixaiRunning || wd14Running)) {
+    /*
+     * 2026-10-19：任务没在跑、但界面还停在"正在生成 AI 标签 / 估算中"（例如被建向量抢占，
+     * 或上一轮异常退出）时，点暂停要有反馈：把相位改成 paused，返回 paused: true。
+     */
+    const stale = getEmbeddingProgress();
+    if (
+      stale.phase === "tagging" || stale.phase === "tagging-paused"
+    ) {
+      setCurrentProgress({
+        processed: stale.processed,
+        total: stale.total,
+        phase: "tagging-paused",
+        currentFile: "",
+      });
+      return { paused: true, alreadyStopped: true };
+    }
     return { paused: false };
   }
   const progress = getEmbeddingProgress();
