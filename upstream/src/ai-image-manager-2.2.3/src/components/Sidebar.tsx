@@ -8,6 +8,7 @@
 // biome-ignore-all lint/a11y/useSemanticElements: scoped component lint cleanup preserves existing UI behavior
 // biome-ignore-all lint/style/noNestedTernary: scoped component lint cleanup preserves existing UI behavior
 
+import { AiProgressBar } from "@/components/AiProgressBar";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import {
   Album,
@@ -36,7 +37,14 @@ import {
   X,
 } from "lucide-react";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -133,6 +141,29 @@ function loadResourcePanelWidth() {
     // Use the default width when storage is unavailable.
   }
   return RESOURCE_PANEL_DEFAULT_WIDTH;
+}
+
+/**
+ * 自用（显示问题修复）：把右键菜单夹在窗口内。
+ *
+ * 原来用的是硬编码尺寸估算（160 / 140 / 180），而菜单实际高度能到 250px 以上，
+ * 所以**贴着窗口底部右键时菜单会溢出窗口、显示不全**。
+ * 这里改成用实测尺寸（size 由 useLayoutEffect 量出来）来夹：
+ * 超出下边缘就整体上移，超出右边缘就整体左移，两侧都留 8px 边距。
+ */
+function clampContextMenuPosition(
+  x: number,
+  y: number,
+  size: { height: number; width: number }
+) {
+  const margin = 8;
+  // 还没量到尺寸时用保守的估算值（第一帧之后就会被真实尺寸覆盖）
+  const width = size.width || 160;
+  const height = size.height || 200;
+  return {
+    left: Math.max(margin, Math.min(x, window.innerWidth - width - margin)),
+    top: Math.max(margin, Math.min(y, window.innerHeight - height - margin)),
+  };
 }
 
 function SidebarTooltip({
@@ -319,6 +350,17 @@ export function Sidebar({
     x: number;
     y: number;
   } | null>(null);
+  /**
+   * 自用新增（2026-10，用户要求）：**在软件里重命名文件夹**。
+   * 用户口径："软件里重命名就同步系统文件夹状态" —— 改的是磁盘上的文件夹名
+   * 加图库里的路径记录；照片内部编号不变，所以标签/相册/收藏关联都保住 ✓。
+   */
+  const [renameFolderTarget, setRenameFolderTarget] = useState<{
+    id: number;
+    name: string;
+  } | null>(null);
+  const [renameFolderDraft, setRenameFolderDraft] = useState("");
+  const [renamingFolder, setRenamingFolder] = useState(false);
   // 自用精简版：文件夹黑名单（视图级过滤，不取消索引）状态
   const [hiddenFolders, setHiddenFolders] = useState<{
     paths: string[];
@@ -457,6 +499,8 @@ export function Sidebar({
     x: number;
     y: number;
   } | null>(null);
+  /** 自用：右键菜单的**实测**尺寸，用来把它夹在窗口内（见 clampContextMenuPosition）。 */
+  const [ctxMenuSize, setCtxMenuSize] = useState({ height: 0, width: 0 });
   const [childTagParent, setChildTagParent] = useState<{
     parentId: number;
     parentName: string;
@@ -681,11 +725,24 @@ export function Sidebar({
       }
       if (ancestorsToExpand.size > 0) {
         setExpandedTagIds((prev) => {
+          /*
+           * 自用修正（2026-10，用户实测"搜索标签后一直卡着"）：
+           * **内容没变时必须返回原引用** ✗→✓
+           *
+           * 原来无条件 `new Set(prev)` 再 add —— 即使一个都没新增，引用也变了；
+           * 而本 effect 的依赖里有 `expandedTagIds` → effect 再跑 → 又建新 Set →
+           * **无限重渲染循环**，界面直接卡死。
+           * 这也解释了用户观察到的现象：不搜索走 else 分支、不 setState，所以一点不卡 ✗。
+           */
+          let changed = false;
           const next = new Set(prev);
           for (const id of ancestorsToExpand) {
-            next.add(id);
+            if (!next.has(id)) {
+              next.add(id);
+              changed = true;
+            }
           }
-          return next;
+          return changed ? next : prev;
         });
       }
     } else {
@@ -695,7 +752,13 @@ export function Sidebar({
         preSearchExpandedRef.current = null;
       }
     }
-  }, [debouncedTagSearch, tags, expandedTagIds, hiddenTags]);
+    /*
+     * 依赖里**故意不含 `expandedTagIds`**：本 effect 自己会写它，
+     * 把它列为依赖就会形成"自己触发自己"的循环 ✗。
+     * 读它只是为了记住"搜索前的展开状态"，用当次渲染的闭包值即可 ✓。
+     */
+    // biome-ignore lint/correctness/useExhaustiveDependencies: 见上方说明，故意不监听 expandedTagIds
+  }, [debouncedTagSearch, tags, hiddenTags]);
 
   // Drag-and-drop: keep application photo organization targets local to the sidebar
   function handleSidebarDragOver(e: React.DragEvent) {
@@ -824,9 +887,29 @@ export function Sidebar({
     let running = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
+    /*
+     * 自用（性能 D）：**只有标签视图才需要标签徽标**。
+     *
+     * 文件夹视图下这棵树根本不可见，以前却照样为它去跑那条 4 秒的同步统计 ——
+     * 主进程被堵住，图片区就滑不动（用户口径："图出来了但不能马上上手操作"）。
+     * 切回标签视图时（resourceView 变化）这里会重新跑，徽标照常出现。
+     */
+    if (resourceView !== "tags") {
+      return;
+    }
+
     /** 拉一次标签；返回拿到的标签数量（0 表示还没生成出来）。 */
     async function loadTags(): Promise<number> {
       try {
+        /*
+         * 自用（性能 B）：**先让一步**，让照片列表的 IPC 先被主进程处理。
+         *
+         * 背景（实测日志）：点文件夹时侧边栏会请求"该文件夹的标签徽标"，
+         * 而那条统计是同步 SQL，实测 4106ms，会把主进程堵住 ——
+         * 于是照片列表（本身只要 13ms）排在后面，界面一直等。
+         * 延后 300ms 请求标签，照片就先出来了；徽标随后补上。
+         */
+        await new Promise((resolve) => setTimeout(resolve, 300));
         const result = await ipc.client.photos.getTags({
           folderId: activeFolderId ?? undefined,
         });
@@ -881,7 +964,7 @@ export function Sidebar({
         clearTimeout(timer);
       }
     };
-  }, [totalPhotos, activeFolderId]);
+  }, [totalPhotos, activeFolderId, resourceView]);
 
   useEffect(() => {
     function handler(event: MessageEvent) {
@@ -1196,6 +1279,29 @@ export function Sidebar({
     }
   }
 
+  /*
+   * 自用（显示问题修复）：菜单渲染出来后量一次真实尺寸。
+   * 用 offsetWidth/offsetHeight 而不是 getBoundingClientRect：
+   * 入场动画带 scale，rect 会偏小，量出来会导致夹得不准。
+   * useLayoutEffect 在绘制前完成，所以不会看到"先溢出再跳回来"。
+   */
+  useLayoutEffect(() => {
+    if (!(folderCtx || tagCtx)) {
+      return;
+    }
+    const element = ctxRef.current;
+    if (!element) {
+      return;
+    }
+    const width = element.offsetWidth;
+    const height = element.offsetHeight;
+    setCtxMenuSize((previous) =>
+      previous.width === width && previous.height === height
+        ? previous
+        : { height, width }
+    );
+  }, [folderCtx, tagCtx]);
+
   useEffect(() => {
     if (!(folderCtx || tagCtx)) {
       return;
@@ -1501,6 +1607,43 @@ export function Sidebar({
   ) {
     e.preventDefault();
     setFolderCtx({ folderId, displayName, x: e.clientX, y: e.clientY });
+  }
+
+  /**
+   * 自用新增（2026-10）：提交文件夹重命名。
+   *
+   * 主进程那边会：先校验名字 → 屏蔽 watcher 事件 → 改磁盘 → 事务迁移图库路径；
+   * 任何一步失败都会回滚并返回 `success: false` + 中文原因，这里如实弹出来 ✓。
+   */
+  async function submitFolderRename() {
+    const target = renameFolderTarget;
+    const newName = renameFolderDraft.trim();
+    if (!target || newName.length === 0 || renamingFolder) {
+      return;
+    }
+    setRenamingFolder(true);
+    try {
+      const result = await ipc.client.photos.renameFolder({
+        id: target.id,
+        newName,
+      });
+      if (!result.success) {
+        toast.error(result.error);
+        return;
+      }
+      setRenameFolderTarget(null);
+      if (result.changed) {
+        await queryClient.invalidateQueries({ queryKey: ["folders"] });
+        await queryClient.invalidateQueries({ queryKey: ["photos"] });
+        toast.success(
+          t("renameFolderDone", { name: newName, count: result.photos })
+        );
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRenamingFolder(false);
+    }
   }
 
   // 自用版：载入标签黑名单
@@ -2442,6 +2585,12 @@ export function Sidebar({
                     )}
                     {/* 自用：隐藏「AI 标签由本地模型自动生成，仅供辅助参考」说明
                         （见 private-build.ts 的 hideAiTagUi） */}
+                    {/* 自用：**常驻**语义索引入口。
+                        上游把「开始 AI 索引」放在从未渲染的组件里，导致索引完成/暂停后
+                        用户找不到重新触发的按钮；这里常驻显示（空闲=开始，完成=重新索引，跑着=进度）。 */}
+                    <div className="border-border/60 border-t px-1 pt-1">
+                      <AiProgressBar />
+                    </div>
                     {!PRIVATE_BUILD.hideAiTagUi && (
                       <p className="mt-1 px-1 text-[10px] text-muted-foreground/40">
                         {t("aiTagDisclaimer")}
@@ -2500,10 +2649,11 @@ export function Sidebar({
             data-overlay-kind="context-menu"
             data-surface="overlay"
             ref={ctxRef}
-            style={{
-              left: Math.min(folderCtx.x, window.innerWidth - 160),
-              top: Math.min(folderCtx.y, window.innerHeight - 180),
-            }}
+            style={clampContextMenuPosition(
+              folderCtx.x,
+              folderCtx.y,
+              ctxMenuSize
+            )}
           >
             <div className="truncate px-3 py-1 font-medium text-[10px] text-muted-foreground/70 uppercase tracking-wider">
               {folderCtx.displayName}
@@ -2559,6 +2709,21 @@ export function Sidebar({
               {t("customizeFolderAppearance")}
             </button>
             <button
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-foreground/5"
+              onClick={() => {
+                setRenameFolderTarget({
+                  id: folderCtx.folderId,
+                  name: folderCtx.displayName,
+                });
+                setRenameFolderDraft(folderCtx.displayName);
+                closeCtx();
+              }}
+              type="button"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+              {t("renameFolder")}
+            </button>
+            <button
               className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] text-destructive transition-colors hover:bg-destructive/10"
               onClick={() => {
                 onDeleteFolder(folderCtx.folderId, folderCtx.displayName);
@@ -2600,6 +2765,61 @@ export function Sidebar({
         }}
       />
 
+      {/* 自用（2026-10）：重命名文件夹 —— 同步改磁盘文件夹名 + 图库路径记录 */}
+      <Dialog
+        onOpenChange={(open) => {
+          if (!open) {
+            setRenameFolderTarget(null);
+          }
+        }}
+        open={renameFolderTarget !== null}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("renameFolderTitle")}</DialogTitle>
+            <DialogDescription>
+              {t("renameFolderDescription", {
+                name: renameFolderTarget?.name ?? "",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          <input
+            autoFocus
+            className="w-full rounded-[6px] border border-border bg-secondary px-2 py-1.5 text-[13px] text-foreground outline-none focus:border-foreground/40"
+            disabled={renamingFolder}
+            onChange={(event) => setRenameFolderDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                void submitFolderRename();
+              } else if (event.key === "Escape") {
+                setRenameFolderTarget(null);
+              }
+            }}
+            value={renameFolderDraft}
+          />
+          <DialogFooter>
+            <button
+              className="rounded-[6px] border border-border px-3 py-1.5 text-[12px] text-foreground transition-colors hover:bg-foreground/5"
+              disabled={renamingFolder}
+              onClick={() => setRenameFolderTarget(null)}
+              type="button"
+            >
+              {t("cancel")}
+            </button>
+            <button
+              className="rounded-[6px] bg-primary px-3 py-1.5 text-[12px] text-primary-foreground transition-colors hover:opacity-90 disabled:opacity-50"
+              disabled={
+                renamingFolder || renameFolderDraft.trim().length === 0
+              }
+              onClick={() => void submitFolderRename()}
+              type="button"
+            >
+              {renamingFolder ? t("renameFolderWorking") : t("confirm")}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Tag context menu */}
       {tagCtx &&
         createPortal(
@@ -2608,10 +2828,7 @@ export function Sidebar({
             data-overlay-kind="context-menu"
             data-surface="overlay"
             ref={ctxRef}
-            style={{
-              left: Math.min(tagCtx.x, window.innerWidth - 160),
-              top: Math.min(tagCtx.y, window.innerHeight - 140),
-            }}
+            style={clampContextMenuPosition(tagCtx.x, tagCtx.y, ctxMenuSize)}
           >
             <div className="truncate px-3 py-1 font-medium text-[10px] text-muted-foreground/70 uppercase tracking-wider">
               {tagCtx.tagName}
