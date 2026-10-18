@@ -105,6 +105,17 @@ let poolExecutionProvider: EmbeddingExecutionProvider = "cpu";
 /** 要交给 DirectML 的适配器序号（null = 系统默认适配器，通常是核显）。 */
 let poolDeviceId: number | null = null;
 /** 多卡模式下实际使用的设备清单（每个 worker 一张卡）。 */
+/**
+ * 自用（多卡）：设置变了只打"脏"标记，**不要**在任务跑着的时候关池子
+ * （关池子会让正在跑的任务卡死：批次 promise 没人 resolve，界面就停在"估算中"）。
+ * 下一次 initWorkerPool 时再按要求重建。
+ */
+let poolDirty = false;
+
+/** 标记"下次建向量时按新设置重建池子"。 */
+export function markEmbedPoolDirty(): void {
+  poolDirty = true;
+}
 let poolDevices: Array<number | null> = [];
 /**
  * 自用（多卡·安全闸）：本代池里是否有两个以上 worker 落在**同一张卡**上。
@@ -873,6 +884,13 @@ async function startWorkerPool(
 
 /** Start the persistent worker pool exactly once for a given configuration. */
 export function initWorkerPool(mp: string, useGPU = false): Promise<void> {
+  // 设置变过（多卡/选卡）→ 先按新设置把旧池子关掉再重建
+  if (poolDirty) {
+    poolDirty = false;
+    if (initialized || slots.length > 0) {
+      shutdownPool();
+    }
+  }
   const adapter = getActiveEmbeddingWorkerAdapter(mp);
   const requestedProvider: EmbeddingExecutionProvider = useGPU
     ? "directml"

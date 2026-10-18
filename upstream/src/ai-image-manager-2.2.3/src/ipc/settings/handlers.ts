@@ -703,12 +703,12 @@ export const setGpuSettings = os
       input.enabled !== undefined ||
       input.deviceId !== undefined
     ) {
-      const { shutdownPool } = await import("@/services/embed-worker-pool");
-      try {
-        shutdownPool();
-      } catch {
-        /* 池子没起过就算了 */
-      }
+      const { markEmbedPoolDirty } = await import(
+        "@/services/embed-worker-pool"
+      );
+      // 只打标记：千万不要在任务跑着的时候 shutdownPool —— 会让正在跑的批次
+      // 永远等不到 worker，界面就停在"估算中"（而且暂停也不起作用）。
+      markEmbedPoolDirty();
     }
     return { ok: true };
   });
