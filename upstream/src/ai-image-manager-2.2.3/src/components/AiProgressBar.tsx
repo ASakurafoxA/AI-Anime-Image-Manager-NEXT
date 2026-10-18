@@ -177,6 +177,27 @@ export function AiProgressBar({ disabled = false }: { disabled?: boolean }) {
     }
   }
 
+  /**
+   * 向量库与当前嵌入模型不兼容（升级换模型后常见：`missing-fingerprint`）。
+   * 这时"重试"没用，必须先删掉向量表重建 —— 用 IPC 的 resetAiIndex，
+   * 它会 rebuildVectorDB() + 清掉所有 isAiProcessed 标记，然后再开始索引。
+   */
+  const needsRebuild = Boolean(
+    lastError &&
+      /rebuild|incompatible|fingerprint|vector store/i.test(lastError)
+  );
+
+  async function handleRebuild() {
+    if (disabled) {
+      return;
+    }
+    setLastError(null);
+    await runProgressMutation(async () => {
+      await ipc.client.photos.resetAiIndex({});
+      return ipc.client.photos.startAiIndexing({});
+    });
+  }
+
   async function handleStart() {
     if (disabled) {
       return;
@@ -252,10 +273,11 @@ export function AiProgressBar({ disabled = false }: { disabled?: boolean }) {
 
         <button
           className="mt-2 w-full rounded-[4px] bg-primary/10 px-2 py-1 font-medium text-[11px] text-primary transition-colors hover:bg-primary/20"
-          onClick={handleStart}
+          disabled={isMutating}
+          onClick={needsRebuild ? handleRebuild : handleStart}
           type="button"
         >
-          {t("aiRetry")}
+          {needsRebuild ? t("aiRebuildIndex") : t("aiRetry")}
         </button>
       </div>
     );

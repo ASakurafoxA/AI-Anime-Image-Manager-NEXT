@@ -1601,7 +1601,9 @@ i18n.use(initReactI18next).init({
         aiOpenMirrorSite: "打开镜像站点",
         aiMirrorSettingsHint: "或在下方「AI 镜像设置」中配置",
         aiRetry: "重试",
-        aiStartIndex: "开始 AI 索引",
+        aiRebuildIndex: "重建向量索引",
+        aiRebuildIndexHint:
+          "向量库与当前嵌入模型不兼容（换过模型或旧版本建的索引）。会清空已建向量与「已处理」标记后从头重建，不会动照片和标签。",
         aiIndexComplete: "AI 索引完成 ({{processed}}/{{total}})",
         aiIndexNewPhotos: "索引新图像",
         aiLoadingEmbedding: "正在加载动漫识别模型... {{percent}}%",
@@ -4204,6 +4206,9 @@ i18n.use(initReactI18next).init({
         aiMirrorSettingsHint: 'Or configure in "AI Mirror Settings" below',
         aiRetry: "Retry",
         aiStartIndex: "Start AI Indexing",
+        aiRebuildIndex: "Rebuild vector index",
+        aiRebuildIndexHint:
+          "The vector store was built with a different embedding model. This clears vectors and processed flags, then rebuilds from scratch; photos and tags are untouched.",
         aiIndexComplete: "AI index complete ({{processed}}/{{total}})",
         aiIndexNewPhotos: "Index New Images",
         aiLoadingEmbedding: "Loading anime recognition model... {{percent}}%",

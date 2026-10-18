@@ -3,8 +3,16 @@
 // biome-ignore-all lint/a11y/noNoninteractiveElementInteractions: scoped component lint cleanup preserves existing UI behavior
 // biome-ignore-all lint/a11y/noStaticElementInteractions: scoped component lint cleanup preserves existing UI behavior
 // biome-ignore-all lint/correctness/noUnusedFunctionParameters: scoped component lint cleanup preserves existing UI behavior
-import { useNavigate } from "@tanstack/react-router";
-import { Clock, Filter, ImageUp, Search, X } from "lucide-react";
+import {
+  ClipboardPaste,
+  Clock,
+  Eye,
+  EyeOff,
+  Filter,
+  ImageUp,
+  Search,
+  X,
+} from "lucide-react";
 import { resolveTagDotColor } from "@/components/sidebar-trees";
 import {
   type Dispatch,
@@ -19,6 +27,7 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import { SmoothInput } from "@/components/ui/smooth-input";
 import {
   Tooltip,
@@ -31,11 +40,7 @@ import type {
   ExifFilters,
   SearchMode,
 } from "@/types/search";
-import { toLocalMediaUrl } from "@/utils/local-media-url";
-import {
-  buildPersonTrie,
-  getSearchSuggestions,
-} from "@/utils/search-suggestions";
+import { getSearchSuggestions } from "@/utils/search-suggestions";
 import { cn } from "@/utils/tailwind";
 import { PRIVATE_BUILD } from "@/config/private-build";
 import { FilterBreadcrumb } from "./FilterBreadcrumb";
@@ -75,20 +80,6 @@ const PATH_SEPARATOR_PATTERN = /[\\/]/;
 const MODAL_SURFACE_SELECTOR =
   '[aria-modal="true"], [role="alertdialog"], [data-slot="dialog-content"], [data-slot="alert-dialog-content"]';
 
-interface PersonOption {
-  coverPhotoPath: string | null;
-  coverThumbnailPath: string | null;
-  id: number;
-  name: string;
-}
-
-interface FaceIdentityRecord {
-  coverPhotoPath?: string | null;
-  coverThumbnailPath?: string | null;
-  id: number;
-  name: string;
-}
-
 interface ImageSearchReference {
   imagePath: string;
   previewDataUrl: string | null;
@@ -126,6 +117,9 @@ interface SearchBarProps {
   filterBarLeadingContent?: ReactNode;
   filterBarTrailingContent?: ReactNode;
   filters: ExifFilters;
+  /** 自用：是否在按标签检索时也排除隐藏文件夹（开关在搜索栏右侧）。 */
+  hideHiddenFolders?: boolean;
+  onToggleHideHiddenFolders?: () => void;
   imageSearchActive?: boolean;
   imageSearchReference?: ImageSearchReference;
   leadingContent?: ReactNode;
@@ -158,7 +152,9 @@ export const SearchBar = memo(
         filterBarLeadingContent,
         filterBarTrailingContent,
         filters,
-        imageSearchActive,
+        hideHiddenFolders = false,
+  onToggleHideHiddenFolders,
+  imageSearchActive,
         imageSearchReference,
         leadingContent,
         onFiltersChange: setFilters,
@@ -192,9 +188,8 @@ export const SearchBar = memo(
       const [advancedCategories, setAdvancedCategories] = useState<
         Record<string, string[]>
       >({});
-      // Person identities for search suggestions and AI-powered dictionary suggestions
-      const [personOptions, setPersonOptions] = useState<PersonOption[]>([]);
-      const navigate = useNavigate();
+      // 自用（2026-10-17）：`useNavigate` 原来只用于"人物建议 → 人物详情页"，
+      // 那条链路已随 SFace 移除 → 这里不再需要 ✓
       const [dictSuggestionsEnabled, setDictSuggestionsEnabled] =
         useState(false);
 
@@ -212,44 +207,11 @@ export const SearchBar = memo(
         [t]
       );
 
-      // Fetch person names for search suggestions
-      useEffect(() => {
-        let cancelled = false;
-        (async () => {
-          try {
-            const faceClient = (
-              ipc.client as unknown as {
-                faces?: {
-                  listFaceIdentities: (
-                    input: Record<string, never>
-                  ) => Promise<FaceIdentityRecord[]>;
-                };
-              }
-            ).faces;
-            const result = (await faceClient?.listFaceIdentities({})) ?? [];
-            if (!cancelled && Array.isArray(result)) {
-              const options: PersonOption[] = result
-                .filter((f) => f.name?.trim())
-                .map((f) => ({
-                  id: Number(f.id),
-                  name: f.name.trim(),
-                  coverThumbnailPath: f.coverThumbnailPath ?? null,
-                  coverPhotoPath: f.coverPhotoPath ?? null,
-                }));
-              setPersonOptions(options);
-              const names = options.map((o) => o.name);
-              if (names.length > 0) {
-                buildPersonTrie(names);
-              }
-            }
-          } catch {
-            // Face module may not be ready
-          }
-        })();
-        return () => {
-          cancelled = true;
-        };
-      }, []);
+      // 自用（2026-10-17，用户口径）：**SFace 人脸链路已整体剔除** ✗
+      // 这里原来会通过 `ipc.client.faces.listFaceIdentities` 拉"人物身份"，
+      // 用来在搜索建议里显示人物头像并点击跳转 `/people/$identityId`。
+      // 人物页现在只用 CCIP 三条功能、不再有"身份"这个概念，
+      // 那条 IPC 通道也删了 → 整块去掉 ✓（人物名建议不再出现，其余建议不受影响）
 
       // Enable AI dictionary suggestions once tags are loaded
       useEffect(() => {
@@ -303,7 +265,7 @@ export const SearchBar = memo(
           });
       }, []);
 
-      // Filter suggestions: person names + dictionary + tags + recent searches
+      // Filter suggestions: dictionary + tags + recent searches
       const suggestions = useMemo(() => {
         const q = query.trim().toLowerCase();
         if (!q) {
@@ -312,22 +274,8 @@ export const SearchBar = memo(
 
         const all: SearchSuggestion[] = [];
 
-        // 1) Person name matches
-        const matchingPersons = personOptions
-          .filter((p) => p.name.toLowerCase().includes(q))
-          .slice(0, 3);
+        // 自用（2026-10-17）：人物身份建议已随 SFace 链路一起移除 ✗
         const seen = new Set<string>();
-        for (const p of matchingPersons) {
-          all.push({
-            type: "person",
-            text: p.name,
-            category: "person",
-            id: p.id,
-            coverThumbnailPath: p.coverThumbnailPath,
-            coverPhotoPath: p.coverPhotoPath,
-          });
-          seen.add(p.name.toLowerCase());
-        }
 
         // 2) AI dictionary suggestions (from search-suggestions)
         // Allow single-char for pinyin matching (e.g. "h" → "海")
@@ -365,7 +313,7 @@ export const SearchBar = memo(
         all.push(...matchingHistory);
 
         return all;
-      }, [query, tags, history, personOptions, dictSuggestionsEnabled]);
+      }, [query, tags, history, dictSuggestionsEnabled]);
 
       const examplesDisabled = Boolean(
         aiStatus &&
@@ -383,11 +331,20 @@ export const SearchBar = memo(
       const displayedSuggestions = query.trim()
         ? suggestions
         : [...(examplesDisabled ? [] : searchExamples), ...recentSuggestions];
+      /*
+       * 自用：搜索框为空时，面板里本来只有三类"提示"（搜索示例 / 时间预设 / 最近搜索）✗。
+       * 前两类已被 hideSearchHints 关掉（用户口径："去掉这个提示"），
+       * 所以只剩"最近搜索"——一条都没有时**不要弹空面板** ✓。
+       */
+      const hasEmptyQueryContent =
+        recentSuggestions.length > 0 ||
+        (!examplesDisabled && searchExamples.length > 0) ||
+        !PRIVATE_BUILD.hideSearchHints;
       const showSuggestionPanel =
         showSuggestions &&
         !imageSearchActive &&
         !showFilters &&
-        (!query.trim() || suggestions.length > 0);
+        (query.trim() ? suggestions.length > 0 : hasEmptyQueryContent);
 
       const inputRef = useRef<HTMLInputElement>(null);
       const fileInputRef = useRef<HTMLInputElement>(null);
@@ -400,7 +357,92 @@ export const SearchBar = memo(
       const [failedImagePreviewUrl, setFailedImagePreviewUrl] = useState<
         string | null
       >(null);
-      const imageSearchFileName = imageSearchReference
+      /** 自用：以图搜图输入小窗口是否展开。 */
+  const [imageSearchOpen, setImageSearchOpen] = useState(false);
+  /** 小窗口连同按钮的外层容器：用来判断"点在小窗外面"从而收起。 */
+  const imageSearchWrapRef = useRef<HTMLSpanElement | null>(null);
+
+  /**
+   * 自用：拖进来的图片 —— 优先取它的本地路径（从资源管理器拖）；
+   * 拿不到路径（比如从网页拖来的位图）就退回读剪贴板。
+   */
+  function handleImageDrop(event: React.DragEvent) {
+    event.preventDefault();
+    const file = event.dataTransfer?.files?.[0];
+    const droppedPath = file
+      ? window.electronAPI?.getFilePath?.(file)
+      : undefined;
+    if (droppedPath && onImageSearch) {
+      setImageSearchOpen(false);
+      onImageSearch(droppedPath);
+      return;
+    }
+    void handlePasteImage();
+  }
+
+  /**
+   * 自用：小窗口打开期间，Ctrl+V 直接粘贴、Esc 关闭。
+   * 读的是**系统剪贴板**（走主进程），所以截图/复制的图都能用。
+   */
+  useEffect(() => {
+    if (!imageSearchOpen) {
+      return;
+    }
+    const onPaste = (event: ClipboardEvent) => {
+      const hasImage = Array.from(event.clipboardData?.items ?? []).some(
+        (item) => item.type.startsWith("image/")
+      );
+      if (hasImage) {
+        event.preventDefault();
+        void handlePasteImage();
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setImageSearchOpen(false);
+      }
+    };
+    const onMouseDown = (event: MouseEvent) => {
+      const root = imageSearchWrapRef.current;
+      if (root && !root.contains(event.target as Node)) {
+        setImageSearchOpen(false);
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    window.addEventListener("keydown", onKeyDown);
+    document.addEventListener("mousedown", onMouseDown);
+    return () => {
+      window.removeEventListener("paste", onPaste);
+      window.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("mousedown", onMouseDown);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageSearchOpen]);
+
+  /**
+   * 自用：把剪贴板里的图片交给主进程落成临时文件，再走原来的以图搜图流程。
+   * 为什么要落文件：搜索接口收的是**图片路径**，而剪贴板里只有位图。
+   */
+  async function handlePasteImage() {
+    if (!onImageSearch) {
+      return;
+    }
+    try {
+      const result = (await ipc.client.photos.saveClipboardImage({})) as {
+        path: string | null;
+      };
+      if (result?.path) {
+        onImageSearch(result.path);
+        return;
+      }
+      toast.error(t("pasteImageEmpty"));
+    } catch (error) {
+      console.error("[SearchBar] paste image failed", error);
+      toast.error(t("pasteImageFailed"));
+    }
+  }
+
+  const imageSearchFileName = imageSearchReference
         ? getFileName(imageSearchReference.imagePath)
         : "";
 
@@ -731,15 +773,8 @@ export const SearchBar = memo(
       }
 
       function handleSuggestionClick(suggestion: SearchSuggestion) {
-        if (suggestion.type === "person" && suggestion.id != null) {
-          navigate({
-            to: "/people/$identityId",
-            params: { identityId: String(suggestion.id) },
-          });
-          setShowSuggestions(false);
-          setSuggestionIndex(-1);
-          return;
-        }
+        // 自用（2026-10-17）：人物身份建议已随 SFace 链路移除，
+        // 不再有 `/people/$identityId` 这个页面可跳 ✓
         if (
           suggestion.type === "tag" &&
           suggestion.tagId !== undefined &&
@@ -919,7 +954,15 @@ export const SearchBar = memo(
                 </div>
               )}
               <form
-                className="home-search-form relative xl:max-w-[720px]"
+                /*
+                 * 自用（用户实测反馈）：这里原来写死 `xl:max-w-[720px]`，
+                 * 于是宽屏下搜索框只有 720px、右边空出一大块，而框里"以图搜图 + 长文件名"
+                 * 又挤在一起 ✗。
+                 * 而 `.home-search-form`（global.css）本身就是 `flex: 1 1 0%`，即"占满剩余空间"
+                 * —— 所以把 max-width 放开，空隙自然被搜索框吃掉，右侧那几个按钮随之右移 ✓。
+                 * 只留一个宽松上限，免得超宽屏上拉成一条。
+                 */
+                className="home-search-form relative min-w-0 2xl:max-w-[1100px]"
                 onSubmit={handleSubmit}
               >
                 {imageSearchActive && imageSearchReference ? (
@@ -955,7 +998,12 @@ export const SearchBar = memo(
                             <ImageUp aria-hidden="true" className="h-4 w-4" />
                           )}
                         </span>
-                        <span className="home-image-search-reference-label text-[11px] text-muted-foreground">
+                        {/*
+                          自用（用户实测反馈）："以图搜图"这四个字**不能参与收缩** ✗ ——
+                          否则长文件名会把它挤扁、甚至挤出框外。
+                          这里固定不缩、不换行；让**文件名**去截断（它本来就是 min-w-0 + truncate）✓。
+                        */}
+                        <span className="home-image-search-reference-label shrink-0 whitespace-nowrap text-[11px] text-muted-foreground">
                           {t("searchModeImage")}
                         </span>
                         <span className="home-image-search-reference-name min-w-0 truncate font-medium">
@@ -1067,7 +1115,7 @@ export const SearchBar = memo(
               )}
 
               {onImageSearch && (
-                <>
+                <span className="relative flex items-center" ref={imageSearchWrapRef}>
                   <input
                     accept="image/*"
                     className="hidden"
@@ -1094,18 +1142,94 @@ export const SearchBar = memo(
                             ? "bg-primary/10 text-primary"
                             : "text-muted-foreground/70 hover:bg-foreground/5 hover:text-foreground"
                         }`}
-                        onClick={() => fileInputRef.current?.click()}
+                        onClick={() =>
+                          setImageSearchOpen((previous) => !previous)
+                        }
                         type="button"
                       >
-                        <ImageUp className="h-4 w-4" />
-                        <span className="home-image-search-label">
-                          {t("searchModeImage")}
+                        <span className="flex items-center gap-1.5">
+  <ImageUp className="h-4 w-4" />
+                          <span className="home-image-search-label">
+                            {t("searchModeImage")}
+                          </span>
                         </span>
                       </button>
                     </TooltipTrigger>
                     <TooltipContent>{t("imageSearchTitle")}</TooltipContent>
                   </Tooltip>
-                </>
+                  {/* 自用：隐藏文件夹开关 —— 打开后按标签检索也排除隐藏文件夹里的图片 */}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        aria-label={t("hideHiddenFolderPhotos")}
+                        aria-pressed={hideHiddenFolders}
+                        className={`flex h-9 items-center justify-center gap-1.5 rounded-[6px] px-2.5 text-[12px] transition-colors ${
+                          hideHiddenFolders
+                            ? "bg-primary/10 text-primary"
+                            : "text-muted-foreground/70 hover:bg-foreground/5 hover:text-foreground"
+                        }`}
+                        onClick={onToggleHideHiddenFolders}
+                        type="button"
+                      >
+                        {hideHiddenFolders ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {hideHiddenFolders
+                        ? t("hideHiddenFolderPhotosOn")
+                        : t("hideHiddenFolderPhotosOff")}
+                    </TooltipContent>
+                  </Tooltip>
+                  {/*
+                    自用：以图搜图的输入小窗口 ——
+                      点击按钮展开；窗口内支持 **Ctrl+V 粘贴**、**拖入图片**、
+                      以及「粘贴图片」按钮；**双击窗口**打开文件选择。
+                  */}
+                  {imageSearchOpen && (
+                    <div
+                      className="absolute top-full right-0 z-50 mt-3 w-72 rounded-[8px] border border-border bg-card p-3 shadow-lg"
+                      data-testid="image-search-popover"
+                      onDoubleClick={() => fileInputRef.current?.click()}
+                      onDragOver={(event) => event.preventDefault()}
+                      onDrop={handleImageDrop}
+                    >
+                      {/* 顶部一行：左「粘贴图片」，右关闭 ✕ */}
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <button
+                          className="flex items-center gap-1 rounded-[6px] px-1.5 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10"
+                          data-testid="image-search-paste"
+                          onClick={handlePasteImage}
+                          type="button"
+                        >
+                          <ClipboardPaste className="h-3.5 w-3.5" />
+                          {t("pasteImageFromClipboard")}
+                        </button>
+                        <button
+                          aria-label={t("imageSearchClose")}
+                          className="flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground/70 transition-colors hover:bg-foreground/5 hover:text-foreground"
+                          data-testid="image-search-close"
+                          onClick={() => setImageSearchOpen(false)}
+                          type="button"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      <div className="flex flex-col items-center gap-1 rounded-[6px] border border-foreground/25 border-dashed px-3 py-4 text-center">
+                        <ClipboardPaste className="h-5 w-5 text-muted-foreground/70" />
+                        <span className="text-[11px] text-muted-foreground">
+                          {t("imageSearchDropHint")}
+                        </span>
+                        <span className="text-[10px] text-muted-foreground/60">
+                          {t("imageSearchDoubleClickHint")}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                </span>
               )}
               {/* 自用精简版：隐藏 EXIF 筛选入口（见 src/config/private-build.ts）。
                   该面板的筛选条件全部依赖 EXIF，而动漫/插画库基本没有 EXIF。 */}
@@ -1166,6 +1290,46 @@ export const SearchBar = memo(
                       })}
                     </TooltipContent>
                   </Tooltip>
+                )}
+              {/*
+                自用（2026-10）：**索引入口**。
+                背景：带「开始 AI 索引」按钮的那个组件（AiProgressBar）从未被渲染 ✗，
+                而黄点只是指示灯 ✗ → 用户找不到任何地方能主动开始建索引 ✓。
+                这里放一个小按钮，只在"索引未完成、且当前没在跑"时出现 ✓
+                （正在跑的时候显示"开始"会误导 ✗）。
+                点击：先 resumeAiIndexing（没暂停时返回 resumed=false），不成就 startAiIndexing。
+              */}
+              {/*
+                自用：**常驻**语义索引入口（用户反馈：索引完成后按钮消失，找不到重触发的地方）。
+                · 未完成 → 「开始 AI 索引」（先续跑，没暂停就新开）
+                · 已完成 → 「重建向量索引」（清空向量与已处理标记后重来）
+              */}
+              {aiStatus &&
+                aiStatus.coverageState !== "error" &&
+                !aiStatus.isEmbedding && (
+                  <button
+                    className="flex h-9 flex-shrink-0 items-center gap-1.5 rounded-[6px] px-2.5 text-[12px] text-muted-foreground/70 transition-colors hover:bg-foreground/5 hover:text-foreground"
+                    onClick={() => {
+                      const ready = aiStatus.coverageState === "ready";
+                      const run = ready
+                        ? ipc.client.photos
+                            .resetAiIndex({})
+                            .then(() => ipc.client.photos.startAiIndexing({}))
+                        : ipc.client.photos.resumeAiIndexing({}).then((result) =>
+                            result?.resumed
+                              ? null
+                              : ipc.client.photos.startAiIndexing({})
+                          );
+                      run.catch((error: unknown) => {
+                        console.error("[AI] Failed to start indexing", error);
+                      });
+                    }}
+                    type="button"
+                  >
+                    {aiStatus.coverageState === "ready"
+                      ? t("aiRebuildIndex")
+                      : t("aiStartIndex")}
+                  </button>
                 )}
               {trailingContent && (
                 <div className="home-toolbar-actions ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
@@ -2076,29 +2240,7 @@ export const SearchBar = memo(
                       tabIndex={-1}
                       type="button"
                     >
-                      {s.type === "person" ? (
-                        <>
-                          {s.coverThumbnailPath || s.coverPhotoPath ? (
-                            <img
-                              alt=""
-                              className="h-6 w-6 flex-shrink-0 rounded-full object-cover"
-                              height={24}
-                              src={toLocalMediaUrl(
-                                s.coverThumbnailPath || s.coverPhotoPath || ""
-                              )}
-                              width={24}
-                            />
-                          ) : (
-                            <span className="flex h-6 w-6 flex-shrink-0 items-center justify-center text-[10px]">
-                              👤
-                            </span>
-                          )}
-                          <span className="truncate">{s.text}</span>
-                          <span className="ml-auto flex-shrink-0 rounded-[3px] bg-blue-500/10 px-1 text-[10px] text-blue-500">
-                            人物
-                          </span>
-                        </>
-                      ) : s.type === "dictionary" ? (
+                      {s.type === "dictionary" ? (
                         <>
                           <Search className="h-3 w-3 flex-shrink-0 text-muted-foreground/70" />
                           <span className="truncate">{s.text}</span>
@@ -2130,6 +2272,13 @@ export const SearchBar = memo(
                 </>
               ) : (
                 <>
+                  {/*
+                    自用版（用户口径："去掉这个提示"）：搜索框为空时那条
+                    「今天 / 本周 / 本月 / 今年 / 去年」快捷筛选，属于"搜索提示"，
+                    与下面的「试试这样搜索」引导**同类** —— 一起由 hideSearchHints 关掉 ✓。
+                    （功能本身没删：直接在搜索框里打"今天"这类词，语义搜索照样会解析时间范围 ✓）
+                  */}
+                  {!PRIVATE_BUILD.hideSearchHints && (
                   <div className="flex flex-wrap items-center gap-1.5 border-border border-b px-3 py-2">
                     <Clock className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground/60" />
                     {timePresets.map((preset) => (
@@ -2154,6 +2303,7 @@ export const SearchBar = memo(
                       </button>
                     ))}
                   </div>
+                  )}
                   {/* 自用版：去掉「试试这样搜索」引导区（见 private-build.ts 的 hideSearchHints） */}
                   {!PRIVATE_BUILD.hideSearchHints && (
                     <>
