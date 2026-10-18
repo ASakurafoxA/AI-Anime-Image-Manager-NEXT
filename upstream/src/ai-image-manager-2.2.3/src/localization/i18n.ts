@@ -1694,6 +1694,7 @@ i18n.use(initReactI18next).init({
         multiGpuHintOn:
           "已开启：请在「使用显卡」里勾选要并行的卡（最多 3 张）。每张卡各跑 worker，卡数越多越快；改完保存后，下一次 AI 任务生效。",
         multiGpuCardLabel: "卡{{index}}",
+  multiGpuCardAdapter: "适配器 {{id}}",
         multiGpuCardSpeed: "{{speed}} 张/秒",
         multiGpuCardSpeedIdle: "空闲",
 
@@ -4304,6 +4305,7 @@ i18n.use(initReactI18next).init({
         multiGpuHintOn:
           "On: tick the cards to run in parallel under \"GPU to use\" (up to 3). Each card runs its own workers, so more cards = faster; applies to the next AI task after saving.",
         multiGpuCardLabel: "GPU {{index}}",
+  multiGpuCardAdapter: "Adapter {{id}}",
         multiGpuCardSpeed: "{{speed}} images/s",
         multiGpuCardSpeedIdle: "idle",
 

@@ -221,7 +221,7 @@ export function GpuSettingsCard({
   // 每张卡的实时速度（张/秒）；**长度就是"在用的卡数"**，< 2 时整体不显示
   /** 每张卡的实时速度与显卡名（名字为空时回退到「卡 N」）。 */
   const [perCardSpeeds, setPerCardSpeeds] = useState<
-    Array<{ label: string | null; perSecond: number }>
+    Array<{ deviceId: number | null; label: string | null; perSecond: number }>
   >([]);
 
   // ── Load saved state on mount ──────────────────────────────────────
@@ -291,13 +291,18 @@ export function GpuSettingsCard({
           }
           const speeds = (
             value as {
-              speeds?: Array<{ label?: string | null; perSecond: number }>;
+              speeds?: Array<{
+                deviceId?: number | null;
+                label?: string | null;
+                perSecond: number;
+              }>;
             }
           ).speeds;
           if (!Array.isArray(speeds)) {
             return;
           }
           const values = speeds.map((item) => ({
+            deviceId: item.deviceId ?? null,
             label: item.label ?? null,
             perSecond: item.perSecond ?? 0,
           }));
@@ -310,7 +315,7 @@ export function GpuSettingsCard({
             previous.every(
               (item, index) =>
                 item.perSecond === values[index].perSecond &&
-                item.label === values[index].label
+                item.deviceId === values[index].deviceId
             )
               ? previous
               : values.length >= 2
@@ -615,8 +620,13 @@ export function GpuSettingsCard({
                   className="inline-flex w-fit items-center gap-1 rounded-[4px] border border-border bg-card px-2 py-0.5 text-[11px] text-foreground tabular-nums"
                   key={`card-${index + 1}`}
                 >
-                  <span className="text-muted-foreground/70">
-                    {speed.label ?? t("multiGpuCardLabel", { index: index + 1 })}
+                  <span
+                    className="text-muted-foreground/70"
+                    title={speed.label ?? undefined}
+                  >
+                    {speed.deviceId === null
+                      ? t("multiGpuCardLabel", { index: index + 1 })
+                      : t("multiGpuCardAdapter", { id: speed.deviceId })}
                   </span>
                   <span>
                     {speed.perSecond > 0
