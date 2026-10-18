@@ -820,7 +820,9 @@ async function processBatchParallel(
   tagIds: Map<string, number>,
   workers: number
 ): Promise<{ written: number; failed: number; errorIds: number[] }> {
-  const lanes = Math.max(1, Math.min(workers, rows.length));
+  // 以"当前还活着"的 worker 数为准：中途挂了一个也不会让另一条 lane 等 60s 超时
+  const alive = Math.min(workers, getPixaiWorkerCount());
+  const lanes = Math.max(1, Math.min(alive, rows.length));
   if (lanes === 1) {
     return processBatch(rows, tagIds);
   }
@@ -829,7 +831,20 @@ async function processBatchParallel(
   for (let i = 0; i < rows.length; i += size) {
     parts.push(rows.slice(i, i + size));
   }
-  const results = await Promise.all(parts.map((part) => processBatch(part, tagIds)));
+  // 单条 lane 抛错只算这一份失败，不要把整轮打标一起带走
+  const results = await Promise.all(
+    parts.map((part) =>
+      processBatch(part, tagIds).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        log.error({ error: message, count: part.length }, "PixAI 并发批次失败");
+        return {
+          written: 0,
+          failed: part.length,
+          errorIds: part.map((row) => row.id),
+        };
+      })
+    )
+  );
   return {
     written: results.reduce((sum, item) => sum + item.written, 0),
     failed: results.reduce((sum, item) => sum + item.failed, 0),

@@ -791,14 +791,26 @@ async function startWorkerPool(
   const multiGpuOn = executionProvider === "directml" && isMultiGpuEnabled();
   poolDevices =
     executionProvider === "directml" ? resolveWorkerDevices() : [];
-  poolDevicesAreShared = hasDuplicatedWorkerDevice(poolDevices);
+  /**
+   * 自用（多卡修正 2026-10-18）：
+   *   · 旧逻辑多卡时 `poolSize = 卡数`（=1 卡 1 worker），比单卡默认的 4 个还少 →
+   *     双卡反而更慢；CLIP 嵌入是"每卡多 worker 叠 IO/预处理"才快（单卡 4 个实测 32 张/秒）。
+   *   · 现在多卡 = **每张卡 × 每卡 worker 数**（默认 4），上限 12；
+   *     设备按 i % 卡数 轮转绑卡。
+   *   · 同卡多 worker 对我们**是好事**（不是人脸时代那个"同卡多开会踩"的场景），
+   *     所以不再因为"设备重复"把派发串行化（`poolDevicesAreShared` 恒 false）。
+   */
+  poolDevicesAreShared = false;
   if (multiGpuOn) {
-    poolSize = Math.max(1, Math.min(poolDevices.length, MAX_MULTI_GPU_DEVICES));
+    poolSize = Math.max(
+      1,
+      Math.min(poolDevices.length * Math.max(1, config.workers), 8)
+    );
   } else {
     // 每个 worker ~200MB；单卡时沿用原并发数
     poolSize = config.workers;
   }
-  poolSize = Math.max(1, Math.min(poolSize, MAX_MULTI_GPU_DEVICES));
+  poolSize = Math.max(1, Math.min(poolSize, 8));
   // 自用：批量与 ORT 线程数直接用配置值（原「占用限制」滑块的缩放已整体删除）
   poolBatchSize = config.batchSize;
   poolIntraOpNumThreads = config.intraOpNumThreads;
