@@ -8,7 +8,6 @@
 // biome-ignore-all lint/a11y/useSemanticElements: scoped component lint cleanup preserves existing UI behavior
 // biome-ignore-all lint/style/noNestedTernary: scoped component lint cleanup preserves existing UI behavior
 
-import { AiProgressBar } from "@/components/AiProgressBar";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import {
   Album,
@@ -2585,12 +2584,6 @@ export function Sidebar({
                     )}
                     {/* 自用：隐藏「AI 标签由本地模型自动生成，仅供辅助参考」说明
                         （见 private-build.ts 的 hideAiTagUi） */}
-                    {/* 自用：**常驻**语义索引入口。
-                        上游把「开始 AI 索引」放在从未渲染的组件里，导致索引完成/暂停后
-                        用户找不到重新触发的按钮；这里常驻显示（空闲=开始，完成=重新索引，跑着=进度）。 */}
-                    <div className="border-border/60 border-t px-1 pt-1">
-                      <AiProgressBar />
-                    </div>
                     {!PRIVATE_BUILD.hideAiTagUi && (
                       <p className="mt-1 px-1 text-[10px] text-muted-foreground/40">
                         {t("aiTagDisclaimer")}

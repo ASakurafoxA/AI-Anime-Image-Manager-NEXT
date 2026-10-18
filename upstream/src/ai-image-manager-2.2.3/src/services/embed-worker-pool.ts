@@ -17,6 +17,7 @@ import {
   resolveWorkerDevices,
 } from "@/services/gpu-detector";
 import { trackChildProcess } from "@/services/tracked-child-processes";
+import { createRateMeter, type RateMeter } from "@/services/rate-meter";
 
 interface EmbedResult {
   error?: string;
@@ -55,6 +56,8 @@ interface WorkerSlot {
   pendingReject: ((err: Error) => void) | null;
   pendingResolve: ((results: EmbedResult[]) => void) | null;
   process: ChildProcess;
+  /** 自用（2026-10-17）：这个 worker 的实时速率计（4 秒滑动窗口）✓ */
+  rateMeter?: RateMeter;
   status: WorkerStatus;
   timeoutId?: ReturnType<typeof setTimeout> | null;
 }
@@ -276,6 +279,8 @@ function spawnWorker(index: number, generation: number): WorkerSlot {
     pendingResolve: null,
     pendingReject: null,
     consecutiveFailures: 0,
+    // 自用（2026-10-17）：每张卡的实时速度 —— 每个 worker 一个 4 秒滑动窗口速率计 ✓
+    rateMeter: createRateMeter(4000),
   };
 
   child.stderr?.on("data", (data: Buffer) => {
@@ -382,6 +387,8 @@ function spawnWorker(index: number, generation: number): WorkerSlot {
         reject?.(new Error("Stale embedding worker result discarded"));
       } else {
         try {
+          // 自用（2026-10-17）：记一批的数量，供"每张卡实时速度"统计 ✓
+          slot.rateMeter?.add(message.results?.length ?? 0);
           resolve?.(validateEmbedResults(message.results));
         } catch (error) {
           reject?.(error instanceof Error ? error : new Error(String(error)));
@@ -794,9 +801,11 @@ async function startWorkerPool(
   for (let i = 0; i < poolSize; i++) {
     const slot = spawnWorker(i, generation);
     // 多卡：第 i 个 worker 绑定第 i 张卡（超出部分复用最后一张）
+    // 轮转分配：i % len（旧写法把超出的 worker 全塞到最后一张卡上，
+    // 触发「同卡多开」保护 → 整池串行，看起来就是"两张卡只有一张在干活"）
     slot.deviceId =
       poolDevices.length > 0
-        ? (poolDevices[Math.min(i, poolDevices.length - 1)] ?? null)
+        ? (poolDevices[i % poolDevices.length] ?? null)
         : poolDeviceId;
     slots.push(slot);
 
@@ -1087,6 +1096,35 @@ export function isPoolReady(): boolean {
   return (
     initialized && slots.some((s) => s.status === "idle" || s.status === "busy")
   );
+}
+
+/**
+ * 自用（2026-10-17，多卡）：**每张卡的实时速度**（张/秒）✓
+ *
+ * 一个 worker = 一张卡（多卡模式下一卡一个），所以这里按 deviceId 汇总即可；
+ * 没在跑任务时返回 0（设置页显示"空闲"）。设置页每 3 秒轮询一次。
+ */
+export function getEmbedPerDeviceStats(): Array<{
+  deviceId: number | null;
+  label: string | null;
+  perSecond: number;
+}> {
+  const byDevice = new Map<number | null, number>();
+  for (const slot of slots) {
+    if (slot.status === "dead") {
+      continue;
+    }
+    const key = slot.deviceId ?? poolDeviceId ?? null;
+    byDevice.set(
+      key,
+      (byDevice.get(key) ?? 0) + (slot.rateMeter?.perSecond() ?? 0)
+    );
+  }
+  return [...byDevice.entries()].map(([deviceId, perSecond]) => ({
+    deviceId,
+    label: null,
+    perSecond: Math.round(perSecond * 10) / 10,
+  }));
 }
 
 export function getPoolHealth(): {

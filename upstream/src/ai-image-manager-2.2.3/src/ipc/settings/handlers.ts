@@ -689,6 +689,27 @@ export const setGpuSettings = os
       );
       setSetting(MULTI_GPU_DEVICES_KEY, JSON.stringify(unique));
     }
+    /*
+     * 自用（多卡修复）：设置变了要**让 worker 池重建**。
+     *
+     * 否则池子是按"改设置之前"的卡数/设备表建好的：勾了 2 张卡，池子仍只有 1 个 worker，
+     * 或 4 个 worker 全绑最后一张卡（旧逻辑 `poolDevices[min(i, len-1)]` 会这样）
+     * → 表现就是"一张卡忙、一张卡闲"，总速度只有单卡水平。
+     * 这里调 shutdownPool()，下一次建向量会按新设置重新 init。
+     */
+    if (
+      input.multiGpuEnabled !== undefined ||
+      input.deviceIds !== undefined ||
+      input.enabled !== undefined ||
+      input.deviceId !== undefined
+    ) {
+      const { shutdownPool } = await import("@/services/embed-worker-pool");
+      try {
+        shutdownPool();
+      } catch {
+        /* 池子没起过就算了 */
+      }
+    }
     return { ok: true };
   });
 
