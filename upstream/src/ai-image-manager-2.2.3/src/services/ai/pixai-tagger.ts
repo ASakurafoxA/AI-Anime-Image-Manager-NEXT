@@ -39,6 +39,7 @@ import {
 } from "./pixai-tag-categories";
 import {
   abortPixaiTagger,
+  getPixaiWorkerCount,
   initPixaiTagger,
   isPixaiModelAvailable,
   PIXAI_EMBEDDING_DIM,
@@ -120,14 +121,47 @@ interface PixaiVocabulary {
 
 let running = false;
 let cancelRequested = false;
+/**
+ * 自用（2026-10-17，待办第 5 项）：**真正挂起式暂停** ✓
+ *
+ * 老做法是"取消 + 等它停"：worker 被杀、模型要从显存/内存重载，
+ * 所以"继续"要先花几秒重新初始化 ✗。
+ * 现在：pause = 置这个标志 → **循环在批次边界原地等**，**worker 一个都不杀**（模型一直热着）✓
+ * → 继续时只是把标志清掉，**立刻接着跑** ✓（CPU/GPU 占用降到 0）
+ */
+let suspendRequested = false;
 
 export function isPixaiTaggingRunning(): boolean {
   return running;
 }
 
+/** 自用：是否处于"挂起"状态（循环在原地等，worker 仍活着）✓ */
+export function isPixaiTaggingSuspended(): boolean {
+  return suspendRequested;
+}
+
+/** 自用：挂起（不杀 worker、不丢进度）✓ */
+export function pausePixaiTagging(): void {
+  suspendRequested = true;
+}
+
+/** 自用：恢复（清标志，循环立刻接着跑）✓ */
+export function resumePixaiTagging(): void {
+  suspendRequested = false;
+}
+
+/** 自用：挂起等待（批边界处调用；取消优先于挂起）✓ */
+async function waitWhileSuspended(): Promise<void> {
+  while (suspendRequested && !cancelRequested) {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+}
+
 /** 请求停止本轮打标：批边界会退出循环，worker 也会中止当前批次。 */
 export function cancelPixaiTagging(): void {
   cancelRequested = true;
+  // 自用：取消同时清掉挂起，否则循环会卡在 waitWhileSuspended 里 ✗
+  suspendRequested = false;
   abortPixaiTagger();
 }
 
@@ -775,6 +809,34 @@ function persistResults(
  *  · 想换成原图：把下面的 `row.thumbnailPath || row.path` 改成 `row.path || row.thumbnailPath`
  *    即可（这一处是唯一的入口）。
  */
+/**
+ * 把行按"每卡一份"切开并发跑（多卡才并发；单卡时就是原来的一批）。
+ *
+ * 为什么要这样：每个 worker 绑一张卡，`processBatch` 一次只占一个 worker，
+ * 顺序循环会让第二张卡全程空闲（实测单卡 1.7 张/秒，双卡还是 1.7）。
+ */
+async function processBatchParallel(
+  rows: PhotoRow[],
+  tagIds: Map<string, number>,
+  workers: number
+): Promise<{ written: number; failed: number; errorIds: number[] }> {
+  const lanes = Math.max(1, Math.min(workers, rows.length));
+  if (lanes === 1) {
+    return processBatch(rows, tagIds);
+  }
+  const size = Math.ceil(rows.length / lanes);
+  const parts: PhotoRow[][] = [];
+  for (let i = 0; i < rows.length; i += size) {
+    parts.push(rows.slice(i, i + size));
+  }
+  const results = await Promise.all(parts.map((part) => processBatch(part, tagIds)));
+  return {
+    written: results.reduce((sum, item) => sum + item.written, 0),
+    failed: results.reduce((sum, item) => sum + item.failed, 0),
+    errorIds: results.flatMap((item) => item.errorIds),
+  };
+}
+
 async function processBatch(
   rows: PhotoRow[],
   tagIds: Map<string, number>
@@ -943,7 +1005,9 @@ export async function runPixaiTagging(
       Boolean(options.useGpu),
       getDmlDeviceId(),
       resolveWorkerDevices()
-    );    const tagIds = loadTagIdMap();
+    );    /** 每张卡一个 worker；多卡时按 worker 数并发派发批次（单卡 = 1，行为不变）。 */
+    const pixaiWorkers = getPixaiWorkerCount();
+    const tagIds = loadTagIdMap();
 
     let done = 0;
     let tagged = 0;
@@ -962,13 +1026,19 @@ export async function runPixaiTagging(
         ? ids.slice(0, options.maxPhotos)
         : ids;
       total = limited.length;
-      for (let i = 0; i < limited.length; i += batchSize) {
+      const step = batchSize * pixaiWorkers;
+      for (let i = 0; i < limited.length; i += step) {
         if (cancelRequested) {
           break;
         }
-        const chunk = limited.slice(i, i + batchSize);
+        // 自用（第 5 项）：挂起时在批边界原地等，worker 保持热态 ✓
+        await waitWhileSuspended();
+        if (cancelRequested) {
+          break;
+        }
+        const chunk = limited.slice(i, i + step);
         const rows = loadPhotosByIds(chunk);
-        const batch = await processBatch(rows, tagIds);
+        const batch = await processBatchParallel(rows, tagIds, pixaiWorkers);
         done += chunk.length;
         tagged += batch.written;
         failed += chunk.length - batch.written;
@@ -1007,14 +1077,19 @@ export async function runPixaiTagging(
         if (cancelRequested) {
           break;
         }
+        // 自用（第 5 项）：挂起 → 在批边界原地等（worker 不销毁、模型保持热态）✓
+        await waitWhileSuspended();
+        if (cancelRequested) {
+          break;
+        }
         if (options.maxPhotos && done >= options.maxPhotos) {
           break;
         }
-        const rows = loadPhotosAfterCursor(cursor, batchSize);
+        const rows = loadPhotosAfterCursor(cursor, batchSize * pixaiWorkers);
         if (rows.length === 0) {
           break;
         }
-        const batch = await processBatch(rows, tagIds);
+        const batch = await processBatchParallel(rows, tagIds, pixaiWorkers);
         /*
          * 游标推进策略（与 WD14 版只有一处不同，故意的）：
          *  WD14 无论成败都推进（等于把失败的照片跳过，下一轮也不会重试）。

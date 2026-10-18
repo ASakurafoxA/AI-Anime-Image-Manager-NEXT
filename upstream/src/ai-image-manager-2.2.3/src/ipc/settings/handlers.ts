@@ -695,26 +695,53 @@ export const setGpuSettings = os
 /**
  * 自用（多卡）：每张卡的**实时速度**（张/秒）—— 设置页每 3 秒轮询一次。
  *
- * 现在只有"图像嵌入"这条链会随"每张卡一个 worker"变化，
- * 打标（PixAI）那条的每设备统计接口也一并接上，等有第二张卡即用。
+ * ⚠️ 2026-10-18（会话#9）：SFace 人脸链路已整体剔除，原来第二条来源
+ * `getFacePerDeviceStats()`（人脸 worker 池）**已删除** ✓
+ * 现在角色识别走的是 CCIP（`ccip-embedder`），它的速度由顶栏进度条自己按秒算，
+ * 不走"每卡实时速度"这套，所以这里只剩建向量（CLIP）一条来源。
  */
 export const getGpuSpeeds = os.handler(async () => {
-  const { resolveWorkerDevices } = await import("@/services/gpu-detector");
+  const { resolveWorkerDevices, getCachedDetection } = await import(
+    "@/services/gpu-detector"
+  );
+  const { getEmbedPerDeviceStats } = await import("@/services/embed-worker-pool");
   const { getPixaiPerDeviceStats } = await import(
     "@/services/ai/pixai-tagger-client"
   );
+  /**
+   * 自用（多卡）：三条链路各自有每卡速度 —— 建向量（CLIP）、打标（PixAI）、
+   * 角色识别（CCIP，走顶栏）。这里把前两条都收进来，取每张卡的最大值，
+   * 否则运行打标时设置页会一直显示 0（用户反馈"速度不对劲"就是看到了旧口径）。
+   */
+  const sources = [getEmbedPerDeviceStats(), getPixaiPerDeviceStats()];
+  const cached = getCachedDetection();
+  /** 适配器序号 → 显卡名（下拉框用的是同一份探针结果）。 */
+  const labelFor = (deviceId: number | null): string | null => {
+    if (deviceId === null) {
+      return null;
+    }
+    const adapter = cached?.adapters?.find((item) => item.deviceId === deviceId);
+    return adapter?.name ?? null;
+  };
+  const speedFor = (deviceId: number | null) => {
+    let best = 0;
+    for (const source of sources) {
+      const stat = source.find(
+        (item: { deviceId: number | null; perSecond: number }) =>
+          item.deviceId === deviceId
+      );
+      if (stat && stat.perSecond > best) {
+        best = stat.perSecond;
+      }
+    }
+    return Math.round(best * 10) / 10;
+  };
   const devices = resolveWorkerDevices();
-  const pixai = getPixaiPerDeviceStats();
-  // 没在跑任务时速率计为空 → 速度 0（界面显示"空闲"）
-  const speeds = devices.map((deviceId, index) => {
-    const stat =
-      pixai.find((item) => item.deviceId === deviceId) ?? pixai[index];
-    return {
-      deviceId,
-      label: stat?.label ?? null,
-      perSecond: Math.round((stat?.perSecond ?? 0) * 10) / 10,
-    };
-  });
+  const speeds = devices.map((deviceId) => ({
+    deviceId,
+    label: labelFor(deviceId),
+    perSecond: speedFor(deviceId),
+  }));
   return { speeds };
 });
 

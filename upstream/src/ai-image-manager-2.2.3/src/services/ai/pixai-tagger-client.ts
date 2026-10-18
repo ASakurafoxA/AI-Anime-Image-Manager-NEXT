@@ -718,6 +718,11 @@ export async function tagPhotoBatchPixai(
  * 返回每个 worker（= 每张卡）的适配器序号与当前张/秒。
  * 未在跑任务时速率计为空 → 速度返回 0（界面显示"空闲"）。
  */
+/** 当前可用的 worker 数（= 每张卡一个）；打标循环据此并发派发批次。 */
+export function getPixaiWorkerCount(): number {
+  return Math.max(1, slots.filter((slot) => slot.ready && !slot.dead).length);
+}
+
 export function getPixaiPerDeviceStats(): Array<{
   deviceId: number | null;
   label: string | null;

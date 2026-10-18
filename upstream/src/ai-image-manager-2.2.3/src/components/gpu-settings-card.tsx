@@ -1,5 +1,5 @@
-import { CheckCircle2, MinusCircle, XCircle } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+﻿import { CheckCircle2, MinusCircle, XCircle } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FilterDropdown } from "@/components/filter-dropdown";
 import { AnimatedActionButton } from "@/components/ui/animated-action-button";
@@ -219,7 +219,10 @@ export function GpuSettingsCard({
   // 多卡模式下勾选的适配器序号（字符串形式，与下拉选项对齐）
   const [deviceIds, setDeviceIds] = useState<string[]>([]);
   // 每张卡的实时速度（张/秒）；**长度就是"在用的卡数"**，< 2 时整体不显示
-  const [perCardSpeeds, setPerCardSpeeds] = useState<number[]>([]);
+  /** 每张卡的实时速度与显卡名（名字为空时回退到「卡 N」）。 */
+  const [perCardSpeeds, setPerCardSpeeds] = useState<
+    Array<{ label: string | null; perSecond: number }>
+  >([]);
 
   // ── Load saved state on mount ──────────────────────────────────────
 
@@ -286,19 +289,29 @@ export function GpuSettingsCard({
           if (cancelled) {
             return;
           }
-          const speeds = (value as { speeds?: Array<{ perSecond: number }> })
-            .speeds;
+          const speeds = (
+            value as {
+              speeds?: Array<{ label?: string | null; perSecond: number }>;
+            }
+          ).speeds;
           if (!Array.isArray(speeds)) {
             return;
           }
-          const values = speeds.map((item) => item.perSecond ?? 0);
+          const values = speeds.map((item) => ({
+            label: item.label ?? null,
+            perSecond: item.perSecond ?? 0,
+          }));
           /**
            * 用户要求：**单卡（1 张）完全不显示**；**≥2 张才显示，用几张显示几个**（最多 3 个）。
            * 后端 `getGpuSpeeds` 返回的就是"实际启用的设备"，所以数组长度 = 在用卡数。
            */
           setPerCardSpeeds((previous) =>
             previous.length === values.length &&
-            previous.every((value, index) => value === values[index])
+            previous.every(
+              (item, index) =>
+                item.perSecond === values[index].perSecond &&
+                item.label === values[index].label
+            )
               ? previous
               : values.length >= 2
                 ? [...values]
@@ -349,6 +362,25 @@ export function GpuSettingsCard({
     }
   }, [enabled, onBusyChange, onEnabledChange, t]);
 
+  /*
+   * 自用（2026-10-18 · 会话#9）：**打开设置页时，若"图像嵌入"这一项还没探测过，自动测一次**。
+   * 否则这一行永远显示"未检测"（用户以为坏了），而且他也分不清是没测过还是真的回退 CPU ✓
+   */
+  const autoDetectRef = useRef(false);
+  useEffect(() => {
+    if (!enabled || autoDetectRef.current) {
+      return;
+    }
+    if (detectedInfo?.embeddingDmlAvailable !== undefined && detectedInfo?.embeddingDmlAvailable !== null) {
+      return;
+    }
+    if (detectPhase !== "idle") {
+      return;
+    }
+    autoDetectRef.current = true;
+    void handleDetect();
+  }, [detectPhase, detectedInfo?.embeddingDmlAvailable, enabled, handleDetect]);
+
   // ── Save ───────────────────────────────────────────────────────────
 
   const handleSave = useCallback(async () => {
@@ -395,7 +427,6 @@ export function GpuSettingsCard({
     [onEnabledChange]
   );
 
-  const faceGpuActive = enabled && detectedInfo?.dmlAvailable === true;
   const embeddingGpuActive =
     enabled && detectedInfo?.embeddingDmlAvailable === true;
   // 下拉框只列"真显卡"：虚拟显示适配器（向日葵 / UU 远程 / IDD）用户不需要选。
@@ -413,14 +444,41 @@ export function GpuSettingsCard({
   const hasKnownAdapterList = usableAdapters.length > 0;
   const showAdapterSection =
     enabled && (hasKnownAdapterList || Boolean(detectedInfo?.gpuName));
+  /*
+   * 自用（2026-10-17，用户口径）：**「角色识别」这一行要保留，改成跟 CCIP 走** ✓
+   *
+   * 用户原话：「GPU 测试的问题，**角色识别是需要 GPU 的**」——
+   * 原来这行绑在已删除的人脸检测池上，我一开始把它整行删掉了 ✗；
+   * 但角色识别现在跑的是 **CCIP**，它同样走 DirectML（`provider: "dml"`），
+   * 所以显卡能不能用，判据就是通用 DML 探测结论 `dmlAvailable` ✓
+   * （探针已经改用当前嵌入模型当试金石，不再依赖已删的人脸模型）
+   */
+  const characterGpuActive = enabled && detectedInfo?.dmlAvailable === true;
+  let characterStatusKey = "gpuStatusNotEnabled";
+  if (enabled) {
+    if (detectPhase === "detected-error") {
+      characterStatusKey = "gpuStatusProbeFailed";
+    } else if (detectedInfo?.dmlAvailable === true) {
+      characterStatusKey = "gpuStatusActive";
+    } else {
+      characterStatusKey = "gpuStatusCpuFallback";
+    }
+  }
+  /*
+   * 自用（2026-10-18 · 会话#9 用户反馈「图像嵌入 GPU 未检测到，使用 CPU」）：
+   * 这里原来是"没探测过(null) 也当成 CPU 回退"，于是明明在用显卡却显示成 CPU ✗
+   * 现在三态分开：未探测 / 可用 / 确实回退 ✓
+   */
   let embeddingStatusKey = "gpuStatusNotEnabled";
   if (enabled) {
     if (detectPhase === "detected-error" || detectedInfo?.embeddingError) {
       embeddingStatusKey = "gpuStatusProbeFailed";
     } else if (detectedInfo?.embeddingDmlAvailable === true) {
       embeddingStatusKey = "gpuStatusActive";
-    } else {
+    } else if (detectedInfo?.embeddingDmlAvailable === false) {
       embeddingStatusKey = "gpuStatusCpuFallback";
+    } else {
+      embeddingStatusKey = "gpuStatusNotProbed";
     }
   }
 
@@ -534,7 +592,16 @@ export function GpuSettingsCard({
         */}
         <div className="flex min-w-0 flex-wrap items-start justify-between gap-3 border-border border-t pt-3">
           <div className="space-y-1.5">
-            <FeatureStatusRow active={faceGpuActive} label={t("gpuStatusFace")} />
+            {/*
+              自用（2026-10-17，用户口径）：**角色识别也吃显卡**（CCIP 走 DirectML）✓
+              这一行原来绑在人脸检测池上；人脸链路删掉后它一度被我误删，
+              现已**迁移到 CCIP**：激活/状态都看通用 DML 探测结论 ✓
+            */}
+            <FeatureStatusRow
+              active={characterGpuActive}
+              label={t("gpuStatusCharacter")}
+              statusKey={characterStatusKey}
+            />
             <FeatureStatusRow
               active={embeddingGpuActive}
               label={t("gpuStatusEmbed")}
@@ -549,11 +616,13 @@ export function GpuSettingsCard({
                   key={`card-${index + 1}`}
                 >
                   <span className="text-muted-foreground/70">
-                    {t("multiGpuCardLabel", { index: index + 1 })}
+                    {speed.label ?? t("multiGpuCardLabel", { index: index + 1 })}
                   </span>
                   <span>
-                    {speed > 0
-                      ? t("multiGpuCardSpeed", { speed: speed.toFixed(1) })
+                    {speed.perSecond > 0
+                      ? t("multiGpuCardSpeed", {
+                          speed: speed.perSecond.toFixed(1),
+                        })
                       : t("multiGpuCardSpeedIdle")}
                   </span>
                 </span>
