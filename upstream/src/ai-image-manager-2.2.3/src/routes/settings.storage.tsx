@@ -1,3 +1,4 @@
+import { AiProgressBar } from "@/components/AiProgressBar";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { Check, Copy, Trash2 } from "lucide-react";
@@ -203,6 +204,13 @@ function StorageSettingsPage() {
         <h2 className="font-semibold text-[14px] text-foreground">
           {t("settingsIndexing")}
         </h2>
+        {/* 自用：语义索引入口（开始 / 重建 / 进度 / 暂停），常驻可见、不依赖"未完成"状态 */}
+        <div className="min-w-0 rounded-[8px] border border-border bg-secondary p-3 min-[480px]:p-4">
+          <p className="mb-2 text-[12px] text-muted-foreground">
+            {t("settingsSemanticIndexHint")}
+          </p>
+          <AiProgressBar />
+        </div>
         <div className="min-w-0 rounded-[8px] border border-border bg-secondary p-3 min-[480px]:p-4">
           <SettingRow
             action={

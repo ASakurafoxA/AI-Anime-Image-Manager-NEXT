@@ -6,11 +6,22 @@ import { getActiveTagger, PRIVATE_BUILD } from "@/config/private-build";
 import { releaseGpu, tryAcquireGpu } from "@/services/ai/gpu-queue";
 import { getSetting } from "@/services/settings-manager";
 import { ensureLocalModel } from "@/services/ai/model-loader";
-import { runWd14Tagging, isWd14TaggingRunning, cancelWd14Tagging, getWd14TaggingBaseline } from "@/services/ai/wd14-tagger";
+import {
+  runWd14Tagging,
+  isWd14TaggingRunning,
+  isWd14TaggingSuspended,
+  pauseWd14Tagging,
+  resumeWd14Tagging,
+  cancelWd14Tagging,
+  getWd14TaggingBaseline,
+} from "@/services/ai/wd14-tagger";
 import {
   cancelPixaiTagging,
   getPixaiTaggingBaseline,
   isPixaiTaggingRunning,
+  isPixaiTaggingSuspended,
+  pausePixaiTagging,
+  resumePixaiTagging,
   runPixaiTagging,
 } from "@/services/ai/pixai-tagger";
 import {
@@ -35,18 +46,33 @@ import {
   stopEmbedding,
 } from "@/services/ai-embedder";
 
-export const startAiIndexing = os.handler(() => {
+export const startAiIndexing = os.handler(async () => {
   if (aiControlState !== "idle") {
     return { busy: true, started: false, state: aiControlState };
   }
   /**
    * 自用（第 10 轮·吞吐修复）：建向量与打标**共用同一块显卡**，同时跑会互相拖慢。
-   * 抢不到就明确拒绝（不排队），避免"两边都慢"却看不出原因。
+   *
+   * 2026-10-19 修正（用户口径）：**建向量优先级更高** —— 打标可以挤占建向量，
+   * 但用户点"开始/重建 AI 索引"时必须能把显卡**抢回来**，而不是静默 busy 返回
+   * （表现就是"点了没反应、打标一直在跑、语义搜索一直不可用"）。
+   * 做法：先让打标挂起（批边界停），等它真的停了再拿走 GPU 令牌。
    */
   const gpuBlocked = tryAcquireGpu("embedding");
   if (gpuBlocked) {
-    console.warn(`[AI] 建向量未启动：${gpuBlocked}`);
-    return { busy: true, started: false, reason: gpuBlocked };
+    console.warn(`[AI] 建向量抢占显卡：${gpuBlocked}`);
+    if (isPixaiTaggingRunning()) {
+      pausePixaiTagging();
+      const deadline = Date.now() + 30_000;
+      while (isPixaiTaggingRunning() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      releaseGpu("tagging");
+    }
+    const retryBlocked = tryAcquireGpu("embedding");
+    if (retryBlocked) {
+      return { busy: true, started: false, reason: retryBlocked };
+    }
   }
   embedAllPhotos((aiProgress) => {
     const { BrowserWindow } = require("electron");
@@ -103,6 +129,34 @@ export const cancelAiIndexing = os.handler(async () => {
 
 export const pauseAiIndexing = os.handler(() => {
   pauseEmbedding();
+  /*
+   * 自用（2026-10）：**暂停必须主动推一条进度**。
+   * 暂停只是让循环停下，不会触发任何 ai-progress 推送 ✗ →
+   * 前端拿不到"已暂停"，就把这次任务当成结束了 → 顶栏整条消失 ✗
+   * 这里把带 isPaused 的当前进度推出去，界面才能显示"已暂停 + 继续"。
+   */
+  try {
+    const progress = getEmbeddingProgress();
+    const { BrowserWindow } = require("electron");
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) {
+        continue;
+      }
+      win.webContents.send("ai-progress", {
+        channel: "ai-progress",
+        phase: progress.phase === "idle" ? "embedding" : progress.phase,
+        processed: progress.processed,
+        total: progress.total,
+        isPaused: true,
+      });
+    }
+  } catch (error) {
+    // 推送只是"让顶栏显示已暂停"，失败也必须让暂停本身成功。
+    console.warn(
+      "[AI] Pause progress push failed:",
+      error instanceof Error ? error.message : String(error)
+    );
+  }
   return { paused: true };
 });
 
@@ -141,12 +195,6 @@ export const pauseTagging = os.handler(async () => {
   if (!(pixaiRunning || wd14Running)) {
     return { paused: false };
   }
-  if (pixaiRunning) {
-    cancelPixaiTagging();
-  }
-  if (wd14Running) {
-    cancelWd14Tagging();
-  }
   const progress = getEmbeddingProgress();
   setCurrentProgress({
     processed: progress.processed,
@@ -154,6 +202,21 @@ export const pauseTagging = os.handler(async () => {
     phase: "tagging-paused",
     currentFile: "",
   });
+  /*
+   * 自用（2026-10-17，待办第 5 项）：**真正挂起式暂停** ✓
+   * PixAI：只置挂起标志 —— 循环在批边界原地等，**worker 一个都不杀、模型一直是热的**，
+   * 所以"继续"是**秒接**（以前要取消 + 等停 + 重新初始化，几秒钟）✓
+   * WD14（另外两版用）：仍走老的"取消"路径（它没有挂起实现），行为不变 ✓
+   */
+  if (pixaiRunning) {
+    pausePixaiTagging();
+    return { paused: true, suspended: true };
+  }
+  // 自用（2026-10-17）：WD14 也改成**挂起**（不杀 worker、继续秒接）✓
+  if (wd14Running) {
+    pauseWd14Tagging();
+    return { paused: true, suspended: true };
+  }
   const stopped = await waitForTaggingToStop();
   return { paused: true, stopped };
 });
@@ -161,6 +224,28 @@ export const pauseTagging = os.handler(async () => {
 export const resumeAiIndexing = os.handler(() => {
   if (!resumeEmbedding()) {
     return { resumed: false, state: aiControlState };
+  }
+  try {
+    // 自用（2026-10）：恢复时也推一条，顶栏立刻从"已暂停"回到"运行中"。
+    const progress = getEmbeddingProgress();
+    const { BrowserWindow } = require("electron");
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) {
+        continue;
+      }
+      win.webContents.send("ai-progress", {
+        channel: "ai-progress",
+        phase: progress.phase === "idle" ? "embedding" : progress.phase,
+        processed: progress.processed,
+        total: progress.total,
+        isPaused: false,
+      });
+    }
+  } catch (error) {
+    console.warn(
+      "[AI] Resume progress push failed:",
+      error instanceof Error ? error.message : String(error)
+    );
   }
   // 自用（第 10 轮·吞吐修复）：恢复建向量同样要抢显卡
   const gpuBlocked = tryAcquireGpu("embedding");
@@ -244,6 +329,18 @@ export const resetAiIndex = os.handler(async () => {
 let taggingRunToken = 0;
 
 export const batchGenerateTags = os.handler(async () => {
+  /*
+   * 自用（2026-10-17，待办第 5 项）：**挂起中再点"继续" = 恢复，不是开新的一轮** ✓
+   * 否则会撞上后面的 busy 判断（`isPixaiTaggingRunning()` 仍为 true）→ 界面"点了没反应" ✗
+   */
+  if (isPixaiTaggingSuspended()) {
+    resumePixaiTagging();
+    return { resumed: true, skipped: 0, tagged: 0, total: 0 };
+  }
+  if (isWd14TaggingSuspended()) {
+    resumeWd14Tagging();
+    return { resumed: true, skipped: 0, tagged: 0, total: 0 };
+  }
   if (
     aiControlState !== "idle" ||
     isAutoTaggingActive() ||

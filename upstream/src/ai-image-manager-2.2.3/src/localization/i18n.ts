@@ -1067,6 +1067,8 @@ i18n.use(initReactI18next).init({
         noResults: "无结果",
         settingsDependencies: "开源依赖",
         settingsIndexing: "索引",
+  settingsSemanticIndexHint:
+    "语义搜索/以图搜图依赖向量索引。没建过或换过模型时，点下面的「重建向量索引」；打标会先被挂起，把显卡让给建向量。",
         settingsThumbnailCache: "缩略图缓存",
         settingsThumbnailCacheHint:
           "用于快速显示图片预览；同一图片可能因不同尺寸或对比预览占用多个文件。清除后浏览图片时会按需重新生成。",
@@ -3629,6 +3631,8 @@ i18n.use(initReactI18next).init({
         noResults: "No results",
         settingsDependencies: "Open Source Dependencies",
         settingsIndexing: "Indexing",
+  settingsSemanticIndexHint:
+    "Semantic search depends on the vector index. Use “Rebuild vector index” after changing models; tagging is suspended first so the GPU is free.",
         settingsThumbnailCache: "Thumbnail Cache",
         settingsThumbnailCacheHint:
           "Used for fast image previews; one image may have multiple files for different sizes or comparison previews. Cleared files are regenerated on demand when images are viewed.",

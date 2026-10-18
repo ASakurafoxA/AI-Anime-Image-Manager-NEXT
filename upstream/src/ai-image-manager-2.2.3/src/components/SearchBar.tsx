@@ -1304,14 +1304,15 @@ export const SearchBar = memo(
                 · 未完成 → 「开始 AI 索引」（先续跑，没暂停就新开）
                 · 已完成 → 「重建向量索引」（清空向量与已处理标记后重来）
               */}
-              {aiStatus &&
-                aiStatus.coverageState !== "error" &&
-                !aiStatus.isEmbedding && (
+              {aiStatus && !aiStatus.isEmbedding && (
                   <button
                     className="flex h-9 flex-shrink-0 items-center gap-1.5 rounded-[6px] px-2.5 text-[12px] text-muted-foreground/70 transition-colors hover:bg-foreground/5 hover:text-foreground"
                     onClick={() => {
-                      const ready = aiStatus.coverageState === "ready";
-                      const run = ready
+                      // ready / error 都走"先清空再重建"；未完成才走续跑
+                      const rebuild =
+                        aiStatus.coverageState === "ready" ||
+                        aiStatus.coverageState === "error";
+                      const run = rebuild
                         ? ipc.client.photos
                             .resetAiIndex({})
                             .then(() => ipc.client.photos.startAiIndexing({}))
@@ -1326,7 +1327,8 @@ export const SearchBar = memo(
                     }}
                     type="button"
                   >
-                    {aiStatus.coverageState === "ready"
+                    {aiStatus.coverageState === "ready" ||
+                    aiStatus.coverageState === "error"
                       ? t("aiRebuildIndex")
                       : t("aiStartIndex")}
                   </button>
