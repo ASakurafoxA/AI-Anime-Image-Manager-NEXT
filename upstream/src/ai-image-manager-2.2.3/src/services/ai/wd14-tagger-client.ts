@@ -64,6 +64,11 @@ interface PendingBatch {
   timer: NodeJS.Timeout;
 }
 
+/**
+ * 轮转游标：旧实现每次都从 slots[0] 找空闲 worker，
+ * 多卡时列表靠前的卡会被喂满、靠后的卡闲着（一张快一张慢的假象）。
+ */
+let slotRotationCursor = 0;
 let slots: WorkerSlot[] = [];
 let slotPending = new Map<number, PendingBatch>();
 let initPromise: Promise<void> | null = null;
@@ -253,8 +258,16 @@ export function isWd14TaggerReady(): boolean {
 
 /** 取一个空闲且存活的槽位；没有则返回 null。 */
 function pickIdleSlot(): WorkerSlot | null {
-  for (const slot of slots) {
-    if (slot.ready && !slot.dead && !slotPending.has(slot.index)) {
+  const total = slots.length;
+  if (total === 0) {
+    return null;
+  }
+  const start = slotRotationCursor % total;
+  for (let offset = 0; offset < total; offset++) {
+    const index = (start + offset) % total;
+    const slot = slots[index];
+    if (slot && slot.ready && !slot.dead && !slotPending.has(slot.index)) {
+      slotRotationCursor = (index + 1) % total;
       return slot;
     }
   }
