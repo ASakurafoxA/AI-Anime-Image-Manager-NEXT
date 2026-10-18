@@ -2,7 +2,7 @@
   "name": "ai-anime-image-manager",
   "productName": "AI Anime Image Manager NEXT",
   "version": "2.2.3",
-  "description": "100% 本地 AI 图片管理器 — 自然语言搜索、智能去重、自动标签、人脸识别、云端分享",
+  "description": "Local AI image manager: semantic search, duplicate detection, AI tagging, character recognition",
   "main": ".vite/build/bootstrap.js",
   "type": "module",
   "private": true,
