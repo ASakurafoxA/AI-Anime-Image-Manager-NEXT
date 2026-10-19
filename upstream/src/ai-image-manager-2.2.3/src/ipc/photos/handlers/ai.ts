@@ -198,6 +198,35 @@ export const pauseAiIndexing = os.handler(() => {
  *  2. 取消是**异步**的（循环要在批次边界退出）。必须等它真正停下来再返回，
  *     否则用户紧接着点"继续"仍会撞上 `isPixaiTaggingRunning()` 的 busy 判断。
  */
+/**
+ * 把打标的相位立刻推给所有窗口。
+ *
+ * 为什么需要：暂停/继续原来只改主进程内存里的进度，界面要等下一条轮询才更新，
+ * 用户会觉得"点了没反应"。这里主动 send 一条。
+ */
+function broadcastTaggingPhase(
+  phase: "tagging" | "tagging-paused",
+  processed: number,
+  total: number
+): void {
+  try {
+    const { BrowserWindow } = require("electron");
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) {
+        continue;
+      }
+      win.webContents.send("ai-progress", {
+        phase,
+        processed,
+        total,
+        isPaused: phase === "tagging-paused",
+      });
+    }
+  } catch {
+    /* 没有窗口（无头测试）时忽略 */
+  }
+}
+
 async function waitForTaggingToStop(timeoutMs = 8000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -238,6 +267,8 @@ export const pauseTagging = os.handler(async () => {
     phase: "tagging-paused",
     currentFile: "",
   });
+  // 立刻推一条，别让界面等轮询（用户反馈"点暂停没反应"常常就是慢了半拍）
+  broadcastTaggingPhase("tagging-paused", progress.processed, progress.total);
   /*
    * 自用（2026-10-17，待办第 5 项）：**真正挂起式暂停** ✓
    * PixAI：只置挂起标志 —— 循环在批边界原地等，**worker 一个都不杀、模型一直是热的**，
@@ -371,6 +402,8 @@ export const batchGenerateTags = os.handler(async () => {
    */
   if (isPixaiTaggingSuspended()) {
     resumePixaiTagging();
+    const p = getEmbeddingProgress();
+    broadcastTaggingPhase("tagging", p.processed, p.total);
     return { resumed: true, skipped: 0, tagged: 0, total: 0 };
   }
   if (isWd14TaggingSuspended()) {
