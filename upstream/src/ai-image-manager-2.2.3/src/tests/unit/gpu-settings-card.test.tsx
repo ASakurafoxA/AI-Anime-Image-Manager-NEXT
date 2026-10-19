@@ -101,6 +101,12 @@ describe("GpuSettingsCard", () => {
     });
   });
 
+  /*
+   * 自用（2026-10-17，用户口径）：「**角色识别是需要 GPU 的**」——
+   * 这一行从人脸检测池**迁移到 CCIP**：判据是通用 DML 探测结论 `dmlAvailable` ✓
+   * 下面这条只给 `dmlAvailable: true`（**不给** embeddingDmlAvailable），
+   * 能出现「GPU 加速中」就说明「角色识别」那行确实是靠 dmlAvailable 亮起来的 ✓
+   */
   it("shows the detected real GPU name without changing DirectML status", async () => {
     vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
       detected: {
@@ -124,6 +130,9 @@ describe("GpuSettingsCard", () => {
         screen.getByText("NVIDIA GeForce RTX 4060 Laptop GPU")
       ).toBeInTheDocument();
     });
+    // 两个状态行都在：角色识别（CCIP）+ 图像嵌入
+    expect(screen.getByText("gpuStatusCharacter")).toBeInTheDocument();
+    expect(screen.getByText("gpuStatusEmbed")).toBeInTheDocument();
     expect(screen.getByText("gpuStatusActive")).toBeInTheDocument();
   });
 
@@ -156,7 +165,7 @@ describe("GpuSettingsCard", () => {
    * ⚠️ 原「AI 占用限制」滑块已按用户要求**整体删除**（PWM 式限速对偶发高负载没用），
    * 所以这条测试只再校验"特征来源"与多卡字段是否随保存一起发出。
    */
-  it("saves the feature source together with the multi-GPU fields", async () => {
+  it("saves the feature source together with the selected GPU", async () => {
     render(<GpuSettingsCard />);
 
     // 默认缩略图（快）：下拉框有选项可开
@@ -172,8 +181,6 @@ describe("GpuSettingsCard", () => {
         deviceId: "auto",
         enabled: false,
         searchImageSource: "thumbnail",
-        deviceIds: [],
-        multiGpuEnabled: false,
       });
     });
   });
@@ -192,8 +199,6 @@ describe("GpuSettingsCard", () => {
         deviceId: "auto",
         enabled: false,
         searchImageSource: "original",
-        deviceIds: [],
-        multiGpuEnabled: false,
       });
     });
   });
@@ -203,90 +208,4 @@ describe("GpuSettingsCard", () => {
    * 原来「使用显卡」+ 多卡开关会因为 `usableAdapters.length > 0` 不成立而**整段消失**
    * （用户截图就是这个）。现在只要还记得显卡名字，这一块就要显示出来。
    */
-  it("keeps the adapter and multi-GPU controls when a failed probe wiped the adapter list", async () => {
-    vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
-      detected: {
-        dmlAvailable: false,
-        embeddingDmlAvailable: false,
-        embeddingError: "Probe worker exited unexpectedly",
-        gpuName: "NVIDIA GeForce RTX 4070 Ti SUPER",
-        probeTimeMs: 1637,
-      },
-      deviceId: "auto",
-      deviceIds: [],
-      effectiveDevices: [2],
-      enabled: true,
-      multiGpuEnabled: false,
-      promptShown: true,
-      searchImageSource: "thumbnail",
-    });
-
-    render(<GpuSettingsCard />);
-
-    // 两块都必须还在
-    expect(await screen.findByLabelText("gpuAdapterTitle")).toBeInTheDocument();
-    expect(screen.getByLabelText("multiGpuTitle")).toBeInTheDocument();
-  });
-
-  /**
-   * 用户明确要求：**只用 1 张卡时完全不显示每卡速度**（顶上已有总速度，重复没意义）。
-   */
-  it("hides the per-card speeds when only one GPU is in use", async () => {
-    vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
-      detected: { dmlAvailable: true, gpuName: "Test GPU", probeTimeMs: 12 },
-      deviceId: "2",
-      deviceIds: [2],
-      effectiveDevices: [2],
-      enabled: true,
-      multiGpuEnabled: false,
-      promptShown: true,
-      searchImageSource: "thumbnail",
-    });
-    vi.mocked(ipc.client.settings.getGpuSpeeds).mockResolvedValue({
-      speeds: [{ deviceId: 2, label: null, perSecond: 12.3 }],
-    });
-
-    render(<GpuSettingsCard />);
-
-    // 等状态行渲染出来（说明轮询也回来了）
-    expect(await screen.findByText("gpuStatusFace")).toBeInTheDocument();
-    await waitFor(() => {
-      expect(ipc.client.settings.getGpuSpeeds).toHaveBeenCalled();
-    });
-    expect(screen.queryByText("multiGpuCardLabel")).toBeNull();
-  });
-
-  /**
-   * 用户明确要求：**≥2 张才显示，用几张显示几个**（最多 3 张）。
-   */
-  it("shows exactly as many per-card speeds as GPUs in use", async () => {
-    vi.mocked(ipc.client.settings.getGpuSettings).mockResolvedValue({
-      detected: { dmlAvailable: true, gpuName: "Test GPU", probeTimeMs: 12 },
-      deviceId: "2",
-      deviceIds: [2, 3],
-      effectiveDevices: [2, 3],
-      enabled: true,
-      multiGpuEnabled: true,
-      promptShown: true,
-      searchImageSource: "thumbnail",
-    });
-    vi.mocked(ipc.client.settings.getGpuSpeeds).mockResolvedValue({
-      speeds: [
-        { deviceId: 2, label: null, perSecond: 11.1 },
-        { deviceId: 3, label: null, perSecond: 22.2 },
-      ],
-    });
-
-    render(<GpuSettingsCard />);
-
-    /*
-     * 两张卡 → 正好两栏。
-     * ⚠️ 测试环境的 `t()` 是替身：带插值的键（multiGpuCardSpeed / multiGpuCardLabel）
-     * 直接返回键名、不会把数字插进去，所以只能断言"栏数"，不能断言 11.1 这种数值。
-     * multiGpuCardLabel 在每个栏里各出现一次 → 出现几次就是几栏。
-     */
-    await waitFor(() => {
-      expect(screen.getAllByText("multiGpuCardLabel")).toHaveLength(2);
-    });
-  });
-});
+      });
