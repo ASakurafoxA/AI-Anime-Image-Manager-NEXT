@@ -1722,11 +1722,11 @@ export function Sidebar({
    * 抽成一份共用，否则改了一处、另一处还是旧行为（第一版就踩了这个坑）。
    */
   const tagPipelineRow = aiTagPipelineActive ? (
-    <div className="flex items-center gap-1.5 rounded-[6px] border border-primary/20 bg-primary/5 px-2 py-1.5 text-[11px] text-primary">
+    <div className="flex min-w-0 items-center gap-1.5 overflow-hidden rounded-[6px] border border-primary/20 bg-primary/5 px-2 py-1.5 text-[11px] text-primary">
       <ScanSearch className="h-3.5 w-3.5 shrink-0 animate-pulse" />
       <span className="min-w-0 truncate">{aiTagStatusText}</span>
       {aiTagRateText ? (
-        <span className="ml-auto flex-shrink-0 text-[10px] text-muted-foreground/70 tabular-nums">
+        <span className="ml-auto min-w-0 truncate text-[10px] text-muted-foreground/70 tabular-nums">
           {aiTagRateText}
         </span>
       ) : null}

@@ -274,7 +274,7 @@ export function PeoplePage() {
               · 但"特征还没算"（reason=vectors-missing）时必须**保持可点** ——
                 它就是补救入口 ✗
           */}
-          {!featureUsingClip && (
+          {!featureUsingClip ? (
             <Button
               disabled={featureBusy || featureRunning || featureModelMissing}
               onClick={() => void handleBuildFeatures()}
@@ -291,6 +291,21 @@ export function PeoplePage() {
                 ? t("characterFeatureBuilding")
                 : t("characterFeatureBuild")}
             </Button>
+          ) : (
+            /* 用 CLIP 特征时不需要单独建特征（文字搜图那套已经算好了）。
+               但原来这里直接空着，用户以为"按钮坏了/功能没了" —— 现在给一句说明 + 开关入口。 */
+            <>
+              <span className="text-[11px] text-muted-foreground">
+                {t("peopleModelClipHint")}
+              </span>
+              <button
+                className="text-[11px] text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
+                onClick={() => navigate({ to: "/settings/behavior" })}
+                type="button"
+              >
+                {t("characterFeatureGoSettings")}
+              </button>
+            </>
           )}
           <span className="text-[11px] text-muted-foreground">
             {featureStatus?.source === "clip" || !ccipCharacterOn

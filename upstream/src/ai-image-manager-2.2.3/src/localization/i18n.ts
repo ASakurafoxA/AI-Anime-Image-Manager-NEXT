@@ -1780,6 +1780,7 @@ i18n.use(initReactI18next).init({
           "全库打标完成后才能用（还剩 {{count}} 张未打标）",
         peopleModelCcip: "当前使用 CCIP 模型",
         peopleModelClip: "当前使用 CLIP 特征",
+  peopleModelClipHint: "正在用 CLIP 特征，不需要单独计算（想更准可开启 CCIP）",
         peopleFindUnnamedCharactersBusy: "分析中…",
         characterSuggestProgressSeeds: "正在读取已命名图片的特征 {{done}}/{{total}}",
         characterSuggestProgressSearch: "正在逐个角色比对 {{done}}/{{total}}",
@@ -4402,6 +4403,7 @@ i18n.use(initReactI18next).init({
           "Available after tagging finishes for the whole library ({{count}} untagged)",
         peopleModelCcip: "Currently using the CCIP model",
         peopleModelClip: "Currently using CLIP features",
+  peopleModelClipHint: "Using CLIP features — no separate build needed (enable CCIP for better accuracy)",
         peopleFindUnnamedCharactersBusy: "Analyzing…",
         characterSuggestProgressSeeds:
           "Loading features of named images {{done}}/{{total}}",
