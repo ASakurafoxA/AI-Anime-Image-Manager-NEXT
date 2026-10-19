@@ -9,7 +9,6 @@ import { captureWorkerOutput } from "@/services/diagnostics/worker-output";
 import {
   getDmlDeviceId,
   hasDuplicatedWorkerDevice,
-  isMultiGpuEnabled,
   MAX_MULTI_GPU_DEVICES,
   probeEmbeddingGpuCapability,
   recordEmbeddingProbeResult,
@@ -793,28 +792,15 @@ async function startWorkerPool(
    * 另外只要解析出的设备列表里出现**重复设备**（例如 `AI_EMBED_WORKERS` 被调大），
    * 也强制串行化 —— 见 `poolDevicesAreShared`。
    */
-  const multiGpuOn = executionProvider === "directml" && isMultiGpuEnabled();
+  /*
+   * 2026-10-19（用户要求）：**多卡并行已整体移除**。
+   * 现在固定"一张卡 + 每卡 worker 数"（配置项默认 4），设备就是「使用显卡」里选中的那张。
+   * 这样就没有"一卡忙一卡闲 / 两张速度对不上"的问题了。
+   */
   poolDevices =
     executionProvider === "directml" ? resolveWorkerDevices() : [];
-  /**
-   * 自用（多卡修正 2026-10-18）：
-   *   · 旧逻辑多卡时 `poolSize = 卡数`（=1 卡 1 worker），比单卡默认的 4 个还少 →
-   *     双卡反而更慢；CLIP 嵌入是"每卡多 worker 叠 IO/预处理"才快（单卡 4 个实测 32 张/秒）。
-   *   · 现在多卡 = **每张卡 × 每卡 worker 数**（默认 4），上限 12；
-   *     设备按 i % 卡数 轮转绑卡。
-   *   · 同卡多 worker 对我们**是好事**（不是人脸时代那个"同卡多开会踩"的场景），
-   *     所以不再因为"设备重复"把派发串行化（`poolDevicesAreShared` 恒 false）。
-   */
   poolDevicesAreShared = false;
-  if (multiGpuOn) {
-    poolSize = Math.max(
-      1,
-      Math.min(poolDevices.length * Math.max(1, config.workers), 8)
-    );
-  } else {
-    // 每个 worker ~200MB；单卡时沿用原并发数
-    poolSize = config.workers;
-  }
+  poolSize = Math.max(1, Math.min(config.workers, 8));
   poolSize = Math.max(1, Math.min(poolSize, 8));
   // 自用：批量与 ORT 线程数直接用配置值（原「占用限制」滑块的缩放已整体删除）
   poolBatchSize = config.batchSize;

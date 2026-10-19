@@ -215,11 +215,7 @@ export function GpuSettingsCard({
     "thumbnail" | "original"
   >("thumbnail");
   // 自用新增：多卡模式（默认关闭；开启后"使用显卡"变成多选，一张卡一个 worker）
-  const [multiGpuEnabled, setMultiGpuEnabled] = useState(false);
-  // 多卡模式下勾选的适配器序号（字符串形式，与下拉选项对齐）
-  const [deviceIds, setDeviceIds] = useState<string[]>([]);
   // 每张卡的实时速度（张/秒）；**长度就是"在用的卡数"**，< 2 时整体不显示
-  /** 每张卡的实时速度与显卡名（名字为空时回退到「卡 N」）。 */
   const [perCardSpeeds, setPerCardSpeeds] = useState<
     Array<{ deviceId: number | null; label: string | null; perSecond: number }>
   >([]);
@@ -236,8 +232,6 @@ export function GpuSettingsCard({
         setSearchImageSource(
           r.searchImageSource === "original" ? "original" : "thumbnail"
         );
-        setMultiGpuEnabled(Boolean(r.multiGpuEnabled));
-        setDeviceIds((r.deviceIds ?? []).map((id) => String(id)));
         /**
          * 每张卡的实时速度显示（用户 2026-10-09 明确要求）：
          *   · **只用 1 张卡 → 完全不显示**（顶上已有总速度）；
@@ -245,7 +239,6 @@ export function GpuSettingsCard({
          * 卡数由下面的轮询从后端拿（`getGpuSpeeds` 返回实际启用的设备），
          * 所以这里不用额外记状态；初值保持空数组 = 先不显示。
          */
-        setPerCardSpeeds([]);
         onEnabledChange?.(r.enabled);
         if (r.detected) {
           setDetectedInfo(r.detected);
@@ -269,71 +262,6 @@ export function GpuSettingsCard({
       })
       .finally(() => onLoaded?.());
   }, [onEnabledChange, onLoaded, t]);
-
-  /**
-   * 自用（多卡）：每 3 秒取一次"每张卡实时速度"。
-   *
-   * 显示规则（用户明确要求）：**只用 1 张卡时完全不显示**（顶上已有总速度），
-   * **用了 ≥2 张才显示，用几张显示几个**（最多 3 个）。
-   * 所以这里按"实际在用的卡数"决定数组长度；卡数 < 2 时置空数组 → 界面不渲染。
-   *
-   * 用 `setActiveDeviceCount` 的函数式更新：值没变时返回原值，
-   * React 不会因此重复渲染（避免每 3 秒白转一圈）。
-   */
-  useEffect(() => {
-    let cancelled = false;
-    const tick = () => {
-      ipc.client.settings
-        .getGpuSpeeds({})
-        .then((value) => {
-          if (cancelled) {
-            return;
-          }
-          const speeds = (
-            value as {
-              speeds?: Array<{
-                deviceId?: number | null;
-                label?: string | null;
-                perSecond: number;
-              }>;
-            }
-          ).speeds;
-          if (!Array.isArray(speeds)) {
-            return;
-          }
-          const values = speeds.map((item) => ({
-            deviceId: item.deviceId ?? null,
-            label: item.label ?? null,
-            perSecond: item.perSecond ?? 0,
-          }));
-          /**
-           * 用户要求：**单卡（1 张）完全不显示**；**≥2 张才显示，用几张显示几个**（最多 3 个）。
-           * 后端 `getGpuSpeeds` 返回的就是"实际启用的设备"，所以数组长度 = 在用卡数。
-           */
-          setPerCardSpeeds((previous) =>
-            previous.length === values.length &&
-            previous.every(
-              (item, index) =>
-                item.perSecond === values[index].perSecond &&
-                item.deviceId === values[index].deviceId
-            )
-              ? previous
-              : values.length >= 2
-                ? [...values]
-                : []
-          );
-        })
-        .catch(() => {
-          /* 取不到就保持上一次的数字，不要打断设置页 */
-        });
-    };
-    tick();
-    const timer = setInterval(tick, 3000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, []);
 
   // ── GPU detection ──────────────────────────────────────────────────
   const handleDetect = useCallback(async () => {
@@ -395,11 +323,7 @@ export function GpuSettingsCard({
     try {
       await ipc.client.settings.setGpuSettings({
         deviceId,
-        deviceIds: deviceIds
-          .map((value) => Number.parseInt(value, 10))
-          .filter((value) => Number.isInteger(value) && value >= 0),
         enabled,
-        multiGpuEnabled,
         searchImageSource,
       });
       setSaveStatus(t("gpuSaved"));
@@ -415,9 +339,7 @@ export function GpuSettingsCard({
     }
   }, [
     deviceId,
-    deviceIds,
     enabled,
-    multiGpuEnabled,
     onBusyChange,
     onEnabledChange,
     searchImageSource,
@@ -533,11 +455,7 @@ export function GpuSettingsCard({
               <FilterDropdown
                 ariaLabel={t("gpuAdapterTitle")}
                 className="w-full max-w-[420px]"
-                multiple={multiGpuEnabled}
                 onChange={(value) => setDeviceId(value)}
-                onValuesChange={(next) =>
-                  setDeviceIds(next.slice(0, 3))
-                }
                 options={[
                   {
                     label: detectedInfo?.gpuName
@@ -553,9 +471,7 @@ export function GpuSettingsCard({
                   })),
                 ]}
                 placeholder={t("gpuAdapterTitle")}
-                showSelectedCheck={multiGpuEnabled}
                 value={deviceId}
-                values={deviceIds}
               />
             </div>
             <p className="text-[11px] text-muted-foreground/60 leading-relaxed [overflow-wrap:anywhere]">
@@ -564,32 +480,7 @@ export function GpuSettingsCard({
           </div>
         )}
 
-        {/* 自用（多卡）：多卡模式开关 —— 默认关闭；开启后上面变成多选 */}
-        {showAdapterSection && (
-          <div className="min-w-0 space-y-1.5 border-border border-t pt-3">
-            <label className="flex min-w-0 items-center justify-between gap-3">
-              <span className="min-w-0 text-[12px] text-muted-foreground">
-                {t("multiGpuTitle")}
-              </span>
-              <Switch
-                aria-label={t("multiGpuTitle")}
-                checked={multiGpuEnabled}
-                onCheckedChange={(next) => {
-                  setMultiGpuEnabled(next);
-                  // 刚开启时至少勾上当前这块卡，避免"开了多卡却没选卡"
-                  if (next && deviceIds.length === 0 && deviceId !== "auto") {
-                    setDeviceIds([deviceId]);
-                  }
-                }}
-              />
-            </label>
-            <p className="text-[11px] text-muted-foreground/60 leading-relaxed [overflow-wrap:anywhere]">
-              {multiGpuEnabled ? t("multiGpuHintOn") : t("multiGpuHintOff")}
-            </p>
-          </div>
-        )}
-
-        {/* Feature status */}
+                {/* Feature status */}
         {/*
           自用（多卡）：每张卡的实时速度显示在这里。
           用户的要求：**单卡完全不显示**；**≥2 张才显示，用几张显示几个**（最多 3 个）。
@@ -613,32 +504,6 @@ export function GpuSettingsCard({
               statusKey={embeddingStatusKey}
             />
           </div>
-          {perCardSpeeds.length > 1 && (
-            <span className="flex min-w-0 flex-col gap-1">
-              {perCardSpeeds.map((speed, index) => (
-                <span
-                  className="inline-flex w-fit items-center gap-1 rounded-[4px] border border-border bg-card px-2 py-0.5 text-[11px] text-foreground tabular-nums"
-                  key={`card-${index + 1}`}
-                >
-                  <span
-                    className="text-muted-foreground/70"
-                    title={speed.label ?? undefined}
-                  >
-                    {speed.deviceId === null
-                      ? t("multiGpuCardLabel", { index: index + 1 })
-                      : t("multiGpuCardAdapter", { id: speed.deviceId })}
-                  </span>
-                  <span>
-                    {speed.perSecond > 0
-                      ? t("multiGpuCardSpeed", {
-                          speed: speed.perSecond.toFixed(1),
-                        })
-                      : t("multiGpuCardSpeedIdle")}
-                  </span>
-                </span>
-              ))}
-            </span>
-          )}
         </div>
 
         {/* Detection status */}

@@ -963,7 +963,7 @@ i18n.use(initReactI18next).init({
         settingsCharacterPreferCcip: "角色识别优先使用 CCIP 模型",
         settingsCharacterPreferCcipHint:
           "开启时用 CCIP 角色模型（更准）。没放模型文件时会停用角色识别并给出提示；关掉本开关即改用现有 CLIP 特征（较不准确）",
-        settingsCharacterWorkersPerCard: "每卡 worker 数（角色识别）",
+        settingsCharacterWorkersPerCard: "角色识别进程数",
         settingsCharacterWorkersPerCardHint:
           "角色识别是「每张图解码+缩放」的瓶颈，进程越多越快：以每卡 1 个为 100%，实测 2 个约 151%、4 个约 220%，4 个之后不再变快（默认 4）。想更快选 4；机器很忙或不稳就往下调。建向量（CLIP）不受这个设置影响",
         characterDiscoveryTitle: "识别无标签角色并命名",
@@ -3519,7 +3519,7 @@ i18n.use(initReactI18next).init({
         settingsCharacterPreferCcip: "Prefer the CCIP model for character recognition",
         settingsCharacterPreferCcipHint:
           "When on, character recognition uses the CCIP model (more accurate). If the model files are missing it is disabled with a clear message; turn this off to fall back to the existing CLIP features (less accurate)",
-        settingsCharacterWorkersPerCard: "Workers per GPU (character recognition)",
+        settingsCharacterWorkersPerCard: "Character recognition processes",
         settingsCharacterWorkersPerCardHint:
           "Character recognition is bottlenecked by per-image decode and resize, so more workers is faster: taking 1 per GPU as 100%, measured about 151% with 2 and 220% with 4; it stops improving past 4 (default 4). Pick 4 for speed, lower it if the machine gets busy or unstable. Embedding (CLIP) is not affected by this setting",
         characterDiscoveryTitle: "Detect untagged characters and name them",

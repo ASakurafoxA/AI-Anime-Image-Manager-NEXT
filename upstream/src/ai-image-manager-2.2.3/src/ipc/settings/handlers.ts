@@ -615,11 +615,7 @@ export const getGpuSettings = os.handler(async () => {
     "@/services/ai/search-image-source"
   );
   const searchImageSource = getSearchImageSource();
-  // 自用新增：多卡模式（一张卡一个 worker）与勾选的适配器序号
-  const { isMultiGpuEnabled, getSelectedDeviceIds, resolveWorkerDevices } =
-    await import("@/services/gpu-detector");
-  const multiGpuEnabled = isMultiGpuEnabled();
-  const deviceIds = getSelectedDeviceIds();
+  // 2026-10-19：多卡并行已移除，只剩"选显卡"（gpu.deviceId）
   let detected: Record<string, unknown> | null = null;
   const raw = getSetting("gpu.detected");
   if (raw) {
@@ -640,12 +636,14 @@ export const getGpuSettings = os.handler(async () => {
   }
   return {
     deviceId,
-    deviceIds,
     enabled,
     detected,
-    /** 多卡模式下每个 worker 实际绑定的设备序号（单卡模式只有 1 个）。 */
-    effectiveDevices: resolveWorkerDevices(),
-    multiGpuEnabled,
+    /** @deprecated 多卡并行已移除，恒为空数组（保留字段仅为兼容旧测试/旧渲染层） */
+    deviceIds: [] as number[],
+    /** @deprecated 多卡并行已移除，恒为 false */
+    multiGpuEnabled: false,
+    /** @deprecated 多卡并行已移除，恒为单元素数组 */
+    effectiveDevices: [null] as Array<number | null>,
     promptShown,
     searchImageSource,
   };
@@ -658,9 +656,8 @@ export const setGpuSettings = os
       enabled: z.boolean(),
       /** 自用新增：以图搜图特征来源（缩略图快 / 原图保真） */
       searchImageSource: z.enum(["thumbnail", "original"]).optional(),
-      /** 自用新增：多卡模式开关 */
+      /** 兼容旧客户端：多卡字段已废弃，收到也忽略 */
       multiGpuEnabled: z.boolean().optional(),
-      /** 自用新增：多卡模式下勾选的适配器序号（最多 3 张） */
       deviceIds: z.array(z.number().int().min(0)).max(3).optional(),
     })
   )
@@ -675,20 +672,6 @@ export const setGpuSettings = os
       );
       setSearchImageSource(input.searchImageSource);
     }
-    if (input.multiGpuEnabled !== undefined) {
-      const { MULTI_GPU_ENABLED_KEY } = await import("@/services/gpu-detector");
-      setSetting(MULTI_GPU_ENABLED_KEY, String(input.multiGpuEnabled));
-    }
-    if (input.deviceIds !== undefined) {
-      const { MULTI_GPU_DEVICES_KEY, MAX_MULTI_GPU_DEVICES } = await import(
-        "@/services/gpu-detector"
-      );
-      const unique = [...new Set(input.deviceIds)].slice(
-        0,
-        MAX_MULTI_GPU_DEVICES
-      );
-      setSetting(MULTI_GPU_DEVICES_KEY, JSON.stringify(unique));
-    }
     /*
      * 自用（多卡修复）：设置变了要**让 worker 池重建**。
      *
@@ -697,12 +680,7 @@ export const setGpuSettings = os
      * → 表现就是"一张卡忙、一张卡闲"，总速度只有单卡水平。
      * 这里调 shutdownPool()，下一次建向量会按新设置重新 init。
      */
-    if (
-      input.multiGpuEnabled !== undefined ||
-      input.deviceIds !== undefined ||
-      input.enabled !== undefined ||
-      input.deviceId !== undefined
-    ) {
+    if (input.enabled !== undefined || input.deviceId !== undefined) {
       const { markEmbedPoolDirty } = await import(
         "@/services/embed-worker-pool"
       );

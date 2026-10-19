@@ -101,9 +101,30 @@ const PROBE_TIMEOUT_MS = 15_000;
  * Fork the gpu-probe worker and wait for its DML availability verdict.
  * The parent enforces a 15 s timeout — if the worker hangs (driver issue),
  * we return dmlAvailable=false rather than blocking indefinitely.
+ *
+ * ⚠️ 自用（2026-10-17，用户口径）：**SFace 人脸链路已整体剔除** ✗ ——
+ * 这个探针原来叫 `probeFaceGpuCapability`，它让 worker 去加载 **YuNet 人脸模型**
+ * 来试 DML；人脸模型删掉以后那条路会永远报 `Model not found` ✗，
+ * 结果就是"GPU 检测失败 → 所有 AI 任务（含角色识别）掉回 CPU"。
+ * 现在：**把当前嵌入模型（中文 CLIP）的路径传进去**当试金石 ✓
+ * （判断 DML 能不能建会话与模型内容无关，用哪个 onnx 都一样）。
  */
-function probeFaceGpuCapability(modelsDir: string): Promise<GpuProbeResult> {
+function probeDirectMlCapability(modelsDir: string): Promise<GpuProbeResult> {
   const scriptPath = findProbeScript("gpu-probe.mjs");
+  /*
+   * 试金石模型 = 当前嵌入模型的实际文件（按 `ai.embeddingModel` 解析）。
+   * 解析失败（配置异常）时留空，worker 会自己在 models/ 里找一个 onnx 兜底 ✓
+   */
+  let probeModelPath: string | undefined;
+  try {
+    const image = getActiveEmbeddingAdapter().embeddingSpace.image;
+    probeModelPath = path.join(
+      modelsDir,
+      ...image.modelRelativePath.split(MODEL_PATH_SEPARATOR)
+    );
+  } catch {
+    probeModelPath = undefined;
+  }
 
   return new Promise((resolve) => {
     let resolved = false;
@@ -170,7 +191,7 @@ function probeFaceGpuCapability(modelsDir: string): Promise<GpuProbeResult> {
       }
     });
 
-    child.send({ type: "probe", modelsDir });
+    child.send({ type: "probe", modelsDir, modelPath: probeModelPath });
   });
 }
 
@@ -296,16 +317,18 @@ export function probeEmbeddingGpuCapability(
 export async function probeGpuCapability(
   modelsDir: string
 ): Promise<GpuProbeResult> {
-  // ⚠️ 顺序有意为之：先跑 YuNet（人脸）那条探针，它会挑出**独立显卡的序号**
-  // 并验证该序号真能建 DML 会话；这个序号随后交给图像嵌入探针。
-  // 若两条并行，嵌入探针拿不到序号，就会用系统默认适配器（双显卡笔记本上通常是核显）。
-  const face = await probeFaceGpuCapability(modelsDir);
+  /*
+   * ⚠️ 顺序有意为之：先跑"通用 DML 探针"（现在用**嵌入模型**当试金石），
+   * 它会挑出**独立显卡的序号**并验证该序号真能建 DML 会话；这个序号随后交给图像嵌入探针。
+   * 若两条并行，嵌入探针拿不到序号，就会用系统默认适配器（双显卡笔记本上通常是核显）。
+   */
+  const directMl = await probeDirectMlCapability(modelsDir);
   const embedding = await probeEmbeddingGpuCapability(
     modelsDir,
-    typeof face.dmlDeviceId === "number" ? face.dmlDeviceId : null
+    typeof directMl.dmlDeviceId === "number" ? directMl.dmlDeviceId : null
   );
   return {
-    ...face,
+    ...directMl,
     embeddingDmlAvailable: embedding.dmlAvailable,
     embeddingError: embedding.error,
     embeddingProbeTimeMs: embedding.probeTimeMs,
@@ -321,7 +344,7 @@ export async function probeGpuCapability(
  * 不加版本号就会踩这个坑：代码改好了、用户升级后仍按旧结论跑
  * （继续"图像嵌入用 CPU"或用核显）。版本号不一致时旧缓存直接判废、下次启动重探。
  */
-export const GPU_DETECTOR_VERSION = 2;
+export const GPU_DETECTOR_VERSION = 3;
 
 /** Persist probe result so we don't re-detect on every launch. */
 export function cacheDetectionResult(result: GpuProbeResult): void {
@@ -441,15 +464,12 @@ export function getSelectedDeviceIds(): number[] {
  *   · 多卡开启但没勾 → 回退单卡，避免"开了多卡却一张都不选"导致不干活。
  */
 export function resolveWorkerDevices(): Array<number | null> {
-  const single: Array<number | null> = [getDmlDeviceId()];
-  if (!isMultiGpuEnabled()) {
-    return single;
-  }
-  const selected = getSelectedDeviceIds();
-  if (selected.length === 0) {
-    return single;
-  }
-  return selected.map((id) => id as number | null);
+  /*
+   * 2026-10-19（用户要求）：**多卡并行整套去掉** —— 只保留"选显卡"。
+   * 所有 worker 一律绑定到用户在「使用显卡」里选中的那一张（auto 时用探针挑出的独显）。
+   * 保留这个函数是为了不动调用方签名；现在它永远只返回 1 个设备。
+   */
+  return [getDmlDeviceId()];
 }
 
 /**
@@ -514,8 +534,8 @@ export function recordEmbeddingProbeResult(
 }
 
 /**
- * 确保"该用哪块显卡"是已知的：有缓存用缓存，没有就补跑一次轻量探测（YuNet + DML，约 1 s），
- * 并把结果并入 `gpu.detected` 缓存。
+ * 确保"该用哪块显卡"是已知的：有缓存用缓存，没有就补跑一次轻量探测
+ * （通用 DML 探针 + 嵌入模型当试金石，约 1 s），并把结果并入 `gpu.detected` 缓存。
  *
  * 为什么需要：探测结果的写入点只有「设置 → GPU 加速 → 检测 GPU」按钮（和未被调用的启动探测）。
  * 用户没点过按钮时，图像嵌入的工作进程启动时拿不到序号，就会退回系统默认适配器
@@ -533,7 +553,7 @@ export async function resolveDmlDeviceId(
   if (cached && "dmlDeviceId" in cached) {
     return null;
   }
-  const face = await probeFaceGpuCapability(modelsDir);
+  const directMl = await probeDirectMlCapability(modelsDir);
   /**
    * ⚠️ 自用（多卡·修复 2026-10-09）：探针失败时**不要**用空结果覆盖已知的显卡列表。
    * 详见 `recordEmbeddingProbeResult` 的注释 —— 一次偶发失败（显卡被别的任务占满）
@@ -541,10 +561,10 @@ export async function resolveDmlDeviceId(
    */
   const merged: GpuProbeResult = {
     ...(cached ?? {
-      dmlAvailable: face.dmlAvailable,
-      probeTimeMs: face.probeTimeMs,
+      dmlAvailable: directMl.dmlAvailable,
+      probeTimeMs: directMl.probeTimeMs,
     }),
-    ...face,
+    ...directMl,
   };
   if (merged.adapters === undefined) {
     merged.adapters = cached?.adapters;
@@ -553,7 +573,7 @@ export async function resolveDmlDeviceId(
     merged.gpuName = cached?.gpuName;
   }
   cacheDetectionResult(merged);
-  return typeof face.dmlDeviceId === "number" ? face.dmlDeviceId : null;
+  return typeof directMl.dmlDeviceId === "number" ? directMl.dmlDeviceId : null;
 }
 
 const VIRTUAL_GPU_PATTERNS = [
