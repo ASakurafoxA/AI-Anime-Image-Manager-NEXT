@@ -34,8 +34,7 @@ vi.mock("sonner", () => ({ toast: presetToast }));
 vi.mock("@/ipc/manager", () => ({
   ipc: {
     client: {
-      faces: { listFaceIdentities: vi.fn().mockResolvedValue([]) },
-      photos: {
+          photos: {
         getExifCandidates: vi.fn().mockResolvedValue({}),
         getTags: vi
           .fn()
@@ -658,16 +657,38 @@ describe("SearchBar", () => {
     expect(screen.getByText("unsupported.raw")).toBeInTheDocument();
   });
 
-  it("shows a labeled image search action and opens the file input", async () => {
+  /*
+   * 自用（2026-10 用户口径）：以图搜图不再"点一下直接弹文件选择"，
+   * 而是**展开一个输入小窗口**（窗口内可 Ctrl+V 粘贴 / 拖入图片），
+   * 文件选择改由窗口内的「选择文件…」或双击窗口触发。
+   */
+  it("点以图搜图展开输入小窗口，窗口内可再打开文件选择", async () => {
     const user = userEvent.setup();
     const inputClick = vi
       .spyOn(HTMLInputElement.prototype, "click")
       .mockImplementation(() => undefined);
     render(<ControlledSearchBar {...baseProps} onImageSearch={vi.fn()} />);
 
+    // 点按钮：先展开小窗口，**不**直接弹文件选择
     await user.click(screen.getByRole("button", { name: "以图搜图" }));
+    const popover = await screen.findByTestId("image-search-popover");
+    expect(popover).toBeInTheDocument();
+    expect(inputClick).not.toHaveBeenCalled();
 
+    // 双击窗口才是打开文件选择
+    await user.dblClick(popover);
     expect(inputClick).toHaveBeenCalledOnce();
+
+    // 右上角的 ✕ 能关闭小窗
+    await user.click(screen.getByTestId("image-search-close"));
+    expect(screen.queryByTestId("image-search-popover")).not.toBeInTheDocument();
+
+    // 点小窗外面也能关闭
+    await user.click(screen.getByRole("button", { name: "以图搜图" }));
+    expect(await screen.findByTestId("image-search-popover")).toBeInTheDocument();
+    await user.click(document.body);
+    expect(screen.queryByTestId("image-search-popover")).not.toBeInTheDocument();
+
     inputClick.mockRestore();
   });
 

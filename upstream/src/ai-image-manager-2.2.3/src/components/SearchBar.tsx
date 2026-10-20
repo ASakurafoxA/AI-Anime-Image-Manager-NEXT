@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { resolveTagDotColor } from "@/components/sidebar-trees";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import {
   type Dispatch,
   forwardRef,
@@ -361,6 +362,23 @@ export const SearchBar = memo(
   const [imageSearchOpen, setImageSearchOpen] = useState(false);
   /** 小窗口连同按钮的外层容器：用来判断"点在小窗外面"从而收起。 */
   const imageSearchWrapRef = useRef<HTMLSpanElement | null>(null);
+  /*
+   * 自用（2026-10-20 · 会话#10）：「重建向量索引」前先确认。
+   * 原因：它会把 `vectors\` 整个目录删掉重建 —— **包括角色特征表 ccip_embeddings**，
+   * 但按钮就在搜索栏上、点一下就走，用户（实测）以为只是"重建搜图向量"，
+   * 结果角色识别直接变成"还没算过角色特征"。
+   */
+  const [rebuildConfirmOpen, setRebuildConfirmOpen] = useState(false);
+
+  /** 自用（会话#10）：真正执行"重建 → 重新索引"，确认框和原来的一步走共用。 */
+  function runRebuildIndex() {
+    ipc.client.photos
+      .resetAiIndex({})
+      .then(() => ipc.client.photos.startAiIndexing({}))
+      .catch((error: unknown) => {
+        console.error("[AI] Failed to rebuild index", error);
+      });
+  }
 
   /**
    * 自用：拖进来的图片 —— 优先取它的本地路径（从资源管理器拖）；
@@ -1312,18 +1330,21 @@ export const SearchBar = memo(
                       const rebuild =
                         aiStatus.coverageState === "ready" ||
                         aiStatus.coverageState === "error";
-                      const run = rebuild
-                        ? ipc.client.photos
-                            .resetAiIndex({})
-                            .then(() => ipc.client.photos.startAiIndexing({}))
-                        : ipc.client.photos.resumeAiIndexing({}).then((result) =>
-                            result?.resumed
-                              ? null
-                              : ipc.client.photos.startAiIndexing({})
-                          );
-                      run.catch((error: unknown) => {
-                        console.error("[AI] Failed to start indexing", error);
-                      });
+                      if (rebuild) {
+                        // 自用（会话#10）：重建会清空角色特征，先让用户确认
+                        setRebuildConfirmOpen(true);
+                        return;
+                      }
+                      ipc.client.photos
+                        .resumeAiIndexing({})
+                        .then((result) =>
+                          result?.resumed
+                            ? null
+                            : ipc.client.photos.startAiIndexing({})
+                        )
+                        .catch((error: unknown) => {
+                          console.error("[AI] Failed to start indexing", error);
+                        });
                     }}
                     type="button"
                   >
@@ -1333,6 +1354,22 @@ export const SearchBar = memo(
                       : t("aiStartIndex")}
                   </button>
                 )}
+              {/*
+                自用（会话#10）：「重建向量索引」确认框 —— 写清"会清掉什么 / 不会动什么"。
+                它删的是整个 `vectors\` 目录（含角色特征表），不是只重建搜图向量。
+              */}
+              <ConfirmDialog
+                confirmText={t("aiRebuildIndex")}
+                description={t("aiRebuildIndexHint")}
+                destructive
+                onCancel={() => setRebuildConfirmOpen(false)}
+                onConfirm={() => {
+                  setRebuildConfirmOpen(false);
+                  runRebuildIndex();
+                }}
+                open={rebuildConfirmOpen}
+                title={t("aiRebuildIndexConfirmTitle")}
+              />
               {trailingContent && (
                 <div className="home-toolbar-actions ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
                   {trailingContent}

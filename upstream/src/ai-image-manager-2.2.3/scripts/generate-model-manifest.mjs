@@ -28,8 +28,9 @@ const FILES = [
   "Xenova/opus-mt-zh-en/vocab.json",
   "Xenova/opus-mt-zh-en/onnx/encoder_model_quantized.onnx",
   "Xenova/opus-mt-zh-en/onnx/decoder_model_merged_quantized.onnx",
-  "face/face_detection_yunet_2023mar.onnx",
-  "face/face_recognition_sface_2021dec.onnx",
+  // 自用（2026-10-17，用户口径）：**SFace 人脸链路已整体剔除** ✗
+  // 这里原来还有三行（YuNet / 动漫检测器 / SFace）——模型已删除、
+  // `MODEL_MANIFEST` 里也不再列，留着只会让这个脚本报 "文件不存在" ✗
 ];
 
 function sha256File(filePath) {

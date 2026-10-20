@@ -15,6 +15,13 @@ interface SettingsSectionProps {
   className?: string;
   description?: ReactNode;
   title?: ReactNode;
+  /**
+   * 自用（2026-10-16）：区块标题的字号。
+   * `"section"`（默认）= 现在各设置页用的稍小样式 ✓；
+   * `"page"` = 和页面顶部标题（如「应用行为」）**完全一样** ✓ ——
+   * 用于"这一块本身就是一个独立话题"的情况（用户要求 ✓）。
+   */
+  titleVariant?: "page" | "section";
 }
 
 export function SettingsPageShell({
@@ -65,16 +72,31 @@ export function SettingsSection({
   className,
   description,
   title,
+  titleVariant = "section",
 }: SettingsSectionProps) {
+  const isPageTitle = titleVariant === "page";
   return (
     <section className={cn("min-w-0 space-y-3", className)}>
       {(title || description) && (
         <div>
-          {title && (
-            <h3 className="font-medium text-[13px] text-foreground">{title}</h3>
-          )}
+          {title &&
+            (isPageTitle ? (
+              // 与 SettingsPageShell 的标题样式保持一致 ✓
+              <h2 className="font-semibold text-[14px] text-foreground">
+                {title}
+              </h2>
+            ) : (
+              <h3 className="font-medium text-[13px] text-foreground">
+                {title}
+              </h3>
+            ))}
           {description && (
-            <p className="mt-0.5 text-[11px] text-muted-foreground [overflow-wrap:anywhere]">
+            <p
+              className={cn(
+                "text-muted-foreground [overflow-wrap:anywhere]",
+                isPageTitle ? "mt-1 text-[12px]" : "mt-0.5 text-[11px]"
+              )}
+            >
               {description}
             </p>
           )}

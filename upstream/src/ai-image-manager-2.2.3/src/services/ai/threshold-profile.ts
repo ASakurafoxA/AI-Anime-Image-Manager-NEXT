@@ -1,4 +1,5 @@
 import {
+  CHINESE_CLIP_V1_ADAPTER_ID,
   getActiveEmbeddingAdapter,
   getEmbeddingAdapter,
 } from "./model-adapter";
@@ -45,6 +46,9 @@ export interface ThresholdProfile {
 
 export const SIGLIP_V1_THRESHOLD_PROFILE_ID =
   "siglip-v1-base-patch16-224-default";
+
+export const CHINESE_CLIP_V1_THRESHOLD_PROFILE_ID =
+  "chinese-clip-v1-base-patch16-default";
 
 function createSiglipV1Profile(): ThresholdProfile {
   const adapter = getActiveEmbeddingAdapter();
@@ -108,8 +112,53 @@ function createSiglipV1Profile(): ThresholdProfile {
   };
 }
 
+/**
+ * 自用（2026-10 换中文 CLIP）：新档位。
+ *
+ * 分数**量级完全不同**：SigLIP 那套是 0.02~0.06（换来之前实测图文相似度 13%），
+ * Chinese-CLIP 是 0.2~0.5（实测 35%）—— 所以这里按约 3 倍等比放大，
+ * 沿用原来的相对比例（consensusThresholdRatio / relativeToTopRatio 是比例，不变）。
+ *
+ * ⚠️ 这几个数是**按比例外推**的，还没用真实分数分布标定：
+ * 因此 calibrationStatus 标成 `"user"`（不是官方校准），第一次跑完真实搜索后
+ * 应按分数分位数再修一次（见改动记录「五之八」的待办第 5 条）。
+ */
+function createChineseClipV1Profile(): ThresholdProfile {
+  const adapter = getEmbeddingAdapter(CHINESE_CLIP_V1_ADAPTER_ID);
+  return {
+    schemaVersion: 1,
+    profileId: CHINESE_CLIP_V1_THRESHOLD_PROFILE_ID,
+    adapterId: adapter.id,
+    modelFingerprint: getModelFingerprint(adapter),
+    calibrationStatus: "user",
+    duplicate: {
+      confirmationSimilarity: 0.95,
+    },
+    semanticSearch: {
+      absoluteMinimumSimilarity: 0.12,
+      candidateMinimumSimilarity: 0.06,
+      consensusThresholdRatio: 0.75,
+      relativeToTopRatio: 0.4,
+    },
+    tag: {
+      candidateFromMedian: 0.06,
+      candidateFromTop: 0.12,
+      confidenceMax: 0.95,
+      confidenceMin: 0.55,
+      topFromMedian: 0.09,
+      topMinimum: 0.1,
+    },
+    textDistance: {
+      englishMaxCosineDistance: 0.98,
+      noCoverageMaxCosineDistance: 0.98,
+      fullCoverageMaxCosineDistance: 0.98,
+    },
+  };
+}
+
 const officialProfiles = new Map<string, () => ThresholdProfile>([
   [SIGLIP_V1_THRESHOLD_PROFILE_ID, createSiglipV1Profile],
+  [CHINESE_CLIP_V1_THRESHOLD_PROFILE_ID, createChineseClipV1Profile],
 ]);
 
 export function registerThresholdProfile(

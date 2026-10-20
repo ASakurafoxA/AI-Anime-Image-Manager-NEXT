@@ -195,6 +195,43 @@ describe("PhotoLightbox", () => {
     expect(onClose).toHaveBeenCalledWith({ index: 1, photoId: 2 });
   });
 
+  /*
+   * 自用（2026-10-18 · 会话#9 用户口径）：「给所有模式的大图界面都增加点击空白区域退出的功能」
+   * —— 主图库原来没传 onBackdropClick，所以点图片两侧的黑边毫无反应 ✗
+   */
+  it("closes when clicking the blank area around the image (no onBackdropClick given)", () => {
+    const onClose = vi.fn();
+    render(
+      <PhotoLightbox
+        initialIndex={0}
+        onClose={onClose}
+        open
+        photos={photos}
+      />
+    );
+
+    const surface = screen.getByLabelText("lightboxReview");
+    // 点"空白"：直接点在容器本身上（图片两侧黑边就是这个容器）
+    fireEvent.click(surface);
+    expect(onClose).toHaveBeenCalledWith({ index: 0, photoId: 1 });
+  });
+
+  it("does not close when clicking the image itself", () => {
+    const onClose = vi.fn();
+    render(
+      <PhotoLightbox
+        initialIndex={0}
+        onClose={onClose}
+        open
+        photos={photos}
+      />
+    );
+
+    const image = screen.getAllByRole("img", { name: "first.jpg" })[0];
+    fireEvent.click(image);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("handles a top toolbar action when the icon itself is clicked", async () => {
     const onToggleFavorite = vi.fn().mockResolvedValue(undefined);
     render(

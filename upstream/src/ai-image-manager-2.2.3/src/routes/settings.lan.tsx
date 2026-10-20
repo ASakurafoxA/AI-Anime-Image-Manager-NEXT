@@ -254,11 +254,20 @@ function LanSettingsPage() {
               }}
             />
           }
+          /*
+           * 自用（2026-10-16，用户要求 ✓）：**去掉这条多余的细线** ✗→✓
+           * 原因是上面那条黄色提示条占了"第一个子元素"的位置，
+           * 所以 SettingRow 自带的"首行不画上分割线"（first:border-t-0）没生效 ✓，
+           * 于是紧跟在提示条下面的这一行多了一条灰色横线 ✗。
+           */
+          className="border-t-0"
           description={t("lanEnableHint")}
           title={t("lanEnable")}
         />
         {settings?.enabled && !settings.hasPermanentPassword ? (
           <SettingRow
+            // 同上：紧跟提示条的警示行也去掉那条灰线 ✓
+            className="border-t-0"
             title={t("lanNotListening")}
             tone="warning"
           />

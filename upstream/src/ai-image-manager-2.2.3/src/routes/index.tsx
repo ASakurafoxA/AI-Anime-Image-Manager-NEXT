@@ -162,6 +162,8 @@ type PendingSequenceAction =
   | { id: number; type: "ungroup" };
 
 interface CompoundSearchParams {
+  /** 自用：语义相似度下限（0~1），来自搜索栏那条「相似度 ≥ N%」滑条。 */
+  minSimilarity?: number;
   advancedField?: ExifFilters["advancedField"];
   advancedValue?: string;
   apertureMax?: number;
@@ -317,6 +319,8 @@ function HomePage() {
     query: string;
     filters?: ExifFilters;
     colorHex?: string;
+    /** 自用（2026-10-16）：续页必须带上同一个「相似度 ≥」滑杆值，否则第 2 页会把低于下限的图又捞回来。 */
+    minSimilarity?: number;
   } | null>(null);
   const lastImageSearchPathRef = useRef<string | null>(null);
   const colorHex = filter.appliedSearch?.colorHex ?? null;
@@ -448,6 +452,23 @@ function HomePage() {
   const [renameDialogOpen, setRenameDialogOpen] = useState(false);
   const [convertDialogOpen, setConvertDialogOpen] = useState(false);
   const [addToAlbumOpen, setAddToAlbumOpen] = useState(false);
+  /*
+   * 自用（2026-10 重做交互）：搜索栏右侧那个「隐藏文件夹」开关。
+   *   打开 = 不显示隐藏目录里的照片（浏览、按标签、搜索显示都一致）
+   *   关闭 = 正常显示（包含被隐藏的目录）
+   * 目录是否隐藏由**右键菜单**决定（隐藏该文件夹 / 恢复在主界面显示），
+   * 这个开关只决定显不显示被隐藏的那些项目。
+   * 默认打开（用户口径），选择记在 localStorage 里。
+   */
+  const [hideHiddenFolders, setHideHiddenFolders] = useState(
+    () => localStorage.getItem("aim.hideHiddenFolderPhotos") !== "0"
+  );
+  const toggleHideHiddenFolders = useCallback(() => {
+    setHideHiddenFolders((previous) => {
+      localStorage.setItem("aim.hideHiddenFolderPhotos", previous ? "0" : "1");
+      return !previous;
+    });
+  }, []);
   const [addToAlbumIds, setAddToAlbumIds] = useState<number[]>([]);
   /** 自用版新增：批量打标签的目标照片（空数组 = 未打开） */
   const [batchTagIds, setBatchTagIds] = useState<number[]>([]);
@@ -468,6 +489,17 @@ function HomePage() {
     string | null
   >(null);
   const [sortField, setSortField] = useState<SortField>(loadSortField);
+  /** 自用：搜索栏的「相似度 ≥ N%」阈值（0 = 不限）与「结果数」上限。 */
+  /*
+   * 自用（2026-10-16，用户要求 ✓）：「相似度 ≥」滑杆**默认 40%** ✓
+   * （原话："就把滑条设置为默认40%" ✓）。
+   * 40% 的依据：实测卡片角标（原始余弦）在语义搜到的图里大致落 40~46% ✓，
+   * 所以 40% 正好"卡住能看的那一批" ✓；拖到 0% 也**不会**全库扫 ✓
+   * （算法自己的及格线仍然生效 ✓ —— 见 `scoring.ts` 的相对线与 `handlers/search.ts` 的检索深度上限 ✓）。
+   * 注意：这是**每次启动/刷新的初始值** ✓（没有持久化 ✓），拖过之后按当前会话算 ✓。
+   */
+  const [searchMinSimilarity, setSearchMinSimilarity] = useState(0.4);
+  const [searchResultLimit, setSearchResultLimit] = useState(100);
   const [sortOrder, setSortOrder] = useState<SortOrder>(loadSortOrder);
   const [gridColumnWidth, setGridColumnWidth] = useState(loadGridColumnWidth);
   const [galleryToolbarHeight, setGalleryToolbarHeight] = useState(52);
@@ -488,6 +520,15 @@ function HomePage() {
     dateTo: string;
     keyword: string;
   } | null>(null);
+  /*
+   * 自用（2026-10-16，用户要求 ✓）：**整个界面**要不要按月分段（设置 → 外观 → 图片按时间分组）。
+   *   开启 = 列表里出现「2025年11月」这类月份标题
+   *   关闭 = 不分段、按当前排序方式平铺（**默认关闭**：读不到就是 false ✓）
+   * 作用范围是**整个图库界面**（整库浏览 + 搜索结果都听它 ✓）——
+   * 本版装的是素材图/插画，很多没有有意义的拍摄时间，按月分段只是噪声 ✗；
+   * 但保留开关，想分段的人自己打开 ✓。设置键：`appearance.groupPhotosByDate` ✓。
+   */
+  const [groupPhotosByDate, setGroupPhotosByDate] = useState(false);
 
   // --- TanStack Query hooks ---
   const isSearching = searchMode !== null;
@@ -561,6 +602,16 @@ function HomePage() {
       () => undefined
     );
   }, [handleSearch]);
+
+  // 自用（2026-10-16）：进页面时只读一次「图片按时间分组」（读不到 / 出错 = 关闭 ✓）。
+  useEffect(() => {
+    ipc.client.settings
+      .getAppSetting({ key: "appearance.groupPhotosByDate" })
+      .then((result) => {
+        setGroupPhotosByDate(result?.value === "true");
+      })
+      .catch(() => setGroupPhotosByDate(false));
+  }, []);
 
   useEffect(() => {
     const onTagsChanged = () => {
@@ -846,6 +897,7 @@ function HomePage() {
     tagIds: filter.activeTagIds.length > 0 ? filter.activeTagIds : undefined,
     tagMode: filter.tagMode,
     favoriteOnly: filter.favoriteOnly || undefined,
+    excludeHiddenFolders: hideHiddenFolders,
     ungroupedOnly: sequenceMode === "photos",
     sort: sortField,
     order: sortOrder,
@@ -914,7 +966,44 @@ function HomePage() {
   // Search results render from the committed response immediately so the
   // request state and masonry input cannot drift apart. Ordinary browse lists
   // still use a deferred copy to avoid blocking on very large transitions.
-  const rawPhotos = isSearching ? (searchResults ?? EMPTY_PHOTOS) : pagedPhotos;
+  /*
+   * 自用（方案 B）：检索永远搜全库，开关只决定"显不显示"隐藏目录的照片。
+   * 所以这里只对**显示用的数组**做过滤，不碰检索结果本身
+   *（结果数/总数不随开关变化）。
+   */
+  /*
+   * 自用（2026-10）：
+   *  ① 这里在**唯一的取数口**统一做两件事：按眼睛开关过滤显示、按 id 去重。
+   *  ② **两者都必须是 useMemo** —— 否则每次渲染都产生新数组，
+   *     下游（sequencePhotoIds 等）的 useMemo 依赖会全部失效 ✗，
+   *     虚拟列表反复重算 → "Maximum update depth exceeded" ✗ + 拖图/滚动卡顿。
+   *  ③ 去重覆盖"浏览 + 搜索 + 拖图"所有入口：
+   *     多路召回与分页衔接都可能把同一张照片带回多次，
+   *     重复 key 会引发上面那串问题 ✗。
+   */
+  const searchPhotosForDisplay = useMemo(
+    () =>
+      isSearching
+        ? (searchResults ?? EMPTY_PHOTOS).filter(
+            (photo) =>
+              !hideHiddenFolders ||
+              !(photo as { inHiddenFolder?: boolean }).inHiddenFolder
+          )
+        : pagedPhotos,
+    [hideHiddenFolders, isSearching, pagedPhotos, searchResults]
+  );
+  const rawPhotos = useMemo(() => {
+    const seen = new Set<number>();
+    const out: typeof searchPhotosForDisplay = [];
+    for (const photo of searchPhotosForDisplay) {
+      if (seen.has(photo.id)) {
+        continue;
+      }
+      seen.add(photo.id);
+      out.push(photo);
+    }
+    return out;
+  }, [searchPhotosForDisplay]);
   const sequencePhotoIds = useMemo(
     () => (isSearching ? rawPhotos.map((photo) => photo.id) : NO_PHOTO_IDS),
     [isSearching, rawPhotos]
@@ -2347,6 +2436,8 @@ function HomePage() {
     if (isSearching) {
       return (
         <SearchEmptyState
+            hideHiddenFolders={hideHiddenFolders}
+            onToggleHideHiddenFolders={toggleHideHiddenFolders}
           hasActiveFilters={hasActiveExifFilters}
           hasAiVectors={aiStatus?.hasVectors ?? false}
           indexedPhotos={searchSemantic?.indexedPhotos ?? 0}
@@ -2512,6 +2603,16 @@ function HomePage() {
       const searchParams: CompoundSearchParams = requestedCursor
         ? { cursor: requestedCursor, limit: 100 }
         : { limit: 100, offset: requestedOffset };
+      /*
+       * 自用（2026-10-16，**续页同刻度**）：
+       * 滑杆值必须和第一页完全一致 —— 它既是主进程的语义硬下限，
+       * 也参与 searchSessions 的指纹（createSearchFingerprint 直接展开整个 input）。
+       * 少了它，第 2 页会（1）指纹对不上 → cursorExpired，或
+       * （2）把低于下限的图又捞回来 ✗（用户要的是"滑杆拖到 40%，角标低于 40% 的图不该出现"）。
+       */
+      if (p.minSimilarity) {
+        searchParams.minSimilarity = p.minSimilarity;
+      }
       if (p.query.trim()) {
         searchParams.query = p.query.trim();
       }
@@ -2829,7 +2930,10 @@ function HomePage() {
     setSearchHasMore(false);
 
     try {
-      const searchParams: CompoundSearchParams = { limit: 100 };
+      const searchParams: CompoundSearchParams = { limit: searchResultLimit };
+      if (searchMinSimilarity > 0) {
+        searchParams.minSimilarity = searchMinSimilarity;
+      }
       if (query.trim()) {
         searchParams.query = query.trim();
       }
@@ -2895,6 +2999,9 @@ function HomePage() {
         query,
         filters,
         colorHex: effectiveColorHex ?? undefined,
+        // 自用（2026-10-16）：续页沿用同一个滑杆值（指纹也包含它，换了值就是新会话）✓
+        minSimilarity:
+          searchMinSimilarity > 0 ? searchMinSimilarity : undefined,
       };
 
       const result = (await searchPhotos(searchParams)) as SearchResponse;
@@ -3265,6 +3372,15 @@ function HomePage() {
       }
       const results = (result as { results?: Photo[] }).results ?? [];
       setSearchResults(results);
+      // 自用：指纹命中说明「这张图你存过」（只是分辨率/格式不同），
+      // 提示一下，否则用户只会看到网格里排最前面的几张，不知道是什么意思。
+      const exactCopyCount =
+        (result as { exactCopyCount?: number }).exactCopyCount ?? 0;
+      if (exactCopyCount > 0) {
+        toast.success(
+          t("imageSearchExactCopiesFound", { count: exactCopyCount })
+        );
+      }
       setSearchError(null);
       setSearchResultGeneration(gen);
       setSearchResultSourceKey(
@@ -3595,6 +3711,8 @@ function HomePage() {
               ) : undefined
             }
             filters={filter.searchDraft.filters}
+            hideHiddenFolders={hideHiddenFolders}
+            onToggleHideHiddenFolders={toggleHideHiddenFolders}
             imageSearchActive={searchMode === "image"}
             imageSearchReference={
               searchMode === "image" && imageSearchPath
@@ -3681,6 +3799,75 @@ function HomePage() {
                     })}
                   </button>
                 )}
+                {searchMode === "text" && (
+                  <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                    <span>{t("searchMinSimilarity")}</span>
+                    <input
+                      aria-label={t("searchMinSimilarity")}
+                      className="h-4 w-20 cursor-pointer accent-primary"
+                      max={100}
+                      min={0}
+                      onChange={(event) =>
+                        setSearchMinSimilarity(Number(event.target.value) / 100)
+                      }
+                      step={1}
+                      type="range"
+                      value={Math.round(searchMinSimilarity * 100)}
+                    />
+                    <span className="w-8 tabular-nums">
+                      {Math.round(searchMinSimilarity * 100)}%
+                    </span>
+                    {/*
+                      自用：显示**本次结果的实际分数区间**。
+                      SigLIP 的原始相似度本来就低（个位数百分比），只给一条 0~100 的滑条
+                      很容易像 26% 那样"看起来不高"却把结果全筛掉 —— 有区间就能照着设。
+                    */}
+                    {isSearching && searchResults && searchResults.length > 0
+                      ? (() => {
+                          const values = searchResults
+                            .map(
+                              (item) =>
+                                (item as { similarity?: number }).similarity
+                            )
+                            .filter(
+                              (value): value is number =>
+                                typeof value === "number" && value > 0
+                            );
+                          if (values.length === 0) {
+                            return null;
+                          }
+                          return (
+                            <span className="text-muted-foreground/60">
+                              {t("searchSimilarityRange", {
+                                max:
+                                  Math.round(Math.max(...values) * 1000) / 10,
+                                min:
+                                  Math.round(Math.min(...values) * 1000) / 10,
+                              })}
+                            </span>
+                          );
+                        })()
+                      : null}
+                  </label>
+                )}
+                <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                  <span>{t("searchResultLimit")}</span>
+                  <select
+                    aria-label={t("searchResultLimit")}
+                    className="h-6 rounded border border-border bg-card px-1 text-[11px]"
+                    onChange={(event) =>
+                      // 上限 300 是接口契约（shared.ts 的 CompoundSearchSchema），
+                      // 超过会被拒绝并导致"0 结果但不报错"
+                      setSearchResultLimit(Math.min(300, Number(event.target.value)))
+                    }
+                    value={searchResultLimit}
+                  >
+                    <option value={30}>30</option>
+                    <option value={100}>100</option>
+                    <option value={200}>200</option>
+                    <option value={300}>300</option>
+                  </select>
+                </label>
                 <SortDropdown
                   onChange={handleSortChange}
                   order={sortOrder}
@@ -3800,6 +3987,18 @@ function HomePage() {
                   }
                   routeKey={gallerySnapshot.value.routeKey}
                   searchQuery={searchQuery}
+                  /*
+                   * 自用（2026-10-16，用户要求 ✓）：**搜索结果永远不按时间分组** ✓
+                   * （用户原话："搜索这个时间栏还是很不对劲，干脆直接让开关不对搜索结果生效好了，
+                   *   相当于强制关闭状态" ✓）。
+                   * 所以：**只要在搜索状态就强制 false** ✓，完全无视「图片按时间分组」那个开关 ✓；
+                   * 不搜索（普通浏览图库）时才听开关 ✓。
+                   * 为什么这样最不容易出 bug ✓：关掉分组时 `PhotoGrid` 会**根本不生成**分组标题 ✓
+                   * （见其 `groupHeaders` 的 memo ✓），于是月份标题、标题位置、滚动时的悬浮小标签、
+                   * 以及"分组边界分层轮转"这一整套逻辑**全部自动失效** ✓ ——
+                   * 不需要在每个显示点各写一次判断 ✗（那才是 bug 温床 ✗）。
+                   */
+                  showGroupHeaders={isSearching ? false : groupPhotosByDate}
                   selectedIds={selectedIds}
                   semanticTopSimilarity={searchSemantic?.topSimilarity}
                   sequenceError={sequenceError}

@@ -182,6 +182,14 @@ function AppearanceSettingsPage() {
   );
   const [uiScale, setUiScale] = useState(1);
   const [searchSensitivity, setSearchSensitivity] = useState("standard");
+  /*
+   * 自用（2026-10-16，用户要求 ✓）：**整个界面**要不要按月分段。
+   *   开启 = 图库列表里出现「2025年11月」这类月份标题
+   *   关闭 = 不分段、按当前排序方式平铺（**默认关闭** ✓）
+   * 作用范围是整个图库界面（整库浏览 + 搜索结果都听它 ✓），
+   * 见 routes/index.tsx 里传给 PhotoGrid 的 showGroupHeaders ✓。
+   */
+  const [groupPhotosByDate, setGroupPhotosByDate] = useState(false);
   const initialAccentColorRef = useRef<AccentColor | null>(null);
   if (initialAccentColorRef.current === null) {
     initialAccentColorRef.current = accentColor;
@@ -192,6 +200,9 @@ function AppearanceSettingsPage() {
     null
   );
   const sensitivityQueueRef = useRef<OptimisticSaveQueue<string> | null>(null);
+  const groupPhotosByDateQueueRef = useRef<OptimisticSaveQueue<boolean> | null>(
+    null
+  );
 
   if (!uiScaleQueueRef.current) {
     uiScaleQueueRef.current = createOptimisticSaveQueue({
@@ -238,6 +249,19 @@ function AppearanceSettingsPage() {
     });
   }
 
+  if (!groupPhotosByDateQueueRef.current) {
+    groupPhotosByDateQueueRef.current = createOptimisticSaveQueue({
+      initialValue: false,
+      onRollback: (value) => setGroupPhotosByDate(value),
+      onSaveError: () => toast.error(t("saveFailed")),
+      persist: (value) =>
+        ipc.client.settings.setAppSetting({
+          key: "appearance.groupPhotosByDate",
+          value: String(value),
+        }),
+    });
+  }
+
   const hydrateAccentColor = useCallback((value: AccentColor) => {
     if (!accentColorQueueRef.current?.hydrate(value)) {
       applyAccentColor(accentColorRef.current);
@@ -260,6 +284,13 @@ function AppearanceSettingsPage() {
       return;
     }
     setSearchSensitivity(value);
+  }, []);
+
+  const hydrateGroupPhotosByDate = useCallback((value: boolean) => {
+    if (!groupPhotosByDateQueueRef.current?.hydrate(value)) {
+      return;
+    }
+    setGroupPhotosByDate(value);
   }, []);
 
   useEffect(() => {
@@ -290,7 +321,20 @@ function AppearanceSettingsPage() {
         );
       })
       .catch(() => hydrateSensitivity("standard"));
-  }, [hydrateAccentColor, hydrateSensitivity, hydrateUiScale]);
+
+    // 自用（2026-10-16）：读不到 = 关闭（默认不按时间分段 ✓）。
+    ipc.client.settings
+      .getAppSetting({ key: "appearance.groupPhotosByDate" })
+      .then((result) => {
+        hydrateGroupPhotosByDate(getSettingValue(result) === "true");
+      })
+      .catch(() => hydrateGroupPhotosByDate(false));
+  }, [
+    hydrateAccentColor,
+    hydrateGroupPhotosByDate,
+    hydrateSensitivity,
+    hydrateUiScale,
+  ]);
 
   function onUiScaleChange(scale: number) {
     setUiScale(scale);
@@ -330,6 +374,11 @@ function AppearanceSettingsPage() {
 
   function onReduceMotionChange(checked: boolean) {
     setReduceMotion(checked).catch(() => toast.error(t("saveFailed")));
+  }
+
+  function onGroupPhotosByDateChange(checked: boolean) {
+    setGroupPhotosByDate(checked);
+    groupPhotosByDateQueueRef.current?.enqueue(checked);
   }
 
   let themeDescription = t("themeSystem");
@@ -380,6 +429,18 @@ function AppearanceSettingsPage() {
           }
           description={t("searchSensitivityHint")}
           title={t("settingsSearchSensitivity")}
+        />
+        {/* 自用（2026-10-16）：紧跟在「匹配灵敏度」下面一行 ✓（默认关闭 ✓） */}
+        <SettingRow
+          action={
+            <Switch
+              ariaLabel={t("settingsGroupPhotosByDate")}
+              checked={groupPhotosByDate}
+              onCheckedChange={onGroupPhotosByDateChange}
+            />
+          }
+          description={t("settingsGroupPhotosByDateHint")}
+          title={t("settingsGroupPhotosByDate")}
         />
         <SettingRow
           action={

@@ -27,6 +27,7 @@ import { getActiveTagger, PRIVATE_BUILD } from "@/config/private-build";
 import {
   applyNegativeSemanticPenalty,
   filterCosineSearchResults,
+  dedupeByPhotoId,
   fuseRankedSearchEvidence,
   isValidEmbeddingVector,
   selectRelevantSemanticResults,
@@ -257,6 +258,14 @@ export async function embedImageInWorker(
   }
 }
 
+/*
+ * 自用（2026-10-16）：检索时显式探测多少个 IVF 分区 ✓。
+ * 索引分区数 ≈ √行数（7.7 万行 ≈ 278 个），不设 nprobes 时只探一小部分 ✗
+ * → 真正的最近邻可能没进候选 ✗（比"排序不准"更致命：候选里根本没有 ✓）。
+ * 64 个分区 ≈ 两成数据，7.7 万行下仍是毫秒级 ✓。
+ */
+const SEARCH_NPROBES = 64;
+
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Brute-force fallback keeps pagination, vector normalization, scoring, and safety limits in one path.
 async function fallbackSearch(
   queryVector: number[],
@@ -385,8 +394,24 @@ async function searchVector(
     const vq = photoTable
       .vectorSearch(queryVector)
       .distanceType("cosine")
+      /*
+       * 自用（2026-10-16，**修"该有的图没被取回来"**）：
+       * 索引有约 √行数 个分区（7.7 万行 ≈ 278 个），**不设 nprobes 时只探一小部分** ✗
+       * → 真正的最近邻可能压根没进候选 ✗，后面的排序再准也没用 ✗。
+       * 这里显式探 64 个分区（≈ 两成数据，7.7 万行下仍是毫秒级 ✓），
+       * 配合 refineFactor 用精确距离重排 ✓，召回与排序都更接近"精确检索" ✓。
+       */
+      .nprobes(SEARCH_NPROBES)
       .refineFactor(adaptiveRefine)
-      .limit(queryLimit);
+      /*
+       * 自用（2026-10-16，**修"候选深度白扔一半"** ✗→✓）：
+       * 实测 LanceDB 的 ivfFlat 检索**对每条命中返回 2 行相同 photo_id** ✗
+       * （`limit=200` 只兑现约 100 个不同 id ✓；以图搜图 `limit=20` 只剩约 10 张 ✗）。
+       * 所以这里**按 2 倍要** ✓，下面再 `dedupeByPhotoId` 去重 ✓ →
+       * 下游拿到的候选条数恢复成"用户要的那么多" ✓，而结果集大小与以前完全一致 ✓
+       * （去重后仍 `slice(0, limit)` ✓）→ 不改变使用感受 ✓，只是不再白扔一半 ✓。
+       */
+      .limit(queryLimit * 2);
     rawResults = (await vq.toArray()) as Record<string, unknown>[];
   } catch (err: unknown) {
     console.error("[AI] vectorSearch failed:", getErrorMessage(err));
@@ -397,10 +422,12 @@ async function searchVector(
   }
 
   const filtered = filterCosineSearchResults(
-    rawResults.map((result) => ({
-      distance: result._distance as number,
-      photoId: result.photo_id as number,
-    })),
+    dedupeByPhotoId(
+      rawResults.map((result) => ({
+        distance: result._distance as number,
+        photoId: result.photo_id as number,
+      }))
+    ),
     maxCosineDistance,
     limit
   );
@@ -552,7 +579,8 @@ async function multiPromptSearch(
   plan: SemanticQueryPlan,
   limit: number,
   timings: SearchTimings = { embedMs: 0, vectorMs: 0 },
-  sensitivity: SearchSensitivity = "standard"
+  sensitivity: SearchSensitivity = "standard",
+  minSimilarity = 0
 ): Promise<MultiPromptSearchResult> {
   if (!(embeddingModel && photoTable) || plan.prompts.length === 0) {
     return {
@@ -644,6 +672,13 @@ async function multiPromptSearch(
         ),
         promptGroupCount,
         sensitivity: s,
+        /*
+         * 自用（2026-10-16，**修"筛选阈值和角标不是一个刻度"**）：
+         * 顶栏滑杆的用户下限（IPC: minSimilarity）交给了评分层当硬下限 ✓。
+         * 它只作用于**语义结果**（这里的融合结果就是语义候选），
+         * 标签 / 文件名 / 人名 / 颜色命中的角标没有百分比，不归它管 ✓。
+         */
+        userMinSimilarity: minSimilarity,
       }
     );
     const exhausted = candidateDepth >= rowCount;
@@ -653,7 +688,7 @@ async function multiPromptSearch(
 
     if (enoughForPage || exhausted || !selection.hasMoreCandidates) {
       console.log(
-        `[AI] Semantic relevance: policy=${getSemanticPolicyVersion()} model=${model.kind} intent=${plan.intent} primary="${plan.prompts[primaryPromptIndex]?.text ?? ""}" prompts=${plan.rawPromptCount}->${plan.prompts.length} groups=${promptGroupCount} depth=${candidateDepth}/${rowCount} top=${selection.topSimilarity.toFixed(4)} cutoff=${selection.finalCutoff.toFixed(4)} reason=${selection.cutoffReason} strong=${selection.strongAccepted} supported=${selection.supportedAccepted} rejectedWeak=${selection.rejectedWeak} accepted=${selection.results.length} hasMore=${hasMore}`
+        `[AI] Semantic relevance: policy=${getSemanticPolicyVersion()} model=${model.kind} intent=${plan.intent} primary="${plan.prompts[primaryPromptIndex]?.text ?? ""}" prompts=${plan.rawPromptCount}->${plan.prompts.length} groups=${promptGroupCount} depth=${candidateDepth}/${rowCount} top=${selection.topSimilarity.toFixed(4)} cutoff=${selection.finalCutoff.toFixed(4)} minSim=${minSimilarity.toFixed(4)} reason=${selection.cutoffReason} strong=${selection.strongAccepted} supported=${selection.supportedAccepted} rejectedWeak=${selection.rejectedWeak} accepted=${selection.results.length} hasMore=${hasMore}`
       );
       return {
         candidateMinimum,
@@ -774,9 +809,10 @@ function setCachedSearch(
 
 export async function searchByText(
   query: string,
-  limit = 50
+  limit = 50,
+  options: SemanticTextSearchOptions = {}
 ): Promise<Array<{ photoId: number; similarity: number }>> {
-  return (await searchByTextWithPlan(query, limit)).results.map(
+  return (await searchByTextWithPlan(query, limit, options)).results.map(
     ({ photoId, similarity }) => ({ photoId, similarity })
   );
 }
@@ -802,10 +838,29 @@ export interface SemanticTextSearchResult {
   topSimilarity: number;
 }
 
+export interface SemanticTextSearchOptions {
+  /**
+   * 自用（2026-10-16，**修"筛选阈值和角标不是一个刻度"**）：
+   * 语义相似度硬下限（0~1），来自「全部图片」顶栏那条「相似度 ≥ N%」滑杆
+   * （IPC 的 `minSimilarity`，zod 里已声明、但主进程此前**没有任何地方读它** ✗）。
+   *
+   * 它被当作**硬下限**并入评分层的 strongCutoff：卡片角标显示的就是原始余弦相似度
+   * （PhotoCard: `match.score * 100`），所以滑杆值与角标天然同刻度 ✓，
+   * 滑杆拖到 40% 时角标低于 40% 的语义结果不会再出现 ✓。
+   * 只作用于**有相似度含义的结果**（语义 / 以图搜图），标签 / 文件名 / 人名 / 颜色
+   * 命中没有百分比，含义不同，不按它砍 ✓。
+   * 默认 0 / 不传 = 完全不改变原有行为（只会收紧、不会放宽）✓。
+   */
+  minSimilarity?: number;
+}
+
 export async function searchByTextWithPlan(
   query: string,
-  limit = 50
+  limit = 50,
+  options: SemanticTextSearchOptions = {}
 ): Promise<SemanticTextSearchResult> {
+  // 自用（2026-10-16）：滑杆下限在这里归一化一次，后续链路只传数值（沿用 sensitivity 的写法）。
+  const minSimilarity = options.minSimilarity ?? 0;
   if (!query.trim()) {
     return {
       candidateDepth: 0,
@@ -830,6 +885,12 @@ export async function searchByTextWithPlan(
   const cacheKey = JSON.stringify({
     embeddingFingerprint: getActiveEmbeddingFingerprint(),
     limit,
+    /*
+     * 自用（2026-10-16）：**滑杆值必须进缓存键** ✓ ——
+     * 否则用户把「相似度 ≥」从 0% 拖到 40% 再搜，会命中上一次 0% 的缓存结果 ✗，
+     * 看起来"滑杆还是不起作用" ✗（2 分钟 TTL 内尤其明显）。
+     */
+    minSimilarity,
     queryPlanFingerprint: getSemanticQueryPlanFingerprint(
       getTranslationModelVersion()
     ),
@@ -863,7 +924,7 @@ export async function searchByTextWithPlan(
   const searchPromise = (async () => {
     await initVectorDB();
     return withVectorDbOperation(() =>
-      performTextSearch(query, limit, cacheKey, sensitivity)
+      performTextSearch(query, limit, cacheKey, sensitivity, minSimilarity)
     );
   })();
   pendingTextSearches.set(cacheKey, searchPromise);
@@ -880,7 +941,8 @@ async function performTextSearch(
   query: string,
   limit: number,
   cacheKey: string,
-  sensitivity: SearchSensitivity
+  sensitivity: SearchSensitivity,
+  minSimilarity = 0
 ): Promise<SemanticTextSearchResult> {
   const totalStartedAt = Date.now();
   const timings: SearchTimings = { embedMs: 0, vectorMs: 0 };
@@ -976,7 +1038,9 @@ async function performTextSearch(
     getActiveEmbeddingFingerprint(),
     limit,
     getTranslationModelVersion(),
-    sensitivity
+    sensitivity,
+    // 自用（2026-10-16）：plan 级缓存键同样带上滑杆值，避免不同阈值互相命中缓存 ✗
+    minSimilarity
   );
   const planCached = getCachedSearch(effectiveCacheKey);
   if (planCached) {
@@ -985,7 +1049,7 @@ async function performTextSearch(
   }
   const semanticSearch =
     plan.prompts.length > 0
-      ? await multiPromptSearch(plan, limit, timings, sensitivity)
+      ? await multiPromptSearch(plan, limit, timings, sensitivity, minSimilarity)
       : {
           candidateMinimum: 0,
           candidateDepth: 0,
@@ -1010,9 +1074,24 @@ async function performTextSearch(
     sensitivityMultiplier: getSensitivityMultiplier(sensitivity),
   };
 
-  setCachedSearch(cacheKey, searchResult);
-  if (effectiveCacheKey !== cacheKey) {
-    setCachedSearch(effectiveCacheKey, searchResult);
+  /*
+   * 自用（2026-10-16，**修"被超时放弃的那次搜索仍把结果写进缓存"** ✗→✓）：
+   *
+   * 走查发现：调用方用 `withTimeout` 放弃一次搜索后 ✗，**那个 promise 还在跑** ✓，
+   * 跑完照样执行 `setCachedSearch` ✓ → 如果它当时拿到的是"降级空结果"✗
+   * （模型没就绪 ✓ / 向量库刚换 ✓ / 正在重建索引 ✓），就会把"**0 条**"缓存 2 分钟 ✗
+   * → 用户**接下来 2 分钟怎么搜都是 0 结果** ✗（很可能正是"搜三次才出结果"的另一半原因 ✓）。
+   *
+   * 所以加一道闸：**空结果一律不写缓存** ✓ ——
+   * "0 条"在绝大多数情况下不是真实结论 ✗，而是临时状态 ✓；
+   * **非空结果照旧缓存** ✓（所以正常搜索的性能与命中率一点不变 ✓）。
+   * `searchCacheModel/Table`（用于模型/表变更时整体失效 ✓）仍照常更新 ✓，不受影响 ✓。
+   */
+  if (semanticSearch.results.length > 0) {
+    setCachedSearch(cacheKey, searchResult);
+    if (effectiveCacheKey !== cacheKey) {
+      setCachedSearch(effectiveCacheKey, searchResult);
+    }
   }
   searchCacheModel = embeddingModel;
   searchCacheTable = photoTable;

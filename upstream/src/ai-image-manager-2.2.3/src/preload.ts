@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer, webUtils } from "electron";
+﻿import { contextBridge, ipcRenderer, webUtils } from "electron";
 import { IPC_CHANNELS, type WanderLifecycleState } from "./constants";
 
 let latestWanderLifecycleState: WanderLifecycleState | null = null;
@@ -84,6 +84,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   restartApp: (): void => {
     ipcRenderer.send("app:restart");
   },
+  /**
+   * 自用（2026-10-17）：**告诉主进程"界面已经画出第一帧了"** ✓
+   * 主进程收到才显示窗口 —— 原来靠 ready-to-show（那只是空白帧），
+   * 于是窗口先弹出来、里面一片白 ✗（用户实测："窗口先出来然后看白底"）。
+   */
+  notifyRendererReady: (): void => {
+    ipcRenderer.send("app:renderer-ready");
+  },
   installUpdate: (): void => {
     ipcRenderer.send("app:install-update");
   },
@@ -156,13 +164,6 @@ ipcRenderer.on("update:status", (_event, payload) => {
 // GPU prompt events removed — GPU detection is now integrated into
 // the Onboarding overlay flow (step 2), not a standalone popup.
 
-ipcRenderer.on("face-detection-progress", (_event, payload) => {
-  postToRenderer({ channel: "face-detection-progress", ...payload });
-});
-
-ipcRenderer.on("face-detection-done", (_event, payload) => {
-  postToRenderer({ channel: "face-detection-done", ...payload });
-});
 
 ipcRenderer.on("window:maximize-change", (_event, isMaximized: boolean) => {
   postToRenderer({ channel: "window:maximize-change", isMaximized });

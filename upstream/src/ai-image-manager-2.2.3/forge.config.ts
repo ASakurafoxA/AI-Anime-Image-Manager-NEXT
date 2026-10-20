@@ -78,6 +78,25 @@ function stageReleaseModels(): void {
       );
       continue;
     }
+    /*
+     * 自用（NEXT，2026-10）：SigLIP 与 opus-mt（中译英）已被**中文 CLIP** 取代
+     * （`private-build.ts` 里嵌入模型默认 `chinese-clip`：中文原生，
+     *  既不再需要中译英那一步，也不再需要 SigLIP）。
+     * 两者合计约 **321 MB**，白打进安装包只是让包变大 ✗，所以这里一并跳过 ✓。
+     *
+     * ⚠️ 注意这不等于"删掉能力"：它们仍是**回退路径** —— 把嵌入模型切回 `siglip`
+     *    依然可用；本机图库里已有这两个模型就照常能跑，缺失时客户端也能按需下载 ✓。
+     *    这里仅仅是不再把它们**塞进安装包**。
+     */
+    if (
+      entry.subPath.startsWith("Xenova/siglip") ||
+      entry.subPath.startsWith("Xenova/opus-mt")
+    ) {
+      console.log(
+        `[release-models] 跳过已被替换的旧模型（改用中文 CLIP）：${entry.fileName}`
+      );
+      continue;
+    }
     const source = path.join("models", entry.subPath, entry.fileName);
     const target = path.join(RELEASE_MODELS_DIR, entry.subPath, entry.fileName);
     if (!fs.existsSync(source)) {
@@ -312,6 +331,19 @@ const config: ForgeConfig = {
     ...(packageTempSuffix
       ? { out: path.join("out", `package-${packageTempSuffix}`) }
       : {}),
+    /*
+     * 自用（2026-10-21 · 会话#10）：**每次构建改 exe 的文件版本**，否则 MSI 升级会坏。
+     *
+     * 踩到的坑：之前所有构建的 exe 都是 `FileVersion=2.2.3`（四段相同），
+     * Windows Installer 的"文件版本"规则认为它和已安装的一样 → **不复制 exe**；
+     * 而 `app.asar` 没有版本号 → 被复制。结果装完是"旧 exe + 新 asar"，
+     * 启动直接 `FATAL: Integrity check failed for asar archive`（asar 完整性哈希对不上）。
+     * 所以版本号必须变：打包脚本设 `AIM_FILE_VERSION=2.2.3.N` → 这里作为 `buildVersion`
+     * 写进 exe 的 FileVersion（@electron/packager 的 fileVersion = buildVersion || appVersion）。
+     */
+    ...(process.env.AIM_FILE_VERSION?.trim()
+      ? { buildVersion: process.env.AIM_FILE_VERSION.trim() }
+      : {}),
     asar: {
       unpack:
         "**/{better-sqlite3,sharp,@lancedb,@lancedb/lancedb-win32-x64-msvc,@lancedb/lancedb-win32-arm64-msvc,@img,node-*,detect-libc,semver,scripts,@xenova,@huggingface,onnxruntime-node,onnxruntime-common,onnxruntime-web,color,color-convert,color-name,color-string,simple-swizzle,is-arrayish,exifr,exiftool-vendored,exiftool-vendored.exe}/**",
@@ -320,6 +352,7 @@ const config: ForgeConfig = {
       "models-release",
       "drizzle",
       "assets/icon.png",
+      "assets/icon-tray.png",
       "THIRD_PARTY_NOTICES.md",
       "THIRD_PARTY_MODEL_NOTICES.md",
       "licenses",

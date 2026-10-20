@@ -1,4 +1,4 @@
-@import "tailwindcss";
+﻿@import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/inter";
@@ -1132,6 +1132,79 @@ html.transitioning [data-theme-sensitive] {
     transform: translateY(0);
   }
 }
+
+/*
+ * 自用（2026-10-16）：设置页"二级选项出现"的入场动画 ✓（用户要求 ✓）。
+ * 用在「设置 → 应用行为 → 开机补扫」里：打开总开关后，第二行会出现 ✓，
+ * 用一点点淡入 + 轻微下滑，避免"啪"一下蹦出来 ✗。
+ * 与项目其他动画一致：prefers-reduced-motion 时直接关掉 ✓。
+ */
+@keyframes setting-row-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-setting-row-enter {
+  animation: setting-row-enter 220ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-setting-row-enter {
+    animation: none;
+  }
+}
+/*
+ * 自用（2026-10-18 · 会话#9 用户要求）：「展开/退出图集、右键缩略图都要有动画」✓
+ *   · `.album-view-enter`   —— 进入某个角色的图集时：淡入 + 轻微上浮
+ *   · 退出图集回到角色列表时用的是**同一个类**（靠 `key` 让 React 重新挂载 → 动画重播）✓
+ *   · `.context-menu-pop`   —— 右键菜单：从点击位置轻微放大出现
+ * 与项目其它动画一致：`prefers-reduced-motion` 时全部关掉 ✓
+ */
+@keyframes album-view-enter {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.album-view-enter {
+  animation: album-view-enter 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes context-menu-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.context-menu-pop {
+  animation: context-menu-pop 140ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  transform-origin: top left;
+}
+
+/*
+ * ⚠️ 这里**故意不再**用 `@media (prefers-reduced-motion: reduce)` 关这两个动画 ——
+ * 用户口径：「动画要能和**设置里那个减少动画的选项**关联」：
+ * 由组件读 `useReducedMotion()`（设置项 `ui.reduceMotion`）决定加不加类 ✓
+ * 如果这里再叠一层系统级媒体查询，Windows 关了"动画效果"就会出现
+ * "设置里明明开着动画、却怎么都看不到"的怪现象 ✗
+ */
+
 
 .animate-page-enter {
   animation: page-enter 200ms ease-out both;
@@ -3116,8 +3189,8 @@ html[data-theme-transition="circle"] .theme-toggle-switch * {
 }
 
 .whats-new-brand-icon {
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   object-fit: cover;
   border: 1px solid color-mix(in srgb, var(--foreground) 12%, transparent);
   border-radius: 7px;

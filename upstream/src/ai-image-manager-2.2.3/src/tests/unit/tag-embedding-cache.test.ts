@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  CHINESE_CLIP_V1_ADAPTER_ID,
+  SIGLIP_V1_ADAPTER_ID,
+  setActiveEmbeddingAdapter,
+} from "@/services/ai/model-adapter";
 import { setEmbeddingModel } from "@/services/ai/state";
 import {
   _ensureTagEmbeddingsForTest,
@@ -9,6 +14,14 @@ import {
 function vector(value = 1): number[] {
   return Array.from({ length: 768 }, () => value);
 }
+
+/*
+ * 自用（2026-10 换中文 CLIP）：这套用例描述的是 **SigLIP** 那条路径的行为
+ *（它仍保留作回退路线），而默认活动模型已换成 Chinese-CLIP，
+ * 所以这里显式切回 SigLIP；用例结束恢复默认，避免影响别的用例。
+ */
+beforeEach(() => setActiveEmbeddingAdapter(SIGLIP_V1_ADAPTER_ID));
+afterEach(() => setActiveEmbeddingAdapter(CHINESE_CLIP_V1_ADAPTER_ID));
 
 describe("tag embedding cache", () => {
   beforeEach(() => {

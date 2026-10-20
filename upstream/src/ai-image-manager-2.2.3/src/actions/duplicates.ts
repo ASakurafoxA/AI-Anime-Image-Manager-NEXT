@@ -3,6 +3,8 @@ import { ipc } from "@/ipc/manager";
 export const duplicateActions = {
   getScanProgress: () => ipc.client.photos.getDuplicateScanProgress(),
   cancelScan: () => ipc.client.photos.cancelDuplicateScan(),
+  /** 自用（2026-10-17）：暂停 —— 停下但保留进度，点「继续」会复用已算好的哈希 ✓ */
+  pauseScan: () => ipc.client.photos.pauseDuplicateScan(),
   listCleanupBatches: () => ipc.client.photos.listDuplicateCleanupBatches(),
   dismissGroup: (groupKey: string, dismissed = true) =>
     ipc.client.photos.dismissDuplicates({ groupKey, dismissed }),

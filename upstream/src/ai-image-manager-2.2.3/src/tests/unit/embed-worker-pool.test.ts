@@ -68,7 +68,8 @@ function emitReady(child: (typeof childProcessMock.children)[number]): void {
 }
 
 function normalizedVector(): number[] {
-  return [1, ...Array.from({ length: 767 }, () => 0)];
+  // 512 维（= 当前活动适配器 Chinese-CLIP 的维度）：首位 1，其余 0
+  return [1, ...Array.from({ length: 511 }, () => 0)];
 }
 
 /**
@@ -324,7 +325,7 @@ describe("embed worker pool lifecycle", () => {
     expect(child.kill).toHaveBeenCalled();
   });
 
-  it("accepts a finite 768-dimensional L2 image vector", async () => {
+  it("accepts a finite 512-dimensional L2 image vector", async () => {
     vi.stubEnv("AI_EMBED_WORKERS", "1");
     const { embedSingleImage, initWorkerPool, shutdownPool } = await import(
       "@/services/embed-worker-pool"
@@ -342,7 +343,7 @@ describe("embed worker pool lifecycle", () => {
       results: [{ id: 0, vector: normalizedVector() }],
     });
 
-    await expect(result).resolves.toHaveLength(768);
+    await expect(result).resolves.toHaveLength(512);
     shutdownPool();
   });
 
@@ -350,7 +351,7 @@ describe("embed worker pool lifecycle", () => {
     ["empty", []],
     ["wrong-dimensional", [1]],
     ["non-finite", [Number.NaN, ...Array.from({ length: 767 }, () => 0)]],
-    ["non-L2", Array.from({ length: 768 }, () => 0)],
+    ["non-L2", Array.from({ length: 512 }, () => 0)],
   ])("rejects a %s image vector", async (_label, vector) => {
     vi.stubEnv("AI_EMBED_WORKERS", "1");
     const { embedSingleImage, initWorkerPool, shutdownPool } = await import(

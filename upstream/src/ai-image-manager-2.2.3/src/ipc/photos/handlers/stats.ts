@@ -35,7 +35,6 @@ import { getActiveEmbeddingAdapterFingerprint } from "@/services/ai/model-config
 import { getThresholdProfileIdentity } from "@/services/ai/threshold-profile";
 import { getDuplicateVectorRevision } from "@/services/ai/vector-db";
 import { getPhotoVectors } from "@/services/ai-embedder";
-import { BKTree } from "@/services/bk-tree";
 import {
   aggregateFromStoredColors,
   computeColorDistribution,
@@ -57,10 +56,14 @@ import {
 } from "@/services/duplicate-review";
 import {
   cancelDuplicateScan,
+  consumePauseRequest,
   type DuplicateScanContext,
   getDuplicateScanProgress,
+  hasActiveDuplicateScan,
+  isPauseRequested,
   markDuplicateScanActive,
   markDuplicateScanFinished,
+  pauseDuplicateScan,
   runDuplicateScan,
 } from "@/services/duplicate-scan-runtime";
 import { getDuplicateSensitivityConfig } from "@/services/duplicate-sensitivity";
@@ -70,6 +73,7 @@ import {
   FULL_FILE_HASH_VERSION,
   filesHaveSameBytes,
 } from "@/services/file-hash";
+import { collectLibraryPhashPairs } from "@/services/phash-index";
 import {
   cleanupDeletedPhotoSequenceMembers,
   getPhotoSequenceRevision,
@@ -132,6 +136,29 @@ const DUPLICATE_SCANNED_SIGNATURE_KEY = "duplicates.scannedSignature";
 const DUPLICATE_DETECTION_ALGORITHM_VERSION =
   "duplicate-v3-reframed-candidates";
 const DUPLICATE_PHASH_VERSION = "phash-v1";
+/**
+ * 「重新构图」的图 pHash 会飘到 16 左右，需要靠 AI 相似度确认 —— 所以候选要加宽。
+ * 原实现用 `bkTree.query(phash, Math.max(phashThreshold, 16))` 逐张查询，
+ * 77,296 张实测 **20 分钟都跑不完**，这正是查重从未产出结果的原因。
+ * 现在改为「精确档 + 加宽档」两遍分桶（见下），并设总量上限。
+ */
+const DUPLICATE_WIDE_PHASH_THRESHOLD = 16;
+/**
+ * 加宽档只在**小库**启用。实测（77,296 张、阈值 16）：加宽档产出 176,799 对，
+ * 其中 **132,702 对距离正好是 16**（几乎全是噪声），且涉及 45,898 张图 ——
+ * Phase 2 要给这些图全部取向量做 AI 确认，代价与收益完全不成比例。
+ * 小库（夹具/小图库）下它是完整而廉价的，因此按库规模设闸。
+ *
+ * 已知局限：大库不启用加宽档，意味着「重新构图」的重复（pHash 距离 9~16）
+ * 不会被 pHash 捞出。要补这一类，正确做法是用向量索引产生候选
+ * （CLIP/CCIP 的相似度检索），而不是把 pHash 阈值开大。
+ */
+const DUPLICATE_WIDE_PASS_MAX_PHOTOS = 10_000;
+/**
+ * 候选配对总量上限。加宽档在 7.7 万张上按阈值 16 生成全部配对会爆炸
+ * （内存与耗时都失控），所以精确档优先、加宽档只在上限内尽量补。
+ */
+const DUPLICATE_MAX_CANDIDATE_PAIRS = 200_000;
 const DUPLICATE_PREVIEW_LIMIT = 24;
 const DUPLICATE_DETAIL_LIMIT = 48;
 
@@ -1187,7 +1214,14 @@ function failDuplicateDetectionRun(
     status = "stale";
   }
   if (error instanceof Error && error.message.startsWith("SCAN_CANCELLED")) {
-    status = "cancelled";
+    /*
+     * 自用（2026-10-17，查重暂停）：同一个"停下"机制有两种语义 ✓
+     *   · 用户点「暂停」→ 记录成 `paused`（可以继续，继续会复用已算好的哈希）
+     *   · 用户点「取消」/ 被新请求顶掉 → `cancelled`
+     * 两者在库里可区分，排查时不会再混 ✓
+     * 注意这里只 **peek**，真正"消费"标记的是 IPC handler（它要把结果变成"已暂停"）✓
+     */
+    status = isPauseRequested() ? "paused" : "cancelled";
   }
   db.update(duplicateDetectionRuns)
     .set({
@@ -1646,6 +1680,15 @@ async function scanDuplicates(
     // Burst/timelapse photos are managed by the sequence workflow, not duplicate cleanup.
     .all()
     .filter((photo) => !sequenceByPhoto.has(photo.id));
+  /*
+   * 自用（2026-10-17）：**每 500 张让出一次事件循环、并响应取消** ✗→✓。
+   *
+   * 原来这个循环对**全库每张图**都同步 `fs.statSync`（本机 7.7 万张），
+   * 中间一次不让出 → 主进程被占死、界面冻住十几秒，连「取消」都点不动 ✗
+   * （用户看到的"一开扫描就像卡住/被取消"就是这个）。
+   * 让出之后：界面能刷新、进度能走、取消能立刻生效 ✓。
+   */
+  let statChecked = 0;
   for (const photo of allPhotos) {
     try {
       const stat = fs.statSync(photo.path);
@@ -1658,6 +1701,11 @@ async function scanDuplicates(
       }
     } catch {
       // The staged hash step will skip an unreadable source file.
+    }
+    statChecked += 1;
+    if (statChecked % 500 === 0) {
+      context.assertCurrent();
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
   }
   const photoRevision = createDuplicatePhotoRevision(allPhotos);
@@ -1892,51 +1940,64 @@ async function scanDuplicates(
       }
     }
 
-    // --- Phase 1: BK-Tree pHash near-neighbor search ---
+    // --- Phase 1: 共用 pHash 引擎的候选检索（两档）---
+    // 精确档：按配置阈值完整生成，保证「同一张图、不同分辨率」一律不漏。
+    // 加宽档：阈值抬到 16 捞出「重新构图」的候选，交给 Phase 2 用 AI 确认；
+    //        全库按 16 生成全部配对数会爆炸，因此只在上限内尽量补。
+    // 注意：`collectLibraryPhashPairs` 内部是一次同步计算，无法中途报告进度，
+    // 取消会在它返回后的第一个 assertCurrent 生效。
     const photosWithHash = allPhotos.filter(
       (p): p is (typeof allPhotos)[number] & { phash: string } =>
         p.phash != null
     );
-    const bkTree = new BKTree();
-    for (const p of photosWithHash) {
-      bkTree.insert(p.id, p.phash);
-    }
+    context.report("matching", 0, photosWithHash.length);
+    const precisePairs = collectLibraryPhashPairs(
+      phashThreshold,
+      DUPLICATE_MAX_CANDIDATE_PAIRS
+    );
+    const wideThreshold = Math.max(
+      phashThreshold,
+      DUPLICATE_WIDE_PHASH_THRESHOLD
+    );
+    const widePairs =
+      wideThreshold > phashThreshold &&
+      photosWithHash.length <= DUPLICATE_WIDE_PASS_MAX_PHOTOS
+        ? collectLibraryPhashPairs(
+            wideThreshold,
+            Math.max(0, DUPLICATE_MAX_CANDIDATE_PAIRS - precisePairs.length)
+          )
+        : [];
+    const phashPairs = [...precisePairs, ...widePairs];
 
     let phashProcessed = 0;
-    for (const p of photosWithHash) {
-      context.report("matching", phashProcessed++, photosWithHash.length);
-      // Reframing can shift pHash substantially. Wider candidates still need
-      // AI confirmation; the no-vector fallback retains the narrower cutoff.
-      const neighbors = bkTree.query(p.phash, Math.max(phashThreshold, 16));
-      for (const n of neighbors) {
-        if (n.photoId === p.id) {
-          continue;
-        }
-        const aId = Math.min(p.id, n.photoId);
-        const bId = Math.max(p.id, n.photoId);
-        const hashA = verifiedExactHashByPhotoId.get(aId);
-        if (hashA && hashA === verifiedExactHashByPhotoId.get(bId)) {
-          continue;
-        }
-        const key = `${aId}_${bId}`;
-        if (seenPairs.has(key)) {
-          continue;
-        }
-        seenPairs.add(key);
-        candidates.push({
-          photoAId: aId,
-          photoBId: bId,
-          matchType: "phash",
-          phashDistance: n.distance,
-          clipSimilarity: null,
-        });
+    for (const pair of phashPairs) {
+      const { photoAId: aId, photoBId: bId } = pair;
+      // SHA-256 完全相同的配对已在上面按 "exact" 处理，这里跳过
+      const hashA = verifiedExactHashByPhotoId.get(aId);
+      if (hashA && hashA === verifiedExactHashByPhotoId.get(bId)) {
+        continue;
       }
+      const key = `${aId}_${bId}`;
+      if (seenPairs.has(key)) {
+        continue;
+      }
+      seenPairs.add(key);
+      candidates.push({
+        photoAId: aId,
+        photoBId: bId,
+        matchType: "phash",
+        phashDistance: pair.distance,
+        clipSimilarity: null,
+      });
 
-      // Yield event loop every 500 photos
+      phashProcessed++;
+      // Yield event loop every 500 pairs so cancel stays responsive
       if (phashProcessed % 500 === 0) {
+        context.assertCurrent();
         await new Promise<void>((r) => setImmediate(r));
       }
     }
+    context.report("matching", photosWithHash.length, photosWithHash.length);
 
     // --- Phase 2: SigLIP vector verification ---
     // Sort by distance (lower = more likely duplicate)
@@ -1962,11 +2023,23 @@ async function scanDuplicates(
 
     for (const c of candidates) {
       if (c.matchType === "exact") {
-        // Exact SHA-256 match �?no CLIP needed
+        // Exact SHA-256 match — no CLIP needed
         confirmedPairs.push(c);
         continue;
       }
 
+      // 指纹距离已经在配置阈值内 = 「同一张图（可能只是分辨率/格式不同）」，
+      // **直接确认，不再让 AI 相似度去否决它**。
+      // 为什么必须这样：实测（2,297 张样本）真重复的语义相似度中位 0.988，
+      // 但最低只有 0.844 —— 用 0.95/0.98 去卡会静默丢掉约 10~20% 的真重复；
+      // 而阈值 4 的指纹匹配在 1,400 次真实查询里零误报，本身已足够可信。
+      if (c.phashDistance <= phashThreshold) {
+        c.matchType = "phash";
+        confirmedPairs.push(c);
+        continue;
+      }
+
+      // 更宽的候选（「重新构图」那类，只有小库才会产生）才需要 AI 确认
       const vecA = vectors.get(c.photoAId);
       const vecB = vectors.get(c.photoBId);
 
@@ -1977,14 +2050,6 @@ async function scanDuplicates(
           c.matchType = "clip_confirmed";
           confirmedPairs.push(c);
         }
-      } else if (c.phashDistance <= 3) {
-        // No vectors: use distance-based confidence
-        // High confidence without CLIP
-        confirmedPairs.push(c);
-      } else if (c.phashDistance <= phashThreshold) {
-        // distance 4-8 without vectors: keep as pending for manual review
-        c.matchType = "phash";
-        confirmedPairs.push(c);
       }
     }
 
@@ -2060,23 +2125,93 @@ export const findDuplicates = os
       forceRescan: z.boolean().optional().default(false),
     })
   )
-  .handler(({ input }) =>
-    runDuplicateScan(
-      JSON.stringify([
-        input,
-        getSetting("duplicates.settingsRevision"),
-        getPhotoSequenceRevision(),
-      ]),
-      (context) => scanDuplicates(input, context)
-    )
-  );
+  .handler(async ({ input }) => {
+    /*
+     * ⚠️ key 里**不要**放 getPhotoSequenceRevision() / settingsRevision。
+     * 这两个值在扫描期间随时会变（例如后台索引器在跑），于是每次重复调用
+     * 都算「新的请求」→ 把正在跑的扫描顶掉 → 记录成
+     * `SCAN_CANCELLED: Duplicate scan was superseded or cancelled`。
+     * 库里 6 条检测记录全是这样被取消的（1~16 秒就结束）。
+     * 「结果是否过期」由任务内部的签名比对决定（见 scanDuplicates 里的
+     * scannedSignature / scannedSequenceRevision），不属于请求标识。
+     *
+     * 自用（2026-10-17，用户实测："退出到主界面，重复检测被取消了"）：
+     * **`forceRescan` 也不能放进 key** ✗→✓ —— 它只是"要不要绕过缓存"，
+     * 不是"换一个扫描对象"。而界面上「开始检测」发 `forceRescan:false`、
+     * 「重新扫描」发 `forceRescan:true`，两个按钮参数不同 →
+     * 后点的那次被当成"新请求"，把正在跑的那次顶掉 ✗（实测 4 条就是这样被取消的）。
+     * 现在 key 只看"扫什么"（threshold 决定档位）→ 同一个目标永远只有一个扫描，
+     * 重复请求会**加入**正在跑的那次（`runDuplicateScan` 的 pending 去重）✓。
+     *
+     * 自用（2026-10-17 第二轮，用户实测："第一次点暂停，过一会它又自己开始扫"）：
+     * **暂停 / 取消不再当"失败"抛出** ✗→✓
+     *
+     * 抛出会让界面那次请求变成错误状态 → React Query 按默认重试策略
+     * **又把扫描重新发起**（实测：暂停后 3~6 秒就冒出一个新 run，连续 4 条）✗✗。
+     * 现在：只要这次停下是"用户按了暂停/取消"，就把**已保存的结果**原样返回，
+     * 附一个 `stopped` 标记 → 界面显示「已暂停」或恢复原样，**不会报错、也不会自动重扫** ✓
+     * 同时"取消不清空结果"也满足用户口径（结果本来就是上次保存的那份）✓
+     */
+    try {
+      return await runDuplicateScan(
+        JSON.stringify([{ threshold: input.threshold ?? null }]),
+        (context) => scanDuplicates(input, context)
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (message.startsWith("SCAN_CANCELLED")) {
+        const stopped = consumePauseRequest() ? "paused" : "cancelled";
+        const saved = readSavedDuplicateGroups();
+        return { ...saved, stopped };
+      }
+      throw error;
+    }
+  });
 
-export const getDuplicateScanProgressHandler = os.handler(() =>
-  getDuplicateScanProgress()
-);
+/*
+ * 自用（2026-10-17，用户实测："退出到主界面，重复检测就被取消了"）：
+ * 除了进度，还要回答一句「**后台现在是不是正在扫**」✓。
+ *
+ * 为什么必须加：扫描是**主进程自己跑完**的，离开页面并不会停 ✗→✓；
+ * 但界面原来只在"本页正在取数"时才轮询这条进度，离开就停、回来也不知道
+ * 后台还在扫 → 显示成"从来没扫过 / 被取消" ✗（用户看到的就是这个）。
+ *
+ * `active` 的判据有两条，缺一不可：
+ *   · `hasActiveDuplicateScan()`：运行期登记表（真正在读写文件/向量时置位）；
+ *   · **阶段本身**：`runDuplicateScan` 一进来就把阶段设成 `queued`，
+ *     而登记表要等 `beginDuplicateDetectionRun` 才置位 —— 中间那段（含全库
+ *     7.7 万次文件检查）界面也得知道"有人在扫"，否则又会显示成没扫 ✓。
+ */
+const RUNNING_SCAN_STAGES = new Set([
+  "queued",
+  "hashing",
+  "matching",
+  "verifying",
+  "publishing",
+]);
+
+export const getDuplicateScanProgressHandler = os.handler(() => {
+  const progress = getDuplicateScanProgress();
+  return {
+    ...progress,
+    active: hasActiveDuplicateScan() || RUNNING_SCAN_STAGES.has(progress.stage),
+  };
+});
 export const cancelDuplicateScanHandler = os.handler(() => {
   cancelDuplicateScan();
   return { cancelled: true };
+});
+
+/**
+ * 自用（2026-10-17，待办「查重的暂停 / 断点继续」）：暂停 ✓
+ *
+ * 语义：在下一个检查点停下，**保留已完成的部分**（文件哈希等已落库）；
+ * 点「继续」时再调 `findDuplicates`，会**复用**已算好的哈希 → 等于接着扫 ✓
+ * （真正"原地挂起"是另一条更大的待办「真正挂起式暂停」✗，这里不做）
+ */
+export const pauseDuplicateScanHandler = os.handler(() => {
+  pauseDuplicateScan();
+  return { paused: true };
 });
 
 export const getDuplicateScan = os
@@ -2106,7 +2241,15 @@ export const getDuplicateScan = os
  * 用途：进入重复检测页时先用它**立刻显示上次结果**（很快），
  * 只有用户点「开始检测 / 重新扫描」才走真正的扫描。
  */
-export const getSavedDuplicateGroups = os.handler(() => {
+export const getSavedDuplicateGroups = os.handler(() =>
+  readSavedDuplicateGroups()
+);
+
+/**
+ * 自用（2026-10-17）：把"读上次结果"抽成一个**普通函数** ✓
+ * —— 暂停/取消时 `findDuplicates` 也要返回同一份数据（原来它是个 oRPC handler，不可直接调用 ✗）。
+ */
+function readSavedDuplicateGroups() {
   const db = getDatabase();
   const persisted = loadNonSequenceDuplicatePairs(db);
   const hydrated = hydrateDuplicateGroups(db, persisted);
@@ -2130,7 +2273,7 @@ export const getSavedDuplicateGroups = os.handler(() => {
      */
     hasSavedResult: persisted.length > 0 || Boolean(signature),
   };
-});
+}
 
 export const getDuplicateGroupPhotos = os
   .input(

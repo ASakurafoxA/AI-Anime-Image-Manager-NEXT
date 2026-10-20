@@ -1,4 +1,9 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  CHINESE_CLIP_V1_ADAPTER_ID,
+  SIGLIP_V1_ADAPTER_ID,
+  setActiveEmbeddingAdapter,
+} from "@/services/ai/model-adapter";
 import {
   canonicalizeSemanticPrompt,
   extractNegativeClauses,
@@ -18,6 +23,16 @@ afterEach(() => {
     process.env.AI_ZH_QUERY_STRATEGY = originalStrategy;
   }
 });
+
+/*
+ * 自用（2026-10 换中文 CLIP）：**这套用例描述的是「SigLIP + 中译英」那条老路径**
+ * —— 它仍然保留着（作为回退路线，见 model-adapter 里的两个适配器），
+ * 但默认活动模型已经换成 Chinese-CLIP（中文原生、不翻译），
+ * 所以这里显式切回 SigLIP 来跑；用例结束再恢复成 Chinese-CLIP，
+ * 避免影响同文件里描述新路径的用例。
+ */
+beforeEach(() => setActiveEmbeddingAdapter(SIGLIP_V1_ADAPTER_ID));
+afterEach(() => setActiveEmbeddingAdapter(CHINESE_CLIP_V1_ADAPTER_ID));
 
 describe("SemanticQueryPlan", () => {
   it("英文查询不经过翻译", async () => {

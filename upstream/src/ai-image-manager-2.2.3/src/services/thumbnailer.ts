@@ -426,7 +426,48 @@ export async function deleteDuelPreview(imagePath: string): Promise<void> {
   }
 }
 
+/*
+ * 自用（2026-10-16）：**加耗时日志** ✓。
+ *
+ * 原来只知道"清理器很慢" ✗，日志里没有任何数字，没法判断是该优化还是该等。
+ * 现在每次检查都记一条：耗时 / 扫了多少个文件 / 当前占用 / 是否清理 / 释放多少 ✓。
+ *
+ * 顺带加**冷却时间**：这个函数每生成 50 个缩略图就会被调一次（见 doGenerate），
+ * 而每次都要 stat 整个缩略图目录 —— 实测这一个目录有 **77,268 个文件 / 7.6 GB** ✗，
+ * 一次扫描要 **16~24 秒** ✗（真实日志：`耗时 24151ms，扫描 77268 个文件 / 7618.3MB`）。
+ * 刚检查过、又没超阈值，就没必要再扫一遍 ✓。
+ *
+ * 自用（2026-10-16 第二轮）：冷却从 5 分钟放宽到 **20 分钟** ✓。
+ * 理由：导入/生成缩略图期间每 5 分钟就扫 7 万多个文件，等于一直在做重 I/O ✗；
+ * 而缓存阈值是 18.4 GB、目标是回落到 14 GB 左右，20 分钟内正常生成量远到不了阈值 ✓。
+ * 启动时那次检查仍由 registry 延迟 2 分钟触发 ✓，每日定时检查不变 ✓。
+ */
+const CACHE_CHECK_COOLDOWN_MS = 20 * 60 * 1000;
+let lastCacheCheckAt = 0;
+
 export async function checkAndCleanDiskCache(): Promise<{
+  cleaned: boolean;
+  freedMB: number;
+  filesRemoved: number;
+}> {
+  const startedAt = Date.now();
+  if (startedAt - lastCacheCheckAt < CACHE_CHECK_COOLDOWN_MS) {
+    return { cleaned: false, freedMB: 0, filesRemoved: 0 };
+  }
+  lastCacheCheckAt = startedAt;
+
+  try {
+    const result = await runDiskCacheCheck(startedAt);
+    return result;
+  } catch (err: unknown) {
+    log.warn(
+      `[Thumbnailer] 磁盘缓存检查失败（耗时 ${Date.now() - startedAt}ms）：${(err as Error)?.message ?? String(err)}`
+    );
+    throw err;
+  }
+}
+
+async function runDiskCacheCheck(startedAt: number): Promise<{
   cleaned: boolean;
   freedMB: number;
   filesRemoved: number;
@@ -438,6 +479,9 @@ export async function checkAndCleanDiskCache(): Promise<{
     usageMB < CACHE_CONFIG.cleanupThresholdMB &&
     usage.fileCount < CACHE_CONFIG.maxDiskFiles
   ) {
+    log.info(
+      `[Thumbnailer] 磁盘缓存检查：耗时 ${Date.now() - startedAt}ms，扫描 ${usage.fileCount} 个文件 / ${usageMB.toFixed(1)}MB，未达清理阈值（${CACHE_CONFIG.cleanupThresholdMB}MB 或 ${CACHE_CONFIG.maxDiskFiles} 个）→ 不清理`
+    );
     return { cleaned: false, freedMB: 0, filesRemoved: 0 };
   }
 
@@ -497,6 +541,9 @@ export async function checkAndCleanDiskCache(): Promise<{
 
   log.info(
     `[Thumbnailer] Cleaned ${filesRemoved} files, freed ${(freedBytes / (1024 * 1024)).toFixed(1)}MB`
+  );
+  log.info(
+    `[Thumbnailer] 磁盘缓存检查：耗时 ${Date.now() - startedAt}ms，扫描 ${usage.fileCount} 个文件 / ${usageMB.toFixed(1)}MB，已清理 ${filesRemoved} 个文件、释放 ${(freedBytes / (1024 * 1024)).toFixed(1)}MB`
   );
 
   return {

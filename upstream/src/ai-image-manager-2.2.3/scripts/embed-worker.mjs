@@ -107,6 +107,26 @@ function loadOrt() {
   return _ort;
 }
 
+/**
+ * 自用（2026-10 换模型）：CLIP 系模型的 ONNX 是**两塔合并**的一张图，
+ * 声明的输入同时包含 `pixel_values` 和 `input_ids`/`attention_mask`。
+ * ONNX Runtime 要求把所有声明输入都喂上，所以这里给"没主动提供"的那些补**零张量**
+ *（只跑视觉塔时，文本输入填零即可，实测两塔互不干扰）。
+ * 对现有的 SigLIP（两塔分文件、只声明 pixel_values）来说，这个补零不会有任何动作。
+ */
+function buildFeeds(ort, session, provided) {
+  const feeds = { ...provided };
+  const providedNames = new Set(Object.keys(feeds));
+  for (const name of session.inputNames ?? []) {
+    if (providedNames.has(name)) {
+      continue;
+    }
+    // int64 类输入（input_ids / attention_mask / token_type_ids）用 [1, 16] 全零
+    feeds[name] = new ort.Tensor("int64", new BigInt64Array(16), [1, 16]);
+  }
+  return feeds;
+}
+
 async function preprocessImage(filePath) {
   const image = activeAdapter.image;
   const { data, info } = await sharp(filePath, { failOn: "none" })
@@ -266,7 +286,9 @@ async function handleEmbed(message) {
         image.imageSize,
         image.imageSize,
       ]);
-      const output = await ortSession.run({ [image.inputName]: pixelValues });
+      const output = await ortSession.run(
+        buildFeeds(ort, ortSession, { [image.inputName]: pixelValues })
+      );
       const embedding = output[image.outputName];
       if (!embedding) {
         throw new Error(`Output "${image.outputName}" missing`);

@@ -71,7 +71,7 @@ vi.mock("electron", () => ({
 
 function vectors(count: number): number[][] {
   return Array.from({ length: count }, () =>
-    Array.from({ length: 768 }, (_, index) => (index === 0 ? 1 : 0))
+    Array.from({ length: 512 }, (_, index) => (index === 0 ? 1 : 0))
   );
 }
 
@@ -227,7 +227,7 @@ describe("text embedding worker client", () => {
       "non-finite",
       [[Number.POSITIVE_INFINITY, ...Array.from({ length: 767 }, () => 0)]],
     ],
-    ["non-L2", [Array.from({ length: 768 }, () => 0)]],
+    ["non-L2", [Array.from({ length: 512 }, () => 0)]],
   ])("rejects a %s text vector", async (_label, invalidVectors) => {
     const { embedTextsInWorker, initTextWorker, shutdownTextWorker } =
       await import("@/services/ai/text-worker-client");

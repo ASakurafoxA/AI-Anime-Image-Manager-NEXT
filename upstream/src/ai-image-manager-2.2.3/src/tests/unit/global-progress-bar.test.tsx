@@ -18,6 +18,7 @@ vi.mock("@/ipc/manager", () => ({
   ipc: {
     client: {
       photos: {
+        cancelCharacterFeatures: vi.fn(),
         pauseTagging: vi.fn(),
         stopScanning: vi.fn(),
       },
@@ -160,6 +161,49 @@ describe("GlobalProgressBar", () => {
 
       renderBar();
       expect(screen.queryByRole("button", { name: "aiPause" })).toBeNull();
+    });
+  });
+
+  /*
+   * 自用（2026-10-18 · 会话#9）：人物页「获取全库角色特征」要跑几小时，
+   * 用户口径是「没有进度条我也不知道识别到什么程度、有没有出问题」。
+   * 这条守住两件事：进度文案要带张数，且能中途取消。
+   */
+  describe("角色特征进度（character-features）", () => {
+    const CCIP_STATUS: GlobalAiProgress = {
+      canCancel: false,
+      isRunning: true,
+      percent: 24,
+      phase: "character-features",
+      processed: 1200,
+      statusText: "角色特征提取 1200/5000（还需 3800） · 失败 3 张",
+      total: 5000,
+    };
+
+    it("顶栏显示已处理/总数/失败张数", () => {
+      mockedUseGlobalAiStatus.mockImplementation(() => CCIP_STATUS);
+
+      const view = renderBar();
+      expect(view.container.textContent).toContain("角色特征提取 1200/5000");
+      expect(view.container.textContent).toContain("失败 3 张");
+      // 百分比有一条平滑动画，第一帧不会正好落在 24，这里只要求"接近目标"
+      expect(view.container.textContent).toMatch(/2[34]%/);
+    });
+
+    it("点「取消」会调 cancelCharacterFeatures（已算好的特征保留）", async () => {
+      mockedUseGlobalAiStatus.mockImplementation(() => CCIP_STATUS);
+      vi.mocked(ipc.client.photos.cancelCharacterFeatures).mockResolvedValue({
+        cancelled: true,
+      });
+
+      renderBar();
+      fireEvent.click(screen.getByRole("button", { name: "cancel" }));
+
+      await waitFor(() =>
+        expect(ipc.client.photos.cancelCharacterFeatures).toHaveBeenCalledWith(
+          {}
+        )
+      );
     });
   });
 });

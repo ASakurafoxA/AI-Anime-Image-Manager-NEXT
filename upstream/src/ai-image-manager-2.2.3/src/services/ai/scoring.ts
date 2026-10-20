@@ -130,6 +130,28 @@ export function getTagEmbeddingCacheKey(
   return `${embeddingFingerprint}:tags-${version}`;
 }
 
+/*
+ * 自用（2026-10-16，**修"候选深度白扔一半"** ✗→✓）：
+ * 实测 LanceDB 的 ivfFlat 检索**对同一条命中会返回 2 行相同 photo_id** ✗
+ * （`limit=200` 只兑现约 100 个不同 id ✓；以图搜图 `limit=20` 只剩约 10 张 ✗）。
+ * 这里按 `photoId` 去重、**同一张只留距离最小（= 最像）的那行** ✓，
+ * 并保持"距离从小到大"的顺序 ✓ —— 与下游 `filterCosineSearchResults` 的预期一致 ✓。
+ * 调用方（`search.ts` 的 `searchVector`）会按 2 倍要候选 ✓，去重后再 `slice(0, limit)` ✓
+ * → 结果集大小与以前**完全一致** ✓，只是不再白扔一半候选 ✓。
+ */
+export function dedupeByPhotoId(
+  rows: Array<{ distance: number; photoId: number }>
+): Array<{ distance: number; photoId: number }> {
+  const best = new Map<number, { distance: number; photoId: number }>();
+  for (const row of rows) {
+    const current = best.get(row.photoId);
+    if (!current || row.distance < current.distance) {
+      best.set(row.photoId, row);
+    }
+  }
+  return [...best.values()].sort((left, right) => left.distance - right.distance);
+}
+
 export function filterCosineSearchResults(
   results: Array<{ distance: number; photoId: number }>,
   maxDistance: number,
@@ -346,6 +368,19 @@ export interface SemanticRelevanceOptions {
   promptGroupCount?: number;
   /** 灵敏度阈值乘数（relaxed<1 / standard=1 / precise>1），作用在最终 cutoffs 上 */
   sensitivity?: number;
+  /**
+   * 自用（2026-10-16，**修"筛选阈值和角标不是一个刻度"**）：
+   * 用户在「全部图片」顶栏拖的那条「相似度 ≥ N%」滑杆（IPC 的 `minSimilarity`）。
+   *
+   * 它必须是一道**硬下限**：卡片角标显示的就是这里的**原始余弦相似度**
+   * （PhotoCard 里 `match.score * 100` →「语义匹配 46%」），所以滑杆拖到 40% 时，
+   * 低于 40% 的图就不该再出现 ✓ —— 用户原话"筛选阈值和角标不是一个刻度"。
+   *
+   * 与 `sensitivity` 的区别：灵敏度是**算法档位**（宽松/标准/精确），它按比例缩放阈值；
+   * 用户手动设的下限是绝对值，**不该再被灵敏度放大或缩小** ✓（见下面的 max 里不乘 s）。
+   * 默认 undefined → 按 0 处理 = 完全不改变原有行为（滑杆只收紧、不会放宽）✓。
+   */
+  userMinSimilarity?: number;
 }
 
 export function calculateScoreGapCutoff(
@@ -380,13 +415,28 @@ function selectLegacySemanticResults(
 ): SemanticRelevanceSelection {
   const s = options.sensitivity ?? 1;
   const topSimilarity = Math.max(...results.map((result) => result.similarity));
+  /*
+   * 自用（2026-10-16，**修"筛选阈值和角标不是一个刻度"**）：
+   * 把顶栏滑杆的用户下限并进 strongCutoff 的 max 里 ✓ —— 它因此成为一道硬下限：
+   * 角标（原始余弦相似度 × 100）低于滑杆值的图，角标与滑杆同一刻度，直接不出现 ✓。
+   * **不乘 s**：s 是算法档位系数，用户手动设的下限是绝对值，不该被它放大/缩小 ✓；
+   * 默认 0 → max 结果不变 = 滑杆只收紧、绝不会放宽现状 ✓。
+   */
   const strongCutoff = Math.max(
     policy.absoluteMinimumSimilarity * s,
-    topSimilarity * policy.relativeToTopRatio * s
+    topSimilarity * policy.relativeToTopRatio * s,
+    options.userMinSimilarity ?? 0
   );
   const consensusCutoff = Math.max(
     policy.candidateMinimumSimilarity * s,
-    strongCutoff * policy.consensusThresholdRatio
+    strongCutoff * policy.consensusThresholdRatio,
+    /*
+     * 自用（2026-10-16，**滑杆必须是"硬"下限**）：
+     * 下面 promptGroupCount > 1 时还有一条共识放宽通道，只改 strongCutoff 会让它
+     * 放进低于滑杆值的图 ✗（角标 < 滑杆 = 用户说的"不是一个刻度"）→ 这里也取 max 用户下限 ✓。
+     * 默认 0 → 与改动前逐位相同 ✓。
+     */
+    options.userMinSimilarity ?? 0
   );
   const relevant = results.filter(
     (result) =>
@@ -482,15 +532,43 @@ function selectV2SemanticResults(
     ? options.primaryScores
     : results.map((result) => result.primarySimilarity);
   const topSimilarity = Math.max(...primaryScores);
+  /*
+   * 自用（2026-10-16，**修"每次只搜出 1 张"**）：
+   *
+   * 旧写法用**外部传进来的原始候选分数**（`options.primaryScores`，最多 400 条原始召回）
+   * 算"断层及格线"，却拿它去筛**融合后的结果列表** ✗ —— 两批分数不是同一批人：
+   * 原始分里前 5 名都在 0.43 以上（断层落在 0.4315），
+   * 但融合后的列表里可能只有 1 张 ≥ 0.4315 → **结果被砍到只剩 1 张** ✗
+   * （实测日志：top=0.4348 cutoff=0.4315 accepted=1 rejectedWeak=80 ✓）。
+   *
+   * 现在改成**用它自己要筛的那份分数**（融合后结果的 primarySimilarity）✓，
+   * 及格线与被筛对象自洽 ✓；列表太短（< 6 条）时本来也算不出有意义的断层 → 不启用 ✓。
+   *
+   * 另外：`gapCutoff` **以前没有乘灵敏度系数** ✗（base 与 relative 都乘了），
+   * 于是把「搜索灵敏度」调成"宽松"对这条线毫无作用 ✗ —— 现在也乘上 ✓。
+   */
   const gapCutoff =
     intent === "object" || intent === "unknown"
-      ? calculateScoreGapCutoff(options.primaryScores ?? [])
+      ? calculateScoreGapCutoff(results.map((result) => result.primarySimilarity))
       : null;
   const relativeCutoff = topSimilarity * cutoffPolicy.ratio * s;
+  const scaledGapCutoff = (gapCutoff ?? 0) * s;
+  /*
+   * 自用（2026-10-16，**修"筛选阈值和角标不是一个刻度"**）：
+   * 顶栏「相似度 ≥ N%」滑杆收在这里 —— 用户下限是**第四项**，与其他三项取 max = 硬下限：
+   * 卡片角标显示的就是这份原始余弦相似度（PhotoCard: `match.score * 100`），
+   * 所以滑杆拖到 40% 时，primarySimilarity < 40% 的图不会再进 results ✓
+   * —— 这正是用户说的"筛选阈值和角标不是一个刻度"要的效果 ✓。
+   *
+   * 逐项说明：base 是意图地板、relative 是相对 top 的比例、gap 是分数断层，
+   * 三者都会被灵敏度 s 缩放；**用户下限不乘 s** ✓（绝对阈值不该被档位改动）。
+   * 默认 0 → max 结果与改动前逐位相同 = 只收紧、不放宽 ✓。
+   */
   const strongCutoff = Math.max(
     cutoffPolicy.base * s,
     relativeCutoff,
-    gapCutoff ?? 0
+    scaledGapCutoff,
+    options.userMinSimilarity ?? 0
   );
   const supportsRelaxation =
     cutoffPolicy.supportFloor !== undefined &&
@@ -499,10 +577,20 @@ function selectV2SemanticResults(
     cutoffPolicy.supportFloor === undefined
       ? strongCutoff
       : cutoffPolicy.supportFloor * s;
+  /*
+   * 自用（2026-10-16，**滑杆必须是"硬"下限**）：
+   * 上面那条 strongCutoff 只是**主通道**；composed / scene 意图还有一条**放宽通道**
+   * （`hasIndependentSupport` 的共识线 consensusCutoff = strongCutoff × 0.85/0.9）。
+   * 只改 strongCutoff 的话，滑杆 40% 时这条通道仍会放进 34%~36% 的图 ✗
+   * —— 角标还是低于滑杆值，用户看到的就是"阈值和角标不是一个刻度" ✗。
+   * 所以共识线也取 max(用户下限)：用户手动设的下限对所有**语义**入选项都成立 ✓；
+   * 默认 0 → 与改动前逐位相同 ✓。
+   */
   const consensusCutoff = supportsRelaxation
     ? Math.max(
         supportFloorScaled,
-        strongCutoff * (cutoffPolicy.supportRatio ?? 1)
+        strongCutoff * (cutoffPolicy.supportRatio ?? 1),
+        options.userMinSimilarity ?? 0
       )
     : strongCutoff;
   const supportCutoff =
@@ -539,7 +627,11 @@ function selectV2SemanticResults(
     candidateMinimum: policy.candidateMinimumSimilarity,
     canContinue,
     consensusCutoff,
-    cutoffReason: getCutoffReason(gapCutoff, cutoffPolicy.base, relativeCutoff),
+    cutoffReason: getCutoffReason(
+      gapCutoff === null ? null : scaledGapCutoff,
+      cutoffPolicy.base * s,
+      relativeCutoff
+    ),
     finalCutoff: strongCutoff,
     hasMoreCandidates: relevant.length > limit || canContinue,
     rejectedWeak: results.length - relevant.length,

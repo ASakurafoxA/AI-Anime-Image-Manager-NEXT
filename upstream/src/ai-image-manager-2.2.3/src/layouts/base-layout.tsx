@@ -9,6 +9,7 @@ import {
 import { useTranslation } from "react-i18next";
 import DragWindowRegion from "@/components/drag-window-region";
 import { GlobalProgressBar } from "@/components/global-progress-bar";
+import { StartupScanPrompt } from "@/components/startup-scan-prompt";
 import { ImportDropLayer } from "@/components/import-drop-layer";
 import { KeyboardShortcuts } from "@/components/KeyboardShortcuts";
 import { OnboardingOverlay } from "@/components/onboarding/OnboardingOverlay";
@@ -217,6 +218,8 @@ function BaseLayoutContent({ children }: { children: ReactNode }) {
                 title={APP_DISPLAY_NAME}
               />
               <GlobalProgressBar />
+              {/* 自用（2026-10-16）：大图库的开机补扫先问一句（见设置 → 应用行为）✓ */}
+              <StartupScanPrompt />
               <div
                 className={`relative flex min-h-0 flex-1 overflow-hidden ${
                   isHomePage ? "home-workspace-content" : ""

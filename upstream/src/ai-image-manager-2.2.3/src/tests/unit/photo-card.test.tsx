@@ -183,11 +183,16 @@ describe("PhotoCard", () => {
     expect(screen.getByText("色彩接近度 50%")).toBeInTheDocument();
   });
 
-  it("labels semantic results without presenting raw cosine as a percentage", () => {
+  /*
+   * 自用（2026-10 用户口径）：角标改成显示**原始相似度**。
+   * 原来按本次最高分归一化（Top1 永远 100%），"最佳匹配"容易被误读成"完美匹配"，
+   * 且同一个 100% 在不同查询里含义不同 —— 现在直接显示余弦相似度，跨查询可比。
+   */
+  it("labels semantic results with the raw similarity percentage", () => {
     render(
       <PhotoCard {...baseProps} match={{ kind: "semantic", score: 0.73 }} />
     );
-    expect(screen.getByText("语义匹配")).toBeInTheDocument();
+    expect(screen.getByText("语义匹配 73%")).toBeInTheDocument();
   });
 
   it("labels exact tag matches without a percentage", () => {
@@ -228,7 +233,7 @@ describe("PhotoCard", () => {
     expect(screen.getByText("AI 生成 (ai-generated)")).toBeInTheDocument();
   });
 
-  it("labels semantic results with a percentage normalized to the top match", () => {
+  it("labels semantic results with the raw percentage even when a top match exists", () => {
     render(
       <PhotoCard
         {...baseProps}
@@ -236,10 +241,11 @@ describe("PhotoCard", () => {
         semanticTopSimilarity={0.8}
       />
     );
-    expect(screen.getByText("语义匹配 91%")).toBeInTheDocument();
+    // 0.73 → 73%（不再除以 Top1 的 0.8 变成 91%）
+    expect(screen.getByText("语义匹配 73%")).toBeInTheDocument();
   });
 
-  it("falls back to the plain semantic label when top similarity is absent", () => {
+  it("keeps the raw percentage when no top similarity is available", () => {
     render(
       <PhotoCard
         {...baseProps}
@@ -247,10 +253,10 @@ describe("PhotoCard", () => {
         semanticTopSimilarity={0}
       />
     );
-    expect(screen.getByText("语义匹配")).toBeInTheDocument();
+    expect(screen.getByText("语义匹配 73%")).toBeInTheDocument();
   });
 
-  it("labels hybrid semantic results with a normalized percentage when a score is present", () => {
+  it("labels hybrid semantic results with the raw percentage when a score is present", () => {
     render(
       <PhotoCard
         {...baseProps}
@@ -263,7 +269,8 @@ describe("PhotoCard", () => {
         semanticTopSimilarity={0.8}
       />
     );
-    expect(screen.getByText("语义匹配 75%")).toBeInTheDocument();
+    // 混合结果里的 0.6 也是原始语义分 → 60%
+    expect(screen.getByText("语义匹配 60%")).toBeInTheDocument();
   });
 
   it("keeps the plain hybrid label when a hybrid result has no semantic score", () => {

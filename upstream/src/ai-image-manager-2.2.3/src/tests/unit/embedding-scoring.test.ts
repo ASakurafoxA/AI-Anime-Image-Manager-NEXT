@@ -1,4 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  CHINESE_CLIP_V1_ADAPTER_ID,
+  SIGLIP_V1_ADAPTER_ID,
+  setActiveEmbeddingAdapter,
+} from "@/services/ai/model-adapter";
 import {
   getActiveEmbeddingModel,
   getTextSearchMaxCosineDistance,
@@ -6,6 +11,7 @@ import {
 import {
   applyNegativeSemanticPenalty,
   filterCosineSearchResults,
+  type FusedRankedSearchResult,
   fuseRankedSearchEvidence,
   fuseRankedSearchResults,
   isValidEmbeddingVector,
@@ -29,6 +35,14 @@ afterEach(() => {
     process.env.AI_SEMANTIC_POLICY = originalPolicy;
   }
 });
+
+/*
+ * 自用（2026-10 换中文 CLIP）：这套用例描述的是 **SigLIP** 那条路径的行为
+ *（它仍保留作回退路线），而默认活动模型已换成 Chinese-CLIP，
+ * 所以这里显式切回 SigLIP；用例结束恢复默认，避免影响别的用例。
+ */
+beforeEach(() => setActiveEmbeddingAdapter(SIGLIP_V1_ADAPTER_ID));
+afterEach(() => setActiveEmbeddingAdapter(CHINESE_CLIP_V1_ADAPTER_ID));
 
 describe("SigLIP scoring policy", () => {
   it("uses SigLIP-specific text search distances", () => {
@@ -293,6 +307,207 @@ describe("embedding prompts and ranked fusion", () => {
     expect(precise).toEqual([1]);
     expect(new Set(relaxed)).toEqual(new Set([...standard, 6, 7]));
     expect(new Set(standard)).toEqual(new Set([...precise, 2, 3, 4, 5]));
+  });
+
+  /*
+   * 自用（2026-10-16，**回归测试：修"每次只搜出 1 张"**）：
+   *
+   * 曾经的做法是"用外部传进来的**原始候选分数**算断层及格线，
+   * 却拿去筛**融合后的结果列表**" ✗ —— 两批分数不同源，
+   * 于是出现"原始分里前几名都在 0.43 以上、融合后只有 1 张 ≥ 0.43" →
+   * **结果被砍到只剩 1 张** ✗（实测日志 top=0.4348 cutoff=0.4315 accepted=1 ✓）。
+   *
+   * 下面这组用例刻意让两批分数"打架"：原始候选在 0.43 上方有一大簇，
+   * 而融合结果里最高只有 0.30 —— 自洽的算法**不应该**因此把结果砍到 1 张 ✓。
+   */
+  it("断层及格线必须用「要筛的那份分数」算，不能被外来的原始分数带偏", () => {
+    const fused = [0.3, 0.29, 0.281, 0.275, 0.27, 0.18, 0.12].map(
+      (similarity, index) => ({
+        photoId: index + 1,
+        primarySimilarity: similarity,
+        rankScore: 0.01,
+        similarity,
+        supportingGroups: ["whole-query" as const],
+      })
+    );
+
+    const selection = selectRelevantSemanticResults(
+      fused,
+      getActiveEmbeddingModel(),
+      1,
+      100,
+      {
+        intent: "object",
+        // 原始候选：0.43 附近一大簇，再往下掉 —— 旧写法会据此把线划到 0.4315 ✗
+        primaryScores: [0.4348, 0.4332, 0.4325, 0.4321, 0.4315, 0.38, 0.35, 0.3],
+      }
+    );
+
+    // 自洽算法：及格线由融合结果的分布决定（≈ 0.3 × 0.6），不会砍到只剩 1 张 ✓
+    expect(selection.results.length).toBeGreaterThanOrEqual(3);
+    expect(selection.finalCutoff).toBeLessThan(0.3);
+    expect(selection.cutoffReason).not.toBe("score-gap");
+  });
+
+  it("搜索灵敏度也能影响断层及格线（旧写法里它漏乘了系数）", () => {
+    const fused = [0.5, 0.48, 0.47, 0.465, 0.46, 0.3, 0.28, 0.26].map(
+      (similarity, index) => ({
+        photoId: index + 1,
+        primarySimilarity: similarity,
+        rankScore: 0.01,
+        similarity,
+        supportingGroups: ["whole-query" as const],
+      })
+    );
+
+    const select = (sensitivity: number) =>
+      selectRelevantSemanticResults(fused, getActiveEmbeddingModel(), 1, 100, {
+        intent: "object",
+        sensitivity,
+      });
+
+    const relaxed = select(0.6).finalCutoff;
+    const standard = select(1).finalCutoff;
+    const precise = select(1.4).finalCutoff;
+
+    expect(relaxed).toBeLessThan(standard);
+    expect(standard).toBeLessThan(precise);
+  });
+
+  /*
+   * 自用（2026-10-16，**修"筛选阈值和角标不是一个刻度"**）：
+   * 「全部图片」顶栏那条「相似度 ≥ N%」滑杆（IPC: minSimilarity，zod 里早就声明了、
+   * 但主进程没有任何地方读它 ✗）最终落到这里的 `userMinSimilarity`。
+   *
+   * 卡片角标显示的就是**原始余弦相似度**（PhotoCard: `match.score * 100`，
+   * 例如「语义匹配 46%」），所以把用户下限当 hard floor 并进 strongCutoff
+   * = 滑杆与角标**同一个刻度** ✓（用户原话："筛选阈值和角标不是一个刻度"）：
+   * 滑杆拖到 28% 时，primarySimilarity < 0.28 的图必须不再出现 ✓。
+   */
+  it("滑杆下限比算法及格线高时真正收紧语义结果（与角标同刻度）", () => {
+    const fused = [0.3, 0.29, 0.281, 0.275, 0.27, 0.18, 0.12].map(
+      (similarity, index) => ({
+        photoId: index + 1,
+        primarySimilarity: similarity,
+        rankScore: 0.01,
+        similarity,
+        supportingGroups: ["whole-query" as const],
+      })
+    );
+    const select = (userMinSimilarity?: number) =>
+      selectRelevantSemanticResults(fused, getActiveEmbeddingModel(), 1, 100, {
+        intent: "object",
+        userMinSimilarity,
+      });
+
+    const withoutSlider = select(undefined);
+    const withSlider = select(0.28);
+
+    // 算法自己的及格线 ≈ 0.225（断层 0.27/0.18）→ 5 张；滑杆 0.28 → 只剩 3 张 ✓
+    expect(withoutSlider.results).toHaveLength(5);
+    expect(withSlider.results.map(({ photoId }) => photoId)).toEqual([1, 2, 3]);
+    expect(
+      withSlider.results.every(({ primarySimilarity }) => primarySimilarity >= 0.28)
+    ).toBe(true);
+    // 滑杆成为最终及格线 → 角标（×100 = 28%）与阈值同一个刻度 ✓
+    expect(withSlider.finalCutoff).toBeCloseTo(0.28, 6);
+    expect(withSlider.acceptedCount).toBeLessThan(withoutSlider.acceptedCount);
+  });
+
+  it("滑杆下限比及格线低时不会放宽（默认 0 与不传完全一致）", () => {
+    const fused = [0.3, 0.29, 0.281, 0.275, 0.27, 0.18, 0.12].map(
+      (similarity, index) => ({
+        photoId: index + 1,
+        primarySimilarity: similarity,
+        rankScore: 0.01,
+        similarity,
+        supportingGroups: ["whole-query" as const],
+      })
+    );
+    const select = (userMinSimilarity?: number) =>
+      selectRelevantSemanticResults(fused, getActiveEmbeddingModel(), 1, 100, {
+        intent: "object",
+        userMinSimilarity,
+      });
+
+    const baseline = select(undefined);
+    const explicitZero = select(0);
+    const belowCutoff = select(0.05); // 远低于算法及格线 ≈ 0.225
+
+    for (const candidate of [explicitZero, belowCutoff]) {
+      expect(candidate.results).toEqual(baseline.results);
+      expect(candidate.finalCutoff).toBe(baseline.finalCutoff);
+      expect(candidate.strongCutoff).toBe(baseline.strongCutoff);
+      expect(candidate.supportCandidates).toEqual(baseline.supportCandidates);
+    }
+  });
+
+  /*
+   * 自用（2026-10-16，**滑杆必须是"硬"下限**）：
+   * composed / scene 意图除了主及格线，还有一条"共识放宽通道"
+   *（consensusCutoff = strongCutoff × 0.85，需要独立证据支持）。
+   * 只提高主及格线的话，滑杆 19% 时这条通道仍会放进 18% 的图 ✗
+   * —— 角标 18% < 滑杆 19%，还是"阈值和角标不是一个刻度" ✗。
+   */
+  it("放宽通道（共识线）也不能放进低于滑杆下限的语义结果", () => {
+    const fused: FusedRankedSearchResult[] = [
+      {
+        photoId: 1,
+        primarySimilarity: 0.5,
+        rankScore: 0.03,
+        similarity: 0.5,
+        supportingGroups: ["whole-query"],
+      },
+      {
+        photoId: 2,
+        primarySimilarity: 0.18,
+        rankScore: 0.02,
+        similarity: 0.18,
+        supportingGroups: ["whole-query", "subject"],
+      },
+    ];
+    const select = (userMinSimilarity?: number) =>
+      selectRelevantSemanticResults(fused, getActiveEmbeddingModel(), 2, 100, {
+        intent: "scene",
+        userMinSimilarity,
+      });
+
+    // scene: strong = 0.5 × 0.4 = 0.2，consensus = 0.2 × 0.85 = 0.17
+    // → 0.18 只能靠共识放宽通道进来 ✓
+    const baseline = select(undefined);
+    expect(baseline.results.map(({ photoId }) => photoId)).toEqual([1, 2]);
+
+    // 滑杆 0.19 时主及格线仍是 0.2（没被抬高），但共识线被顶到 0.19 →
+    // 0.18 < 0.19 必须被挡住 ✓
+    const withSlider = select(0.19);
+    expect(withSlider.strongCutoff).toBeCloseTo(0.2, 6);
+    expect(withSlider.consensusCutoff).toBeCloseTo(0.19, 6);
+    expect(withSlider.results.map(({ photoId }) => photoId)).toEqual([1]);
+  });
+
+  it("legacy 策略下同样把滑杆下限当硬下限", () => {
+    process.env.AI_SEMANTIC_POLICY = "legacy";
+    const fused = [0.1, 0.09, 0.05, 0.041].map((similarity, index) => ({
+      photoId: index + 1,
+      primarySimilarity: similarity,
+      rankScore: 0.01,
+      similarity,
+      supportingGroups: ["whole-query" as const],
+    }));
+    const select = (userMinSimilarity?: number) =>
+      selectRelevantSemanticResults(fused, getActiveEmbeddingModel(), 1, 100, {
+        intent: "object",
+        userMinSimilarity,
+      });
+
+    const baseline = select(undefined);
+    const withSlider = select(0.095); // 高于 legacy 的及格线 ≈ 0.04，也高于第 2 名 0.09
+
+    expect(baseline.cutoffReason).toBe("legacy");
+    expect(baseline.results).toHaveLength(4);
+    expect(withSlider.results.map(({ photoId }) => photoId)).toEqual([1]);
+    expect(withSlider.strongCutoff).toBeCloseTo(0.095, 6);
+    expect(withSlider.results.length).toBeLessThan(baseline.results.length);
   });
 
   it("continues broad scene retrieval while the primary tail remains eligible", () => {

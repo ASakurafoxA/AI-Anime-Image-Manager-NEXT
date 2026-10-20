@@ -36,8 +36,7 @@ vi.mock("@/ipc/manager", () => ({
   ipc: {
     client: {
       albums: { listAlbums: vi.fn().mockResolvedValue([]) },
-      faces: { listFaceIdentities: vi.fn().mockResolvedValue([]) },
-      photos: {
+          photos: {
         getTags: vi.fn().mockResolvedValue([]),
         searchSpotlight: vi.fn().mockResolvedValue({ results: [] }),
       },

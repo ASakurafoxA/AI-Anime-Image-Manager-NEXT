@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { Profiler } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Sidebar } from "@/components/Sidebar";
 
@@ -956,5 +957,56 @@ describe("Sidebar", () => {
       fireEvent.click(screen.getByRole("button", { name: "aiResume" }));
       await waitFor(() => expect(batchGenerateTagsMock).toHaveBeenCalledWith({}));
     });
+  });
+
+  /*
+   * 回归（2026-10，用户实测："搜索标签后一直卡着，直接浏览标签树却一点不卡"）：
+   * 自动展开祖先的 effect 原先**无条件 `new Set(prev)`**，而它的依赖里有 `expandedTagIds`
+   * → setState 后依赖变化 → effect 再跑 → 又建新 Set …… 形成**无限重渲染循环**。
+   *
+   * ⚠️ 注意：effect 里的循环是**异步**的，React **不会**抛 "Maximum update depth exceeded"
+   * （那只在 render 阶段同步 setState 时才抛），所以不能用"是否抛错"来断言 ——
+   * 必须**数渲染次数**：界面稳定后若还在疯狂重渲染，就是循环 ✗。
+   */
+  it("搜索标签时不会陷入无限重渲染", async () => {
+    const { ipc } = await import("@/ipc/manager");
+    const getTagsMock = ipc.client.photos.getTags as unknown as {
+      mockResolvedValue: (value: unknown) => void;
+    };
+    getTagsMock.mockResolvedValue([
+      { id: 1, name: "角色", parentId: null, photoCount: 12 },
+      { id: 2, name: "小天城", parentId: 1, photoCount: 8 },
+    ]);
+
+    let renderCount = 0;
+    render(
+      <Profiler id="sidebar" onRender={() => { renderCount += 1; }}>
+        <Sidebar {...baseProps} />
+      </Profiler>
+    );
+    fireEvent.click(screen.getByRole("button", { name: "标签" }));
+
+    // loadTags 里有 300ms「让路」延时，等标签真的进来
+    await waitFor(() => expect(screen.getByText("角色")).toBeInTheDocument(), {
+      timeout: 3000,
+    });
+
+    fireEvent.change(screen.getByLabelText(/搜索标签|tagSearchPlaceholder/), {
+      target: { value: "小天" },
+    });
+
+    // 命中子标签 → 自动展开父节点（就是原来死循环的那条路径）
+    await waitFor(
+      () => expect(screen.getByText("小天城")).toBeInTheDocument(),
+      { timeout: 3000 }
+    );
+
+    // 界面已经稳定，静置 400ms：正常情况下不该再有大量重渲染。
+    // 若陷入循环，这 400ms 内渲染次数会是几百上千次（实测原先就是"一直卡着"）。
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const stableCount = renderCount;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const extraRenders = renderCount - stableCount;
+    expect(extraRenders).toBeLessThan(5);
   });
 });

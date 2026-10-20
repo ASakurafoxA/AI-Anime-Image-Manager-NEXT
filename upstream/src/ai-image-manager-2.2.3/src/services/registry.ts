@@ -1,6 +1,9 @@
 import { closeDatabase, getDatabase, initDatabase } from "@/db";
+import { getAiControlState } from "@/services/ai/state";
 import { shutdownTextWorker } from "@/services/ai/text-worker-client";
 import { shutdownTranslationWorker } from "@/services/ai/translation-worker-client";
+import { hasActiveDuplicateScan } from "@/services/duplicate-scan-runtime";
+import { getSetting, setSetting } from "@/services/settings-manager";
 import {
   closeVectorDB,
   embedAllPhotos,
@@ -251,6 +254,44 @@ class ServiceRegistry {
 
 export const registry = new ServiceRegistry();
 let thumbnailCleanupInterval: ReturnType<typeof setInterval> | undefined;
+/** 自用（2026-10-16）：启动后那次延迟执行的缓存检查（见 thumbnailCleaner 的 start）。 */
+let thumbnailCleanupTimer: ReturnType<typeof setTimeout> | undefined;
+/**
+ * 自用（2026-10-17）：启动后的孤儿记录清理**延后 60 秒**再跑。
+ * 实测它要对全库 7.7 万张图各做一次 `fs.existsSync`（6040~8072ms）✗，
+ * 正好压在界面首帧那一刻 —— 而孤儿记录不影响显示 ✓，晚一分钟查没有副作用。
+ */
+const STARTUP_ORPHAN_CLEANUP_DELAY_MS = 60_000;
+let orphanCleanupTimer: ReturnType<typeof setTimeout> | undefined;
+/**
+ * 自用（2026-10-17 第二轮，用户实测"查重被后台任务抢磁盘"）：
+ * 这个检查**每次启动**都要对 7.7 万张逐个 `fs.existsSync`（实测 4.8~8.1 秒）✗，
+ * 而它清的是"**文件**已被外部删掉/移动"的记录 —— 这种变化极慢，
+ * 一天查一次完全够 ✓。所以：
+ *   · 24 小时内查过 → **直接跳过**；
+ *   · 正在查重 / AI 任务在跑 → **让路**（10 分钟后再看）。
+ */
+const ORPHAN_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const ORPHAN_SCAN_SETTING_KEY = "maintenance.lastFileOrphanScanAt";
+/** 自用（2026-10-17）：缩略图缓存检查也改成"一天最多数一遍"（它要 stat 全库缩略图）✓ */
+const THUMBNAIL_CHECK_SETTING_KEY = "maintenance.lastThumbnailCheckAt";
+const BUSY_RETRY_DELAY_MS = 10 * 60 * 1000;
+
+/** 自用：现在是不是有"重活"在跑（查重 / 打标 / 建向量）—— 这种时候后台维护要主动让路 ✓ */
+function isHeavyWorkRunning(): boolean {
+  try {
+    if (hasActiveDuplicateScan()) {
+      return true;
+    }
+  } catch {
+    /* 忽略 */
+  }
+  try {
+    return getAiControlState() !== "idle";
+  } catch {
+    return false;
+  }
+}
 
 // ── Service definitions ───────────────────────────────────────────────
 
@@ -299,13 +340,48 @@ registry.register({
     const { BrowserWindow } = await import("electron");
 
     // 启动时清理孤立记录（fire-and-forget，不阻塞启动）
-    cleanupOrphanedRecordsAsync().then(({ removed }) => {
-      if (removed > 0) {
-        console.log(
-          `[Registry] Cleaned up ${removed} orphaned records on startup`
-        );
-      }
-    });
+    /*
+     * 自用（2026-10-17 第二轮，用户实测"查重被后台任务抢磁盘"）：
+     *
+     * 这一步对**全库每张图**（本机 77,299 张）做一次 `fs.existsSync` ——
+     * 实测 **4.8~8.1 秒** ✗，而它清的只是"**文件**被外部删掉/移动"的记录，变化极慢 ✓。
+     * 所以改成：**24 小时内查过就跳过**；正在查重 / AI 任务在跑就**让路**（10 分钟后再看）✓。
+     *
+     * ⚠️ 注意它和「设置 → 存储 → 清理无效记录」**不是一回事**：
+     *   设置页那个只查"文件夹记录已不存在"（纯 SQL、瞬间完成）；
+     *   这里查的是"**文件**还在不在"（逐个 stat、很慢），没有手动入口 ✗，所以不能直接删掉。
+     */
+    const scheduleOrphanCleanup = (delayMs: number) => {
+      orphanCleanupTimer = setTimeout(() => {
+        orphanCleanupTimer = undefined;
+        if (isHeavyWorkRunning()) {
+          console.log(
+            `[perf] 孤儿记录检查：有查重/AI 任务在跑 → 让路，${BUSY_RETRY_DELAY_MS / 60000} 分钟后再看 ✓`
+          );
+          scheduleOrphanCleanup(BUSY_RETRY_DELAY_MS);
+          return;
+        }
+        const lastScanAt = Number(getSetting(ORPHAN_SCAN_SETTING_KEY) ?? 0) || 0;
+        if (Date.now() - lastScanAt < ORPHAN_SCAN_INTERVAL_MS) {
+          console.log(
+            "[perf] 孤儿记录检查：24 小时内已经查过 → 本次跳过 ✓（省下 5~8 秒磁盘操作）"
+          );
+          return;
+        }
+        const orphanStartedAt = Date.now();
+        cleanupOrphanedRecordsAsync()
+          .then(({ removed, checked }) => {
+            setSetting(ORPHAN_SCAN_SETTING_KEY, String(Date.now()));
+            console.log(
+              `[perf] 孤儿记录检查（文件是否还在）：检查 ${checked} 张 / 移除 ${removed} 张，耗时 ${Date.now() - orphanStartedAt}ms`
+            );
+          })
+          .catch(() => {
+            /* 孤儿清理失败不影响启动 */
+          });
+      }, delayMs);
+    };
+    scheduleOrphanCleanup(STARTUP_ORPHAN_CLEANUP_DELAY_MS);
 
     startWatching((photoId, event) => {
       for (const win of BrowserWindow.getAllWindows()) {
@@ -317,7 +393,8 @@ registry.register({
         scheduleWatchedFilesAiProcessing();
       }
     });
-    resumeInterruptedImports();
+    // 自用（2026-10-16）：这个函数现在是异步的（内部要做"有没有变化"的只读预检）
+    void resumeInterruptedImports();
 
     // 自用版：开机增量补扫 —— 补上"关机期间直接存进目录"的图。
     // 延迟执行，先让其余服务启动完成，避免抢磁盘 I/O 与 AI 模型加载。
@@ -326,16 +403,25 @@ registry.register({
 
     // 自用版：清理应用回收站里超过 30 天的文件（按"删除时刻"算，移动时已改时间戳）。
     // 失败不影响启动，所以吞掉异常。
+    // 自用（2026-10-17）：同样加耗时（它是同步 fs.rmSync 循环，回收站一多就会卡主线程 ✗）。
     void (async () => {
       try {
         const { purgeExpiredAppTrash } = await import("@/services/app-trash");
+        const trashStartedAt = Date.now();
         purgeExpiredAppTrash();
+        console.log(
+          `[perf] 启动回收站清理：耗时 ${Date.now() - trashStartedAt}ms`
+        );
       } catch {
         /* 回收站清理失败不阻塞启动 */
       }
     })();
   },
   stop: async () => {
+    if (orphanCleanupTimer) {
+      clearTimeout(orphanCleanupTimer);
+      orphanCleanupTimer = undefined;
+    }
     await stopImports();
     await stopWatching();
   },
@@ -462,17 +548,76 @@ registry.register({
   name: "thumbnailCleaner",
   level: ServiceLevel.Optional,
   start: async () => {
-    // 启动时清理一次
-    const result = await checkAndCleanDiskCache();
-    if (result.cleaned) {
-      console.log(
-        `[Registry] Thumbnail cache cleaned on startup: ${result.filesRemoved} files, ${result.freedMB.toFixed(1)}MB freed`
-      );
-    }
+    /*
+     * 自用（2026-10，**修"启动后一碰就未响应"**）：
+     * 这里原来是 `await checkAndCleanDiskCache()` ✗ ——
+     * 它要遍历缩略图缓存（实测 **77,268 个文件** ✗），
+     * 一 await 就把**服务注册表的启动**卡住 ✓，
+     * 而界面的"就绪门"在等服务注册表 → 于是界面画得出来、却一直取不到照片 ✗
+     *（实测：等几分钟它扫完，界面自己就恢复正常 ✓）。
+     *
+     * 现在改成**后台跑**：服务立刻报告 started ✓，清理在后台慢慢做 ✓。
+     *
+     * 自用（2026-10-16，**再往后挪 2 分钟** ✗→✓）：
+     * 实测日志：这次扫描 **耗时 16,074ms、扫了 77,268 个文件 / 7,618 MB** ✓，
+     * 而它正好和「渲染层加载」撞在一起（同一秒里主进程既要服务页面、
+     * 又要做 7 万多次 stat ✗）→ 界面在这一段里最容易「未响应」✗。
+     * 启动时**并不需要**立刻知道缓存有多大 ✓，所以挪到启动 2 分钟后再做：
+     * 先把界面和照片列表让出来 ✓，再慢慢数文件和清理 ✓。
+     */
+    const startupCleanupDelayMs = 2 * 60 * 1000;
+    /*
+     * 自用（2026-10-17 第二轮，用户实测"查重被后台任务抢磁盘"）：
+     * 这次检查要 stat **7.7 万个缩略图文件**（实测 5.4~16 秒）✗，
+     * 若此时用户正好在扫查重（它也在逐张读文件），两边就互相拖慢 ✗ →
+     * **有查重/AI 任务在跑时主动让路**（10 分钟后再看）✓
+     */
+    const runThumbnailCacheCheck = (delayMs: number) => {
+      thumbnailCleanupTimer = setTimeout(() => {
+        thumbnailCleanupTimer = undefined;
+        if (isHeavyWorkRunning()) {
+          console.log(
+            "[perf] 缩略图缓存检查：有查重/AI 任务在跑 → 让路，10 分钟后再看 ✓"
+          );
+          runThumbnailCacheCheck(BUSY_RETRY_DELAY_MS);
+          return;
+        }
+        /*
+         * 自用（2026-10-17 第二轮）：**一天最多数一遍** ✓
+         * 它要 stat 全库缩略图（本机 7.7 万个文件 → 5.4~16 秒）✗，
+         * 而结论几乎总是"没到阈值、不清理"（本机 7.45GB / 7.7 万，阈值 18GB / 10 万）——
+         * 每次启动都数一遍纯属白花时间 ✓。缓存变大是"天"级别的变化，一天一次足够 ✓。
+         */
+        const lastCheckAt =
+          Number(getSetting(THUMBNAIL_CHECK_SETTING_KEY) ?? 0) || 0;
+        if (Date.now() - lastCheckAt < ORPHAN_SCAN_INTERVAL_MS) {
+          console.log(
+            "[perf] 缩略图缓存检查：一天内已经数过 → 本次跳过 ✓（省下 5~16 秒磁盘操作）"
+          );
+          return;
+        }
+        setSetting(THUMBNAIL_CHECK_SETTING_KEY, String(Date.now()));
+        checkAndCleanDiskCache()
+          .then((result) => {
+            if (result.cleaned) {
+              console.log(
+                `[Registry] Thumbnail cache cleaned on startup: ${result.filesRemoved} files, ${result.freedMB.toFixed(1)}MB freed`
+              );
+            }
+          })
+          .catch(() => {
+            // 清理失败不影响启动。
+          });
+      }, delayMs);
+    };
+    runThumbnailCacheCheck(startupCleanupDelayMs);
 
-    // 每天清理一次
+    // 每天清理一次（同样：有重活在跑就让路，下次再来 ✓）
     const cleanupInterval = setInterval(
       () => {
+        if (isHeavyWorkRunning()) {
+          return;
+        }
         checkAndCleanDiskCache()
           .then((result) => {
             if (result.cleaned) {
@@ -492,6 +637,10 @@ registry.register({
     thumbnailCleanupInterval = cleanupInterval;
   },
   stop: () => {
+    if (thumbnailCleanupTimer) {
+      clearTimeout(thumbnailCleanupTimer);
+      thumbnailCleanupTimer = undefined;
+    }
     if (thumbnailCleanupInterval) {
       clearInterval(thumbnailCleanupInterval);
       thumbnailCleanupInterval = undefined;

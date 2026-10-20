@@ -560,7 +560,15 @@ const LOCALE_TAG_PATTERN =
   /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*(?:-[A-Za-z0-9]{1,8})?$/;
 const LOCALE_STRING_LIMIT = 16_384;
 const LOCALE_ARRAY_LIMIT = 2048;
-const LOCALE_OBJECT_LIMIT = 2048;
+/*
+ * 自用（2026-10-18 · 会话#9）：**根对象的属性上限 2048 → 8192** ✓
+ *
+ * 原来的 2048 已经装不下内置英文文案了（当前 **2209** 条）——
+ * 也就是说**任何"完整翻译"的外挂语言包都会因为"too many object properties"被判非法** ✗
+ * （日文包做到 2049 条时就正好踩线，`japanese-locale-plugin` 的合法性测试当场报错。）
+ * 放宽到 8192：仍然是一个明确的界限（防超大恶意包），但不再误伤正常翻译 ✓
+ */
+const LOCALE_OBJECT_LIMIT = 8192;
 const LOCALE_DEPTH_LIMIT = 32;
 const LOCALE_LEAF_LIMIT = 50_000;
 const LOCALE_DANGEROUS_TEXT_PATTERN =

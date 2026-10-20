@@ -6,6 +6,8 @@ import { captureWorkerOutput } from "@/services/diagnostics/worker-output";
 import { trackChildProcess } from "@/services/tracked-child-processes";
 import { ensureLocalModel } from "./model-loader";
 
+import { getActiveEmbeddingAdapter } from "./model-adapter";
+
 export type TranslationState = "ready" | "loading" | "degraded" | "error";
 
 const MODEL_ID = "Xenova/opus-mt-zh-en";
@@ -117,6 +119,14 @@ export function getTranslationModelVersion(): string {
 }
 
 export function initTranslationWorker(modelsRoot: string): Promise<void> {
+  /*
+   * 自用（2026-10 换中文 CLIP）：这个模型**中文原生**，查询不再需要中译英，
+   * 所以绝不再加载 opus-mt（省启动时间、内存，以及那条
+   * "MarianTokenizer is not yet supported ..." 的加载警告）。
+   */
+  if (getActiveEmbeddingAdapter().family === "chinese-clip") {
+    return Promise.resolve();
+  }
   if (child?.connected && translationState === "ready") {
     scheduleIdleShutdown();
     return Promise.resolve();

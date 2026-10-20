@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   listDuplicateCleanupBatches: vi.fn(),
   getDuplicateScanProgress: vi.fn(),
   cancelDuplicateScan: vi.fn(),
+  pauseDuplicateScan: vi.fn(),
   dismissDuplicates: vi.fn(),
   getDuplicateGroupPhotos: vi.fn(),
   findDuplicates: vi.fn(),
@@ -251,6 +252,60 @@ describe("DuplicatesPage persisted review", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "startFaceDetectionShort" })
     );
+    await waitFor(() => expect(mocks.findDuplicates).toHaveBeenCalledTimes(1));
+  });
+
+  it("进页面时后台正在扫：接回那次扫描，不再显示「开始检测」", async () => {
+    /*
+     * 用户实测（2026-10-17）："退出到主界面，重复检测被取消了"。
+     * 真因不是扫描被停，而是**界面离开后就接不回来了** ✗：
+     * 原来进度查询 `enabled: scanBusy`，离开页面就停、回来也不知道后台还在扫，
+     * 于是显示成"没扫过 / 被取消"。
+     * 现在进页面就问一次 `active`，为真就把这次扫描 join 回来 ✓。
+     */
+    setupGroups([makeGroup("exact:1-2", "exact", [1, 2])]);
+    mocks.getDuplicateScanProgress.mockResolvedValue({
+      stage: "hashing",
+      processed: 1,
+      total: 3,
+      active: true,
+    });
+    mountWithoutStarting();
+
+    // 同 key 的请求会 join 正在跑的那次（不会顶掉它），只有一次
+    await waitFor(() => expect(mocks.findDuplicates).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("1.jpg")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "startFaceDetectionShort" })
+    ).toBeNull();
+  });
+
+  it("进度是「已暂停」时：显示已暂停与继续，而不是错误/空面板", async () => {
+    /*
+     * 自用（2026-10-17，待办「查重的暂停 / 断点继续」）：
+     * 暂停后阶段存在主进程（`paused`），离开页面再回来也要能看到「已暂停 + 继续」✓
+     */
+    setupGroups([makeGroup("exact:1-2", "exact", [1, 2])]);
+    mocks.getSavedDuplicateGroups.mockResolvedValue({
+      groups: [],
+      hasSavedResult: false,
+    });
+    mocks.getDuplicateScanProgress.mockResolvedValue({
+      stage: "paused",
+      processed: 1,
+      total: 3,
+      active: false,
+    });
+    mountWithoutStarting();
+
+    expect(await screen.findByText("duplicatePausedHint")).toBeInTheDocument();
+    // 不该同时显示「开始检测」入口，也不该显示错误面板
+    expect(
+      screen.queryByRole("button", { name: "startFaceDetectionShort" })
+    ).toBeNull();
+    expect(screen.queryByText("duplicateScanFailed")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "aiResume" }));
     await waitFor(() => expect(mocks.findDuplicates).toHaveBeenCalledTimes(1));
   });
 

@@ -1180,14 +1180,24 @@ export const MasonryGrid = memo(
           selectionActive={selectionActive}
           show={showScrollTop}
         />
-        {isScrolling && currentTimeLabel && headerPositions.length > 0 && (
-          <div
-            className="glass-surface pointer-events-none absolute right-4 z-20 rounded-[6px] px-3 py-1.5 font-medium text-[12px] text-foreground shadow-lg ring-1 ring-border"
-            style={{ top: topInset + 8 }}
-          >
-            {currentTimeLabel}
-          </div>
-        )}
+        {/*
+          自用（2026-10-16，用户反馈 ✓）：**"滚动中的当前月份"小标签也要跟着分组开关走** ✗→✓。
+          这个右上角的悬浮小标签用的是 `headerPositions`，而 `useMasonryLayout` 里
+          **不管 showGroupHeaders 都会把分组位置算出来** ✗ →
+          于是关掉"图片按时间分组"后，内嵌的月份标题没了、这个小标签却照旧弹出来 ✗。
+          加上 `showGroupHeaders &&` 之后，关掉分组时它也不再出现 ✓。
+        */}
+        {showGroupHeaders &&
+          isScrolling &&
+          currentTimeLabel &&
+          headerPositions.length > 0 && (
+            <div
+              className="glass-surface pointer-events-none absolute right-4 z-20 rounded-[6px] px-3 py-1.5 font-medium text-[12px] text-foreground shadow-lg ring-1 ring-border"
+              style={{ top: topInset + 8 }}
+            >
+              {currentTimeLabel}
+            </div>
+          )}
       </div>
     );
   }),

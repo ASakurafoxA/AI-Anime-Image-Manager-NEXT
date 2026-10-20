@@ -2,11 +2,18 @@
  * GPU capability probe worker.
  *
  * Lightweight one-shot worker that probes DirectML GPU availability.
- * Uses the bundled YuNet ONNX model via onnxruntime-node to test whether the
- * DML execution provider works.
+ * 用一个**仍然存在的 onnx**（默认 = 当前嵌入模型，中文 CLIP）建一次 DML 会话，
+ * 以此判断 DML 能不能用。
+ *
+ * ⚠️ 自用（2026-10-17，用户口径）：**SFace 人脸链路已整体剔除** ✗ ——
+ * 这里原来拿 `face/face_detection_yunet_2023mar.onnx` 当"试金石"，
+ * 而那些人脸模型已经删了 → 探针会永远返回 `Model not found` ✗，
+ * 表现为"GPU 检测失败、全部掉回 CPU"（角色识别也吃不到显卡）。
+ * 现在改成**由主进程把模型路径传进来**（`modelPath`），并保留一个兜底：
+ * 找不到就用 `models/` 下任一存在的 onnx 试（DML 能不能建会话与模型内容无关）。
  *
  * IPC Protocol:
- *   Parent → { type: "probe", modelsDir: "..." }
+ *   Parent → { type: "probe", modelsDir: "...", modelPath?: "..." }
  *   Worker → { type: "result", dmlAvailable, gpuName?, gpuIndex?, dmlDeviceId?, error?, probeTimeMs }
  *   Worker exits with code 0.
  *
@@ -180,22 +187,72 @@ function loadOrt() {
 
 // ── Probe handler ────────────────────────────────────────────────────
 
-async function handleProbe(modelsDir) {
+/**
+ * 挑一个"用来试 DML 的 onnx"。
+ *
+ * 优先用主进程传进来的 `modelPath`（当前嵌入模型 = 中文 CLIP）；
+ * 没传/不存在时退回扫描 `models/` 下的常见位置 ——
+ * 建 DML 会话只需要**一个真实存在的 onnx**，与模型内容、输入形状无关。
+ */
+function resolveProbeModel(modelsDir, modelPath) {
+  if (modelPath && fs.existsSync(modelPath)) {
+    return modelPath;
+  }
+  const candidates = [
+    path.join(
+      modelsDir,
+      "Xenova",
+      "chinese-clip-vit-base-patch16",
+      "onnx",
+      "model_quantized.onnx"
+    ),
+    path.join(
+      modelsDir,
+      "Xenova",
+      "chinese-clip-vit-base-patch16",
+      "onnx",
+      "vision_model_quantized.onnx"
+    ),
+    path.join(modelsDir, "Xenova", "siglip-base-patch16-224", "onnx", "model_quantized.onnx"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  // 最后一招：models/ 下递归找第一个 .onnx（跳过已废弃的 face/ 目录）
+  try {
+    const stack = [modelsDir];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === "face") {
+          continue;
+        }
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(full);
+        } else if (entry.name.endsWith(".onnx")) {
+          return full;
+        }
+      }
+    }
+  } catch {
+    /* 扫不到就算了，下面会报"没模型" */
+  }
+  return null;
+}
+
+async function handleProbe(modelsDir, modelPath) {
   const probeStart = Date.now();
 
-  // Probe with the active YuNet detector.
-  const yunetModel = path.join(
-    modelsDir,
-    "face",
-    "face_detection_yunet_2023mar.onnx"
-  );
-  const faceModel = yunetModel;
+  const probeModel = resolveProbeModel(modelsDir, modelPath);
 
-  if (!fs.existsSync(faceModel)) {
+  if (!probeModel) {
     process.send?.({
       type: "result",
       dmlAvailable: false,
-      error: `Model not found: ${faceModel}`,
+      error: `No ONNX model available for GPU probe under ${modelsDir}`,
       probeTimeMs: Date.now() - probeStart,
     });
     process.exit(0);
@@ -208,7 +265,7 @@ async function handleProbe(modelsDir) {
   const createSession = async (executionProviders) => {
     const { InferenceSession } = await loadOrt();
     // DML-only session — if this throws, DML is unavailable (JS-catchable).
-    return InferenceSession.create(faceModel, {
+    return InferenceSession.create(probeModel, {
       executionProviders,
       logSeverityLevel: 3,
     });
@@ -303,6 +360,6 @@ async function handleProbe(modelsDir) {
 
 process.on("message", (msg) => {
   if (msg?.type === "probe") {
-    handleProbe(msg.modelsDir);
+    handleProbe(msg.modelsDir, msg.modelPath);
   }
 });

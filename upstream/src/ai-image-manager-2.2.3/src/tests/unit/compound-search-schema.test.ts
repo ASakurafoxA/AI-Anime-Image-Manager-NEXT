@@ -23,13 +23,14 @@ describe("compound search filters", () => {
   });
 
   it("accepts bounded search pagination", () => {
+    // 自用（2026-10）：上限从 200 提到 300 —— 搜索栏的「结果数」档位是 30/100/200/300。
     expect(
-      CompoundSearchSchema.parse({ limit: 200, offset: 400 })
+      CompoundSearchSchema.parse({ limit: 300, offset: 400 })
     ).toMatchObject({
-      limit: 200,
+      limit: 300,
       offset: 400,
     });
-    expect(() => CompoundSearchSchema.parse({ limit: 201 })).toThrow();
+    expect(() => CompoundSearchSchema.parse({ limit: 301 })).toThrow();
     expect(() => CompoundSearchSchema.parse({ offset: -1 })).toThrow();
   });
 

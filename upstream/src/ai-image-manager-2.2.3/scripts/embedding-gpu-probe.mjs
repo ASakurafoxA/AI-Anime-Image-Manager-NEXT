@@ -77,7 +77,28 @@ async function handleProbe(message) {
       new Float32Array(3 * imageSize * imageSize),
       [1, 3, imageSize, imageSize]
     );
-    const output = await session.run({ [inputName]: pixels });
+    /*
+     * 自用（2026-10 换中文 CLIP）：合并模型的一张 ONNX 里声明了
+     * input_ids / attention_mask / pixel_values 三个输入，只喂 pixel_values 会被
+     * ONNX Runtime 拒绝（"input 'input_ids' is missing in 'feeds'"）→ DirectML 探测
+     * 判定不可用、整条链回退 CPU（实测只有 10 张/秒）。
+     * 这里给"声明了但没提供"的输入补零张量，与 embed-worker.mjs 的 buildFeeds 一致。
+     */
+    const feeds = { [inputName]: pixels };
+    const [batch, channels, height, width] = pixels.dims;
+    for (const name of session.inputNames ?? []) {
+      if (feeds[name]) {
+        continue;
+      }
+      feeds[name] = /pixel_values$/i.test(name)
+        ? new Tensor(
+            "float32",
+            new Float32Array(batch * channels * height * width),
+            [batch, channels, height, width]
+          )
+        : new Tensor("int64", new BigInt64Array(16), [1, 16]);
+    }
+    const output = await session.run(feeds);
     for (const value of Object.values(output)) {
       value?.dispose?.();
     }

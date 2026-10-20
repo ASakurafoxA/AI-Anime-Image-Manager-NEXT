@@ -92,6 +92,186 @@ const schema = {
 let dbInstance: ReturnType<typeof drizzle> | null = null;
 let sqliteConnection: Database.Database | null = null;
 
+/*
+ * ── 自用（2026-10-16）：数据库语句记录器（排查「界面未响应」用）───────────
+ *
+ * 背景：出现「窗口未响应 + 一个核心满载 + 持续读盘」时，日志会**完全停写** ✗，
+ * 事后完全看不出卡在哪条语句上（实测两次，只能强杀进程 ✓）。
+ *
+ * 做法：把每条语句**在执行之前**就写进文件 ✓ —— 所以卡死的那条语句一定能被记下来；
+ * 中途被强杀也不会丢（对比之下，等它跑完再记就永远没机会 ✗）。
+ *
+ * 打开方式（不需要改代码、也不影响正常使用）：
+ *   · 环境变量 `AIM_TRACE_QUERIES=1`，或
+ *   · 在软件配置目录的 `logs\` 下放一个空文件 `query-trace.on` ✓
+ * 记录位置：软件配置目录的 `logs\query-trace.log` ✓
+ *
+ * 成本：只有开启时才写盘；每行还会带 3 层调用位置，方便直接定位到代码 ✓。
+ * 关掉：删掉 `query-trace.on` 文件即可（下次启动生效）✓。
+ */
+const QUERY_TRACE_ENV = "AIM_TRACE_QUERIES";
+const QUERY_TRACE_MARKER = "query-trace.on";
+const QUERY_TRACE_FILE = "query-trace.log";
+/** 超过这个耗时就额外记一条 SLOW（方便事后只看慢的）✓。 */
+const QUERY_TRACE_SLOW_MS = 1000;
+/** 记录文件体积上限：到了就停止记录，免得把磁盘写爆 ✗。 */
+const QUERY_TRACE_MAX_BYTES = 100 * 1024 * 1024;
+
+let queryTraceFd: number | null | undefined;
+let queryTraceBytes = 0;
+
+function getQueryTraceFd(): number | null {
+  if (queryTraceFd !== undefined) {
+    return queryTraceFd;
+  }
+  queryTraceFd = null;
+  try {
+    const enabled =
+      process.env[QUERY_TRACE_ENV] === "1" ||
+      fs.existsSync(path.join(app.getPath("userData"), "logs", QUERY_TRACE_MARKER));
+    if (!enabled) {
+      return queryTraceFd;
+    }
+    const logsDir = path.join(app.getPath("userData"), "logs");
+    fs.mkdirSync(logsDir, { recursive: true });
+    const filePath = path.join(logsDir, QUERY_TRACE_FILE);
+    queryTraceFd = fs.openSync(filePath, "a");
+    fs.writeSync(
+      queryTraceFd,
+      `\n===== 语句记录开始 ${new Date().toISOString()} pid=${process.pid} =====\n`
+    );
+  } catch {
+    queryTraceFd = null;
+  }
+  return queryTraceFd;
+}
+
+/** 语句开始执行前的调用位置（3 层），用于定位到代码文件。 */
+function traceCaller(): string {
+  try {
+    const stack = new Error().stack ?? "";
+    return stack
+      .split("\n")
+      .slice(2, 5)
+      .map((line) => line.trim().replace(/^at\s+/, ""))
+      .join(" ← ");
+  } catch {
+    return "";
+  }
+}
+
+function traceStatementStart(sql: string): number {
+  const startedAt = Date.now();
+  const fd = getQueryTraceFd();
+  if (fd === null) {
+    return startedAt;
+  }
+  try {
+    if (queryTraceBytes >= QUERY_TRACE_MAX_BYTES) {
+      fs.writeSync(
+        fd,
+        `${new Date().toISOString()} | 记录已达上限，停止记录\n`
+      );
+      fs.closeSync(fd);
+      queryTraceFd = null;
+      return startedAt;
+    }
+    const oneLine = sql.replace(/\s+/g, " ").trim().slice(0, 2000);
+    const text = `${new Date(startedAt).toISOString()} | 开始 | ${oneLine}\n         ↳ ${traceCaller()}\n`;
+    fs.writeSync(fd, text);
+    queryTraceBytes += text.length;
+  } catch {
+    /* 记录失败不影响业务 */
+  }
+  return startedAt;
+}
+
+function traceStatementEnd(
+  sql: string,
+  startedAt: number,
+  error?: unknown
+): void {
+  const fd = getQueryTraceFd();
+  if (fd === null) {
+    return;
+  }
+  const elapsed = Date.now() - startedAt;
+  if (error === undefined && elapsed < QUERY_TRACE_SLOW_MS) {
+    return;
+  }
+  try {
+    const oneLine = sql.replace(/\s+/g, " ").trim().slice(0, 400);
+    fs.writeSync(
+      fd,
+      `${new Date().toISOString()} | ${error === undefined ? `慢 ${elapsed}ms` : `出错 ${elapsed}ms`} | ${oneLine}\n`
+    );
+  } catch {
+    /* 记录失败不影响业务 */
+  }
+}
+
+/** 给语句挂上计时与记录（失败就原样返回，绝不影响业务）✓。 */
+function wrapStatementForTrace<T>(statement: T, sql: string): T {
+  try {
+    const target = statement as unknown as Record<string, unknown>;
+    for (const method of ["all", "get", "run"] as const) {
+      const original = target[method];
+      if (typeof original !== "function") {
+        continue;
+      }
+      const fn = original as (...args: unknown[]) => unknown;
+      target[method] = function traced(this: unknown, ...args: unknown[]) {
+        const startedAt = traceStatementStart(sql);
+        try {
+          const result = fn.apply(this, args);
+          traceStatementEnd(sql, startedAt);
+          return result;
+        } catch (error) {
+          traceStatementEnd(sql, startedAt, error);
+          throw error;
+        }
+      };
+    }
+  } catch {
+    /* 挂不上就算了，不能因为排查工具把程序弄坏 */
+  }
+  return statement;
+}
+
+/** 给连接装上记录器（prepare / exec / pragma 都覆盖）✓。 */
+function instrumentSqliteForTrace(sqlite: Database.Database): void {
+  try {
+    if (getQueryTraceFd() === null) {
+      return;
+    }
+    const originalPrepare = sqlite.prepare.bind(sqlite);
+    (sqlite as unknown as Record<string, unknown>).prepare = (
+      sql: string,
+      ...rest: unknown[]
+    ) =>
+      wrapStatementForTrace(
+        (originalPrepare as (...a: unknown[]) => unknown)(sql, ...rest),
+        sql
+      );
+
+    const originalExec = sqlite.exec.bind(sqlite);
+    (sqlite as unknown as Record<string, unknown>).exec = (...args: unknown[]) => {
+      const sql = String(args[0] ?? "");
+      const startedAt = traceStatementStart(sql);
+      try {
+        const result = (originalExec as (...a: unknown[]) => unknown)(...args);
+        traceStatementEnd(sql, startedAt);
+        return result;
+      } catch (error) {
+        traceStatementEnd(sql, startedAt, error);
+        throw error;
+      }
+    };
+  } catch {
+    /* 排查工具装不上不影响业务 */
+  }
+}
+
 interface SQLiteTableColumn {
   name: string;
 }
@@ -196,6 +376,9 @@ export function initDatabase(): ReturnType<typeof drizzle> {
   sqlite.pragma("foreign_keys = ON");
   sqlite.pragma("busy_timeout = 5000");
   sqliteConnection = sqlite;
+
+  /* 自用（2026-10-16）：只有在开启记录器时才挂上（见文件上方说明）✓。 */
+  instrumentSqliteForTrace(sqlite);
 
   // Register custom SQLite functions
   sqlite.function(

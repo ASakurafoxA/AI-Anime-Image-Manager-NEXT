@@ -249,7 +249,7 @@ describe("LAN read-only API", () => {
 
     const response = await request(
       lanPort,
-      "/api/photos?limit=20&offset=40&sort=name&order=asc&folderId=9&tagId=3&favorite=1&q=abc",
+      "/api/photos?limit=20&offset=40&sort=name&order=asc&folderId=9&tagId=3&favorite=1&q=abc&excludeHiddenFolders=1",
       { cookie }
     );
 
@@ -257,6 +257,8 @@ describe("LAN read-only API", () => {
     expect(JSON.parse(response.body).total).toBe(61);
     expect(apiMocks.listLanPhotos).toHaveBeenCalledWith(
       expect.objectContaining({
+        // 隐藏文件夹开关（与桌面端同名同义）：页面上的"眼睛"按钮传下来的
+        excludeHiddenFolders: true,
         favoriteOnly: true,
         folderId: 9,
         limit: 20,

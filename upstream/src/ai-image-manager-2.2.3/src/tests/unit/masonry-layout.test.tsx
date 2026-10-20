@@ -125,6 +125,16 @@ describe("useMasonryLayout cache safety", () => {
     expect(result.current.visibilityIndex).toHaveLength(3);
   });
 
+  /*
+   * 自用（2026-10-16，**意图变更** ✓ —— 用户要求"搜索结果要像主界面一样平铺" ✓）：
+   *
+   * 紧凑模式（`showGroupHeaders=false`，标题不画 ✗）**不再**把各列强行对齐到同一高度 ✗→✓。
+   * 原因：搜索结果是按**相似度**排的 ✓ → 几乎每张照片各自构成一个"月份分组" ✓ →
+   * 每个边界都对齐会把照片推到上一批下面 ✗；更早的版本更糟：各列被拉平后，
+   * "谁最短谁接"那行比较在各列相等时永远命中第 0 列 ✗ → **全部挤成一列** ✗（用户截图 ✓）。
+   * 现在紧凑模式直接走普通瀑布流 ✓ → 第 3 张贴着最短的列排（top 由 108 变为 **58** ✓）。
+   * 分组标题的位置（`headerPositions`）**不受影响** ✓ —— 仍记在当时的最高点上 ✓。
+   */
   it("keeps compact group boundaries while retaining date marker positions", () => {
     const { result } = renderLayout({
       headers: [
@@ -141,7 +151,8 @@ describe("useMasonryLayout cache safety", () => {
       { label: "February", top: 108 },
     ]);
     expect(result.current.positions[0].top).toBe(0);
-    expect(result.current.positions[2].top).toBe(108);
+    // 同上：紧凑模式下不再为分组边界留出对齐高度 ✓（108 → 58 ✓）
+    expect(result.current.positions[2].top).toBe(58);
   });
 
   it("recomputes appended positions when group header spacing mode changes", () => {
@@ -163,6 +174,7 @@ describe("useMasonryLayout cache safety", () => {
     });
 
     expect(result.current.positions[0].top).toBe(0);
-    expect(result.current.positions[2].top).toBe(108);
+    // 切到紧凑模式后重算的位置 ✓（同样不再被分组边界下推：108 → 58 ✓）
+    expect(result.current.positions[2].top).toBe(58);
   });
 });

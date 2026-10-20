@@ -35,9 +35,206 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { ipc } from "@/ipc/manager";
+import { resolveTagDotColor } from "@/utils/tag-dot-color";
+import { buildTagTree } from "@/components/sidebar-trees";
 import { getTagDisplayName } from "@/localization/tag-display";
 import { getDateLocale } from "@/utils/date-locale";
 import { toLocalMediaUrl } from "@/utils/local-media-url";
+
+/*
+ * 自用：详情页「关键信息」里高亮的主类。
+ * 2026-10：试过把「分级」也放进来，实际用下来没什么用，已去掉（年龄分级仍以普通标签显示）。
+ */
+const HIGHLIGHT_TAG_ROOTS = new Set(["角色", "画风"]);
+
+/*
+ * 自用：不在高亮主类里、但同样算「关键信息」的标签（按名字匹配）。
+ * 目前是「AI 生成 (ai-generated)」：它在「元信息」主类下，
+ * 而整个元信息主类有 1.9 万张图的一堆标签，绝不能整类拉进来。
+ */
+const KEY_TAG_NAME_RE = /ai[\s_-]*generated|AI\s*生成/i;
+
+/** 自用：判断某个标签是否属于「关键信息」（主类高亮 或 命中名字白名单）。 */
+function isKeyValueTag(
+  tag: DetailTag,
+  byId: Map<number, DetailTag>
+): boolean {
+  if (HIGHLIGHT_TAG_ROOTS.has(rootTagNameOf(tag, byId))) {
+    return true;
+  }
+  const candidate = tag as { name?: string; displayName?: string };
+  return KEY_TAG_NAME_RE.test(
+    `${candidate.name ?? ""} ${candidate.displayName ?? ""}`
+  );
+}
+
+/** 自用：详情面板里要用到的标签字段（结构化类型，不绑定某个模块的类型）。 */
+interface DetailTag {
+  color?: string | null;
+  id: number;
+  name: string;
+  parentId?: number | null;
+}
+
+function buildDetailTagMap(allTags: DetailTag[]): Map<number, DetailTag> {
+  return new Map(allTags.map((item) => [item.id, item]));
+}
+
+/** 自用：标签所属**主类**的名字（一路向上找，带环保护）。 */
+function rootTagNameOf(
+  tag: { id: number; parentId?: number | null },
+  byId: Map<number, DetailTag>
+): string {
+  /*
+   * ⚠️ 起点必须先用 id 从**全量标签表**里取回那一条：
+   * `getPhotoTags` 返回的标签**不含 parentId**，直接拿它当起点的话
+   * 向上找一步就断了 —— 结果是「主类」被当成标签自己，
+   * 于是角色/画师分不出来、颜色也退化成"按标签自身 id 随机取色"。
+   */
+  let current: { id: number; parentId?: number | null } | undefined =
+    byId.get(tag.id) ?? tag;
+  const guard = new Set<number>([tag.id]);
+  while (current?.parentId !== null && current?.parentId !== undefined) {
+    const parent = byId.get(current.parentId);
+    if (!parent || guard.has(parent.id)) {
+      break;
+    }
+    guard.add(parent.id);
+    current = parent;
+  }
+  return byId.get(current?.id ?? tag.id)?.name ?? "";
+}
+
+/**
+ * 自用：**按标签树的展示顺序**给每个标签一个序号。
+ *
+ * 关键点：直接复用左侧标签树那份 `buildTagTree`（同一份实现 = 同一个顺序），
+ * 再深度优先编号。这样详情面板里从上往下的顺序和标签树完全一致，
+ * 于是**同一主类的标签自然连成一整块**（颜色也就连成一块）。
+ * 结果按 allTags 的数组引用缓存：图库数据没变就不重算（3 万个标签只算一次）。
+ */
+const TAG_ORDER_CACHE = new WeakMap<object, Map<number, number>>();
+
+function tagOrderIndexOf(allTags: DetailTag[]): Map<number, number> {
+  const cached = TAG_ORDER_CACHE.get(allTags);
+  if (cached) {
+    return cached;
+  }
+  const index = new Map<number, number>();
+  let counter = 0;
+  const walk = (nodes: ReturnType<typeof buildTagTree>) => {
+    for (const node of nodes) {
+      index.set(node.tag.id, counter);
+      counter += 1;
+      walk(node.children);
+    }
+  };
+  // buildTagTree 只用到 id/name/parentId/color，这里的结构化类型够用
+  walk(buildTagTree(allTags as never));
+  TAG_ORDER_CACHE.set(allTags, index);
+  return index;
+}
+
+/**
+ * 自用：把一张图的标签分成「关键信息（角色名 / 画师）」与「其余标签」两组，
+ * **组内都按标签树的顺序**排。
+ */
+function splitDetailTags(
+  photoTags: DetailTag[],
+  allTags: DetailTag[],
+  language: string
+) {
+  const byId = buildDetailTagMap(allTags);
+  const order = tagOrderIndexOf(allTags);
+  const fallback = Number.MAX_SAFE_INTEGER;
+  const sorted = [...photoTags].sort(
+    (a, b) => (order.get(a.id) ?? fallback) - (order.get(b.id) ?? fallback)
+  );
+  /*
+   * 排版：标签区是两列 grid，**短标签两个一行、长标签独占一行**。
+   * 同一主类内把短标签排在前面，短标签就能填满整行、长标签落在块尾 —— 看着更整齐。
+   * 主类之间的先后仍是标签树的顺序（借助 Map 的插入顺序）。
+   */
+  const arrange = (list: DetailTag[]) => {
+    const groups = new Map<string, DetailTag[]>();
+    for (const tag of list) {
+      const root = rootTagNameOf(tag, byId);
+      const bucket = groups.get(root);
+      if (bucket) {
+        bucket.push(tag);
+      } else {
+        groups.set(root, [tag]);
+      }
+    }
+    const out: DetailTag[] = [];
+    for (const bucket of groups.values()) {
+      out.push(
+        ...bucket.filter((tag) => !isLongDetailTag(tag, language)),
+        ...bucket.filter((tag) => isLongDetailTag(tag, language))
+      );
+    }
+    return out;
+  };
+  return {
+    byId,
+    keyTags: arrange(sorted.filter((tag) => isKeyValueTag(tag, byId))),
+    restTags: arrange(sorted.filter((tag) => !isKeyValueTag(tag, byId))),
+  };
+}
+
+/** 自用：显示名超过这个字数就算「长标签」（独占一行）。 */
+const LONG_TAG_LENGTH = 13;
+
+/** 自用：是不是长标签（按**显示名**的字符数算）。 */
+function isLongDetailTag(tag: DetailTag, language: string): boolean {
+  return getTagDisplayName(tag.name, language).length > LONG_TAG_LENGTH;
+}
+
+/** 自用：详情面板里的标签 chip（左侧色条 + 同色淡底 + 右侧 ✕）。样式保持上一版。 */
+function renderDetailTagChip(
+  tag: DetailTag,
+  byId: Map<number, DetailTag>,
+  language: string,
+  removeLabel: string,
+  rootLabel: (rootName: string) => string,
+  onRemove: (id: number) => void
+) {
+  // 同样要先取全量那条（原因见 rootTagNameOf 的注释）
+  const color = resolveTagDotColor(byId.get(tag.id) ?? tag, byId);
+  return (
+    <span
+      className={`flex w-full items-center gap-2 rounded-[4px] px-2 py-1 text-[11px] text-foreground/90 ${
+        isLongDetailTag(tag, language) ? "col-span-2" : ""
+      }`}
+      key={tag.id}
+      style={{ background: `${color}1f`, borderLeft: `3px solid ${color}` }}
+    >
+      {/* 悬停显示这个标签所属的**主类**（角色 / 通用 / 画风…），沿用同一套 Tooltip 样式 */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="flex-1">{getTagDisplayName(tag.name, language)}</span>
+        </TooltipTrigger>
+        <TooltipContent>
+          {rootLabel(rootTagNameOf(byId.get(tag.id) ?? tag, byId))}
+        </TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            aria-label={removeLabel}
+            className="flex h-3.5 w-3.5 items-center justify-center rounded-full text-muted-foreground/60 transition-colors hover:bg-destructive hover:text-white"
+            onClick={() => onRemove(tag.id)}
+            type="button"
+          >
+            <X className="h-2 w-2" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>{removeLabel}</TooltipContent>
+      </Tooltip>
+    </span>
+  );
+}
+
 
 interface PhotoDetail {
   filename: string;
@@ -804,86 +1001,63 @@ export function PhotoDetailPanel({
             </div>
           </section>
 
+          {/* 自用：关键信息（角色名 / 画师）—— 两者都没有时整块不显示 */}
+          {(() => {
+            const { byId, keyTags } = splitDetailTags(
+              photoTags,
+              allTags,
+              i18n.language
+            );
+            if (keyTags.length === 0) {
+              return null;
+            }
+            return (
+              <section>
+                <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
+                  {t("keyInfo")}
+                </h4>
+                <div className="grid grid-cols-2 gap-1">
+                  {keyTags.map((tag) =>
+                    renderDetailTagChip(
+                      tag,
+                      byId,
+                      i18n.language,
+                      t("remove"),
+                      (root) => t("tagRootLabel", { root }),
+                      handleRemoveTag
+                    )
+                  )}
+                </div>
+              </section>
+            );
+          })()}
+
           {/* Tags */}
           <section>
             <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
               {t("sidebarTags")}
             </h4>
-            <div className="flex flex-wrap gap-1.5">
-              {photoTags.map((tag) => {
-                const unconfirmed = tag.isConfirmed === false;
-                return (
-                  <span
-                    className="group relative flex items-center gap-0.5"
-                    key={tag.id}
-                  >
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <button
-                          aria-label={
-                            unconfirmed
-                              ? t("aiSuggestionConfirm", {
-                                  confidence: tag.confidence
-                                    ? `${Math.round(tag.confidence * 100)}%`
-                                    : "",
-                                })
-                              : t("clickToRemove")
-                          }
-                          className={`flex items-center gap-0.5 rounded-[4px] px-1.5 py-0.5 text-[11px] ${
-                            unconfirmed
-                              ? "border border-foreground/30 border-dashed bg-foreground/5 text-foreground"
-                              : "text-white/90 hover:opacity-80"
-                          }`}
-                          onClick={() =>
-                            unconfirmed
-                              ? handleConfirmTag(tag.id)
-                              : handleRemoveTag(tag.id)
-                          }
-                          style={
-                            unconfirmed
-                              ? undefined
-                              : { background: tag.color || "var(--primary)" }
-                          }
-                          type="button"
-                        >
-                          {getTagDisplayName(tag.name, i18n.language)}
-                          {unconfirmed ? (
-                            <span className="ml-0.5 text-[10px] opacity-60">
-                              ?
-                            </span>
-                          ) : (
-                            <X className="h-2.5 w-2.5 opacity-60" />
-                          )}
-                        </button>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        {unconfirmed
-                          ? t("aiSuggestionConfirm", {
-                              confidence: tag.confidence
-                                ? `${Math.round(tag.confidence * 100)}%`
-                                : "",
-                            })
-                          : t("clickToRemove")}
-                      </TooltipContent>
-                    </Tooltip>
-                    {unconfirmed && (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <button
-                            aria-label={t("remove")}
-                            className="absolute -top-1 -right-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-muted text-muted-foreground/70 opacity-0 transition-opacity hover:bg-destructive hover:text-white group-hover:opacity-100"
-                            onClick={() => handleRemoveTag(tag.id)}
-                            type="button"
-                          >
-                            <X className="h-2 w-2" />
-                          </button>
-                        </TooltipTrigger>
-                        <TooltipContent>{t("remove")}</TooltipContent>
-                      </Tooltip>
-                    )}
-                  </span>
+            {/* 自用：**竖直排列**（一行一个，按标签树的顺序从上往下），颜色用
+                「左侧色条 + 同色淡底」表达归属 —— 既不晃眼又一眼能看出分类。
+                排版：两列 grid —— 短标签两个一行，长标签独占一行。 */}
+            <div className="grid grid-cols-2 gap-1">
+              {(() => {
+                const { byId, restTags } = splitDetailTags(
+                  photoTags,
+                  allTags,
+                  i18n.language
                 );
-              })}
+                return restTags.map((tag) =>
+                  renderDetailTagChip(
+                    tag,
+                    byId,
+                    i18n.language,
+                    t("remove"),
+                    (root) => t("tagRootLabel", { root }),
+                    handleRemoveTag
+                  )
+                );
+              })()}
               <button
                 className="rounded-[4px] border border-input border-dashed px-1.5 py-0.5 text-[11px] text-muted-foreground/70 hover:border-muted-foreground hover:text-muted-foreground"
                 onClick={() => {
@@ -994,6 +1168,8 @@ export function PhotoDetailPanel({
           </section>
 
           {/* AI Tag Suggestions */}
+          {/* 自用精简：整块去掉（见 private-build.ts 的 hideAiSuggestedTags） */}
+          {!PRIVATE_BUILD.hideAiSuggestedTags && (
           <section>
             <h4 className="mb-2 font-medium text-[11px] text-muted-foreground/70 uppercase tracking-wider">
               {t("aiSuggestionTitle")}
@@ -1083,6 +1259,7 @@ export function PhotoDetailPanel({
               {t("aiTagDisclaimer")}
             </p>
           </section>
+          )}
 
           {/* EXIF and maker metadata */}
           {/* 自用精简版：隐藏照片详情里的 EXIF 区块（见 src/config/private-build.ts） */}

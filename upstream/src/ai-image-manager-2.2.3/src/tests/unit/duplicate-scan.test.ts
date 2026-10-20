@@ -2,7 +2,12 @@
 import { call } from "@orpc/server";
 import { dismissDuplicates, findDuplicates } from "@/ipc/photos/handlers/stats";
 import { updateDuplicateReviewState } from "@/services/duplicate-review";
-import { cancelDuplicateScan } from "@/services/duplicate-scan-runtime";
+import {
+  cancelDuplicateScan,
+  consumePauseRequest,
+  getDuplicateScanProgress,
+  pauseDuplicateScan,
+} from "@/services/duplicate-scan-runtime";
 import { computeFullFileHash } from "@/services/file-hash";
 
 vi.mock("@/services/file-hash", async (original) => {
@@ -66,6 +71,7 @@ vi.mock("@/services/smart-album-engine", () => ({
 }));
 
 import {
+  duplicateDetectionRuns,
   duplicatePairs,
   duplicatePhotoFingerprints,
   duplicateReviewGroups,
@@ -230,7 +236,10 @@ describe("duplicate cleanup deletion plans", () => {
     expect(rejected.groups[0].photoCount).toBe(2);
     vectors.read.mockResolvedValue(new Map());
     const noAI = await call(findDuplicates, { forceRescan: true });
-    expect(noAI.groups[0].photoCount).toBe(2);
+    // 自用：查重已改成「严格档」（指纹阈值 4）。没有 AI 向量可确认时，
+    // 只保留指纹距离 <= 4 的配对；本夹具三张图的距离是 6 / 14 / 15，
+    // 因此不产生任何重复组（以前阈值 8 时距离 6 会被保留，故断言为 2）。
+    expect(noAI.groups).toHaveLength(0);
   });
   it("restores ignored groups and preserves their saved decisions", async () => {
     makeSimilar();
@@ -304,7 +313,8 @@ describe("duplicate cleanup deletion plans", () => {
       call(findDuplicates, { forceRescan: true }),
       call(findDuplicates, { forceRescan: true }),
     ]);
-    expect(a.runId).toBe(b.runId);
+    // 正常扫完的分支才带 runId（暂停/取消分支返回 stopped + 上次结果，见下面两条用例）
+    expect((a as { runId?: string }).runId).toBe((b as { runId?: string }).runId);
     expect(vectors.read).toHaveBeenCalledTimes(1);
   });
   it("cancels without publishing partial results", async () => {
@@ -313,10 +323,47 @@ describe("duplicate cleanup deletion plans", () => {
       cancelDuplicateScan();
       return Promise.resolve(new Map());
     });
-    await expect(call(findDuplicates, { forceRescan: true })).rejects.toThrow(
-      "SCAN_CANCELLED"
-    );
+    /*
+     * 自用（2026-10-17 第二轮）：暂停/取消**不再当失败抛出** ✓ ——
+     * 否则界面那次请求变成错误状态、React Query 会按默认重试把扫描重新发起 ✗✗
+     * （用户实测："第一次点暂停，过一会它又自己开始扫"）。
+     * 现在返回"已保存的结果 + stopped 标记"，界面据此显示，不会自动重扫 ✓
+     */
+    const result = await call(findDuplicates, { forceRescan: true });
+    expect(result).toMatchObject({ stopped: "cancelled" });
     expect(getTestDb().select().from(duplicatePairs).all()).toEqual(before);
+  });
+  /*
+   * 自用（2026-10-17，待办「查重的暂停 / 断点继续」）：
+   * 暂停与取消共用同一套"停下"机制，但语义不同 ——
+   *   ① 阶段记成 `paused`（界面据此显示「已暂停 + 继续」），而不是 `cancelled`；
+   *   ② 上层能把这次停下标成 `paused`（`consumePauseRequest()` 只认一次）；
+   *   ③ 下一轮开始时**清掉**暂停标记，不会把新的一轮误判成暂停 ✓
+   */
+  it("pauses at the next checkpoint and reports paused instead of cancelled", async () => {
+    const before = getTestDb().select().from(duplicatePairs).all();
+    vectors.read.mockImplementationOnce(() => {
+      pauseDuplicateScan();
+      return Promise.resolve(new Map());
+    });
+    // 暂停同样**不抛错**：返回"已保存的结果 + stopped=paused" ✓（界面显示「已暂停」）
+    const pausedResult = await call(findDuplicates, { forceRescan: true });
+    expect(pausedResult).toMatchObject({ stopped: "paused" });
+    // ① 阶段：paused（不是 cancelled）
+    expect(getDuplicateScanProgress().stage).toBe("paused");
+    // ② 运行记录被标成 paused（而不是 cancelled）—— 库里可区分，排查时不会混 ✓
+    const runs = getTestDb().select().from(duplicateDetectionRuns).all();
+    const latestRun = runs[runs.length - 1];
+    expect(latestRun?.status).toBe("paused");
+    // 暂停标记已被 handler 消费掉，不会影响下一轮
+    expect(consumePauseRequest()).toBe(false);
+    expect(getTestDb().select().from(duplicatePairs).all()).toEqual(before);
+
+    // ③ 继续 = 再跑一次（复用已算好的哈希）；新一轮开始时暂停标记已清掉
+    await expect(
+      call(findDuplicates, { forceRescan: true })
+    ).resolves.toBeTruthy();
+    expect(consumePauseRequest()).toBe(false);
   });
   it("rolls back pairs and fingerprints when snapshot publication fails", async () => {
     const before = getTestDb().select().from(duplicatePairs).all();

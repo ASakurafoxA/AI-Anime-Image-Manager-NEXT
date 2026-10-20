@@ -318,20 +318,17 @@ export const PhotoCard = memo(function PhotoCard({
     if (!match) {
       return null;
     }
-    // 相对本次搜索最佳匹配归一化（最佳=100%），避免 SigLIP 原始余弦
-    // 绝对分数偏低带来的"才 40% 匹配？"误解。无有效 topSimilarity 时回退 null。
-    const semanticPercentOf = (score: number): string | null => {
-      if (
-        semanticTopSimilarity &&
-        semanticTopSimilarity > 0 &&
-        score <= semanticTopSimilarity
-      ) {
-        return t("searchMatchSemanticPercent", {
-          value: Math.max(1, Math.round((score / semanticTopSimilarity) * 100)),
-        });
-      }
-      return null;
-    };
+    /*
+     * 自用（2026-10）：角标直接显示**原始相似度**，不再按本次最高分归一化。
+     *
+     * 原来归一化会让 Top1 永远 100% —— "这批里排第一"很容易被误读成"完美匹配"，
+     * 而且同一个 100% 在不同查询里含义完全不同，无法横向比较。
+     * 改成原始分之后：跨查询可比，也能和其它工具（如 MaterialSearch，显示 51%/31%）直接对照。
+     */
+    const semanticPercentOf = (score: number): string | null =>
+      t("searchMatchSemanticPercent", { value: Math.round(score * 100) });
+    // 归一化用的最高分已不再需要（保留形参以免动 props 契约）
+    void semanticTopSimilarity;
     if (match.kind === "color") {
       return t("searchMatchColor", { value: Math.round(match.score * 100) });
     }

@@ -62,16 +62,11 @@ interface AlbumResult {
   name: string;
 }
 
-interface PersonResult {
-  coverBbox: { x: number; y: number; width: number; height: number } | null;
-  coverPhotoHeight: number | null;
-  coverPhotoPath: string | null;
-  coverPhotoWidth: number | null;
-  coverThumbnailPath: string | null;
-  faceCount: number;
-  id: number;
-  name: string;
-}
+/*
+ * 自用（2026-10-17，用户口径）：**SFace 人脸链路已整体剔除** ✗
+ * 这里原来的 `PersonResult` + 人物搜索分组（跳到 `/people/$identityId`）已删掉；
+ * 人物页现在只用 CCIP 三条功能，没有"身份"这个概念了 ✓
+ */
 
 export function SpotlightSearch() {
   const { t, i18n } = useTranslation();
@@ -80,7 +75,6 @@ export function SpotlightSearch() {
   const [photoResults, setPhotoResults] = useState<PhotoResult[]>([]);
   const [tagResults, setTagResults] = useState<TagResult[]>([]);
   const [albumResults, setAlbumResults] = useState<AlbumResult[]>([]);
-  const [personResults, setPersonResults] = useState<PersonResult[]>([]);
   const [searching, setSearching] = useState(false);
   const { data: aiStatus } = useAiStatus();
   const navigate = useNavigate();
@@ -91,7 +85,6 @@ export function SpotlightSearch() {
   const staticCacheRef = useRef<{
     tags?: { data: TagResult[]; ts: number };
     albums?: { data: AlbumResult[]; ts: number };
-    faces?: { data: PersonResult[]; ts: number };
   }>({});
   const CACHE_TTL = 30_000; // 30 seconds
 
@@ -129,7 +122,6 @@ export function SpotlightSearch() {
         setPhotoResults([]);
         setTagResults([]);
         setAlbumResults([]);
-        setPersonResults([]);
         return;
       }
       const gen = ++searchGenRef.current;
@@ -140,7 +132,6 @@ export function SpotlightSearch() {
         // Use cached data for relatively static resources
         const cachedTags = staticCacheRef.current.tags;
         const cachedAlbums = staticCacheRef.current.albums;
-        const cachedFaces = staticCacheRef.current.faces;
 
         const tagsPromise =
           cachedTags && now - cachedTags.ts < CACHE_TTL
@@ -162,31 +153,21 @@ export function SpotlightSearch() {
                 };
                 return data;
               });
-        const facesPromise =
-          cachedFaces && now - cachedFaces.ts < CACHE_TTL
-            ? Promise.resolve(cachedFaces.data)
-            : ipc.client.faces.listFaceIdentities({}).then((data) => {
-                staticCacheRef.current.faces = {
-                  data: data as PersonResult[],
-                  ts: Date.now(),
-                };
-                return data;
-              });
 
-        const [photos, tags, albums, faces] = await Promise.allSettled([
+        // 自用（2026-10-17）：人物身份那一路已随 SFace 链路移除 → 只剩三个来源 ✓
+        const [photos, tags, albums] = await Promise.allSettled([
           (ipc.client.photos as any).searchSpotlight({
             query: q,
             limit: 8,
           }),
           tagsPromise,
           albumsPromise,
-          facesPromise,
         ]);
         // 竞态保护：丢弃过时响应
         if (gen !== searchGenRef.current) {
           return;
         }
-        const failed = [photos, tags, albums, faces].filter(
+        const failed = [photos, tags, albums].filter(
           (r) => r.status === "rejected"
         ).length;
 
@@ -212,16 +193,9 @@ export function SpotlightSearch() {
               .slice(0, 5)
           );
         }
-        if (faces.status === "fulfilled") {
-          setPersonResults(
-            ((faces.value as PersonResult[]) || [])
-              .filter((p) => p.name?.toLowerCase().includes(qLower))
-              .slice(0, 5)
-          );
-        }
-        if (failed > 0 && failed < 4) {
+        if (failed > 0 && failed < 3) {
           toast.error(t("searchPartialFailed"));
-        } else if (failed === 4) {
+        } else if (failed === 3) {
           toast.error(t("toastSearchFailed"));
         }
       } catch {
@@ -480,53 +454,7 @@ export function SpotlightSearch() {
               </Command.Group>
             )}
 
-            {/* Person results */}
-            {personResults.length > 0 && (
-              <Command.Group
-                className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:text-muted-foreground [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider"
-                heading={t("people")}
-              >
-                {personResults.map((person) => (
-                  <Command.Item
-                    className="flex cursor-pointer items-center gap-3 rounded-[6px] px-2 py-2 text-[13px] text-foreground aria-selected:bg-foreground/5"
-                    key={`person-${person.id}`}
-                    onSelect={() =>
-                      handleSelect(() =>
-                        navigate({
-                          to: "/people/$identityId",
-                          params: { identityId: String(person.id) },
-                        })
-                      )
-                    }
-                    value={`person ${person.name}`}
-                  >
-                    {person.coverThumbnailPath || person.coverPhotoPath ? (
-                      <img
-                        alt=""
-                        className="h-7 w-7 rounded-full object-cover"
-                        height={28}
-                        src={toLocalMediaUrl(
-                          person.coverThumbnailPath ||
-                            person.coverPhotoPath ||
-                            ""
-                        )}
-                        width={28}
-                      />
-                    ) : (
-                      <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary/10">
-                        <Users className="h-3.5 w-3.5 text-primary" />
-                      </div>
-                    )}
-                    <span className="min-w-0 flex-1 truncate">
-                      {person.name}
-                    </span>
-                    <span className="shrink-0 text-[10px] text-muted-foreground">
-                      {person.faceCount} {t("photos")}
-                    </span>
-                  </Command.Item>
-                ))}
-              </Command.Group>
-            )}
+            {/* 自用（2026-10-17）：「人物」分组已随 SFace 链路移除 ✗ */}
 
             {/* Album results */}
             {albumResults.length > 0 && (

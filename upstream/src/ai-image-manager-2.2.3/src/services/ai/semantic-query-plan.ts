@@ -225,6 +225,10 @@ function ensurePhotoPrompt(text: string): string {
   if (!normalized) {
     return "";
   }
+  // 自用：中文原生模型对英文也能编码，但不该套 SigLIP 那套英文模板
+  if (getActiveEmbeddingModel().kind === "chinese-clip") {
+    return normalized.endsWith(".") ? normalized : `${normalized}.`;
+  }
   if (getActiveEmbeddingModel().kind === "siglip") {
     if (SIGLIP_PROMPT_PREFIX_RE.test(normalized)) {
       return `${normalized}.`;
@@ -349,7 +353,7 @@ export async function prepareSemanticQueryPlan(
       intent: classifyEnglishIntent(normalizedQuery),
       language,
       negativePrompts: negativeTerms
-        .map(ensurePhotoPrompt)
+        .map((prompt) => ensurePhotoPrompt(prompt))
         .filter(isEnglishPrompt),
       normalizedQuery,
       rawPromptCount: 1,
@@ -362,6 +366,34 @@ export async function prepareSemanticQueryPlan(
           weight: 1,
         },
       ],
+      translationMode: "none",
+      version: SEMANTIC_QUERY_PLAN_VERSION,
+    };
+  }
+
+  /*
+   * 自用（2026-10 换中文 CLIP）：该模型**中文原生** —— 直接用中文原文。
+   *
+   * 既不再翻译（省掉 opus-mt 那一步的信息损失与延迟），也不套
+   * `This is a photo of …` 那种英文模板（那是给只吃英文的 SigLIP 用的）。
+   */
+  if (getActiveEmbeddingModel().kind === "chinese-clip") {
+    return {
+      coverage: 1,
+      intent: classifyEnglishIntent(normalizedQuery),
+      language,
+      negativePrompts: [],
+      normalizedQuery,
+      prompts: [
+        {
+          canonicalKey: canonicalizeSemanticPrompt(normalizedQuery),
+          evidenceGroup: "whole-query",
+          role: "primary",
+          text: normalizedQuery,
+          weight: 1,
+        },
+      ],
+      rawPromptCount: 1,
       translationMode: "none",
       version: SEMANTIC_QUERY_PLAN_VERSION,
     };
@@ -420,7 +452,7 @@ export async function prepareSemanticQueryPlan(
     language,
     negativePrompts: translatedNegatives
       .filter(Boolean)
-      .map(ensurePhotoPrompt)
+      .map((prompt) => ensurePhotoPrompt(prompt))
       .filter(isEnglishPrompt),
     normalizedQuery,
     rawPromptCount: promptCandidates.length,
@@ -457,11 +489,19 @@ export function semanticQueryPlanCacheKey(
   modelKind: string,
   limit: number,
   translationModelVersion: string,
-  sensitivity = "standard"
+  sensitivity = "standard",
+  /*
+   * 自用（2026-10-16，**修"筛选阈值和角标不是一个刻度"**）：
+   * 顶栏「相似度 ≥ N%」滑杆值也要进缓存键 ✓ —— 它参与最终筛选结果，
+   * 不进键的话换个阈值会命中上一个阈值的结果 ✗（滑杆看着"还是不起作用"）。
+   * 默认 0 = 不传时键与旧行为完全一致 ✓。
+   */
+  minSimilarity = 0
 ): string {
   return JSON.stringify({
     embeddingFingerprint: modelKind,
     limit,
+    minSimilarity,
     negativePrompts: plan.negativePrompts,
     normalizedQuery: plan.normalizedQuery,
     prompts: plan.prompts,

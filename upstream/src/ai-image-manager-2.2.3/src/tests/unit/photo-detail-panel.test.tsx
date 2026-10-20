@@ -115,7 +115,13 @@ describe("PhotoDetailPanel preview", () => {
     expect(image).toHaveClass("opacity-0");
   });
 
-  it("keeps unconfirmed tags readable in the light theme", async () => {
+  /*
+   * 自用（2026-10 用户口径）：标签不再有「未确认 / 已确认」两态 ——
+   * 原来未确认时是虚线灰底（本条用例在测它的可读性），而在已确认状态下
+   * **点标签本身就是删除**，同一个标签点一下做的事相反，极易误删。
+   * 现在：所有标签都按主类颜色实心显示；**点本体不删除**，删除只走右侧的 ✕。
+   */
+  it("标签按主类颜色实心显示，删除入口只有右侧的 ✕", async () => {
     getPhotoTagsMock.mockResolvedValue([
       {
         color: null,
@@ -135,13 +141,15 @@ describe("PhotoDetailPanel preview", () => {
       />
     );
 
-    await waitFor(() => {
-      expect(screen.getByText("人物")).toHaveClass(
-        "border-foreground/30",
-        "bg-foreground/5",
-        "text-foreground"
-      );
-    });
+    // 淡底 chip + 左侧主类色小圆点（不再是"未确认"的虚线灰底，也不是整块实心色）
+    const label = await screen.findByText("人物");
+    const chip = label.parentElement as HTMLElement;
+    // 颜色表达归属：左侧色条 + 同色淡底
+    expect(chip.style.borderLeft).toContain("3px solid");
+    expect(chip.style.background).not.toBe("");
+
+    // 删除入口只有右侧那个常驻的 ✕
+    expect(screen.getByRole("button", { name: "remove" })).toBeInTheDocument();
   });
 
   it("hides manual analysis while the photo is being auto-tagged", async () => {
@@ -286,15 +294,14 @@ describe("PhotoDetailPanel preview", () => {
     expect(screen.queryByRole("button", { name: "海浪" })).toBeNull();
   });
 
-  it("ignores a suggestion response after navigating to another photo", async () => {
-    let resolveSuggestion: ((value: unknown) => void) | undefined;
-    suggestTagsMock.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveSuggestion = resolve;
-        })
-    );
-    const { rerender } = render(
+  /*
+   * 自用（问题：图片详情里那块「AI 建议标签」是上游通用图像模型的产物，
+   * 与自用版的 Danbooru 标签体系不是一回事）—— 已由 `hideAiSuggestedTags` 整块去掉。
+   * 原来有两条用例在测"切换照片后丢弃过期的建议响应"，那些逻辑虽然还在代码里，
+   * 但按钮已经不渲染、无法触发，所以这里改成守住"区块不再出现"。
+   */
+  it("不再显示「AI 建议标签」区块", async () => {
+    render(
       <PhotoDetailPanel
         onClose={vi.fn()}
         onOpenExplorer={vi.fn()}
@@ -302,55 +309,11 @@ describe("PhotoDetailPanel preview", () => {
       />
     );
 
-    fireEvent.click(
-      await screen.findByRole("button", { name: "analyzeSuggestedTags" })
-    );
-    rerender(
-      <PhotoDetailPanel
-        onClose={vi.fn()}
-        onOpenExplorer={vi.fn()}
-        photo={{ ...basePhoto, id: 2, filename: "second.jpg" }}
-      />
-    );
-    resolveSuggestion?.({ suggestions: [{ confidence: 0.9, tag: "stale" }] });
-
     await waitFor(() => {
-      expect(screen.queryByText("stale")).not.toBeInTheDocument();
+      expect(screen.queryByText("aiSuggestionTitle")).not.toBeInTheDocument();
     });
-  });
-
-  it("ignores a stale tag-analysis status after navigating to another photo", async () => {
-    const statusResolvers: Array<(value: unknown) => void> = [];
-    getPhotoTagAnalysisStatusMock.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          statusResolvers.push(resolve);
-        })
-    );
-    const { rerender } = render(
-      <PhotoDetailPanel
-        onClose={vi.fn()}
-        onOpenExplorer={vi.fn()}
-        photo={basePhoto}
-      />
-    );
-    await waitFor(() => expect(statusResolvers).toHaveLength(1));
-
-    rerender(
-      <PhotoDetailPanel
-        onClose={vi.fn()}
-        onOpenExplorer={vi.fn()}
-        photo={{ ...basePhoto, id: 2, filename: "second.jpg" }}
-      />
-    );
-    await waitFor(() => expect(statusResolvers).toHaveLength(2));
-    statusResolvers[1]?.({ state: "ready" });
-    statusResolvers[0]?.({ state: "tagging" });
-
-    await waitFor(() => {
-      expect(
-        screen.getByRole("button", { name: "analyzeSuggestedTags" })
-      ).toBeInTheDocument();
-    });
+    expect(
+      screen.queryByRole("button", { name: "analyzeSuggestedTags" })
+    ).not.toBeInTheDocument();
   });
 });

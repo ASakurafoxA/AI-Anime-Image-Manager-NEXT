@@ -22,7 +22,10 @@ interface ParsedTimeFilter {
 interface SearchEmptyStateProps {
   hasActiveFilters: boolean;
   hasAiVectors: boolean;
+  /** 自用：显示/隐藏「隐藏目录」的图片（与搜索栏那个眼睛开关同一个状态）。 */
+  hideHiddenFolders?: boolean;
   indexedPhotos?: number;
+  onToggleHideHiddenFolders?: () => void;
   onClearFilters?: () => void;
   onClearSearch: () => void;
   onGoToAiSettings?: () => void;
@@ -49,6 +52,8 @@ export function SearchEmptyState({
   indexedPhotos = 0,
   totalPhotos = 0,
   searchError,
+  hideHiddenFolders = false,
+  onToggleHideHiddenFolders,
 }: SearchEmptyStateProps) {
   const { t } = useTranslation();
   const aiState = semanticState ?? (hasAiVectors ? "ready" : "unavailable");
@@ -196,6 +201,16 @@ export function SearchEmptyState({
     return (
       <EmptyStateCard
         actions={[
+          ...(onToggleHideHiddenFolders
+            ? [
+                {
+                  label: hideHiddenFolders
+                    ? t("hideHiddenFolderPhotos")
+                    : t("showHiddenFolderPhotos"),
+                  onClick: onToggleHideHiddenFolders,
+                },
+              ]
+            : []),
           { label: t("emptyBrowseAll"), onClick: onClearSearch, primary: true },
         ]}
         description={t("emptyColorSearchDesc")}
@@ -216,7 +231,9 @@ export function SearchEmptyState({
       description={
         hasActiveFilters
           ? t("emptySearchDescWithFilters")
-          : t("emptySearchDescription")
+          : hideHiddenFolders
+            ? t("hideHiddenFolderPhotosOn")
+            : t("showHiddenFolderPhotos")
       }
       icon={<Search className="h-5 w-5" />}
       title={t("emptySearchTitle")}

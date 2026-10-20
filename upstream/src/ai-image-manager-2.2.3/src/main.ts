@@ -36,11 +36,7 @@ import {
   onMainLocaleChanged,
   syncLegacyRendererLocale,
 } from "@/localization/main-runtime";
-import { getActiveFaceModel } from "@/services/ai/face-model-config";
-import {
-  getEmbeddingModelFile,
-  getTranslationModelFile,
-} from "@/services/ai/model-config";
+import { getEmbeddingModelFile } from "@/services/ai/model-config";
 import { copyModelsOnce } from "@/services/ai/model-loader";
 import { releaseGpu, tryAcquireGpu } from "@/services/ai/gpu-queue";
 import { deletePhotoVectors, initVectorDB } from "@/services/ai-embedder";
@@ -53,8 +49,6 @@ import {
   DiagnosticSanitizer,
   sanitizeRendererRoute,
 } from "@/services/diagnostics/sanitizer";
-import { cancelFaceDetection } from "@/services/face-detector";
-import { shutdownFacePool } from "@/services/face-worker-pool";
 import {
   getHttpServerAuthToken,
   getHttpServerPort,
@@ -154,6 +148,8 @@ if (devUserDataDir) {
 // 它就会变成 ...\APPDATA\AI Anime Image Manager NEXT —— 而用户的图库位置
 // （app-config.json）、标签与局域网口令哈希都在旧目录里，那样会看起来"全丢了"。
 // 所以这里显式钉死旧目录；两个环境变量（E2E / 隔离验证）仍然优先。
+// ⚠️ 2026-10-18（会话#9）用户口径：**只需要和上游原版不同**（上游叫 AI Image Manager，
+//    配置目录本来就是分开的），**自家三版不需要再拆** → 保持"三版共用一个配置目录" ✓
 if (!isE2E && !devUserDataDir) {
   const legacyUserDataDir = path.join(
     app.getPath("appData"),
@@ -221,6 +217,45 @@ function logMain(message: string) {
   appendStartupLog("main.log", `${new Date().toISOString()} ${message}`);
 }
 
+/*
+ * 自用（2026-10-17）：启动期「主线程被谁占住」体检器。
+ *
+ * 现象：`[bg] startRemaining done` → `[bg] ensureModelAvailable done` 这一段，
+ * 从 **2026-10-16 00:55** 起每次启动多出 **6~22 秒**（之前 9 天每次都是 0 秒 ✓），
+ * 而这段里**一条日志都没有** → 主线程被某段"不写日志的同步活儿"占住了 ✗
+ * （用户："启动又要等好几秒白屏了"）。
+ *
+ * 做法：每 100ms 记一次时间，**实际间隔比 100ms 多出来的部分 = 卡顿**；
+ * 卡顿 ≥300ms 就写一条到 main.log（带"启动后第几秒"）。
+ * 只在前 90 秒工作，之后自动停 —— 平时安静、出事有据 ✓。
+ */
+let startupLagTimer: NodeJS.Timeout | null = null;
+/** 启动体检起点（给各段日志统一换算"启动后第几秒"）。 */
+let startupProbeStartedAt = Date.now();
+function startStartupLagProbe(limitMs = 90_000): void {
+  if (startupLagTimer) {
+    return;
+  }
+  startupProbeStartedAt = Date.now();
+  const startedAt = startupProbeStartedAt;
+  let last = Date.now();
+  startupLagTimer = setInterval(() => {
+    const now = Date.now();
+    const drift = now - last - 100;
+    last = now;
+    if (drift >= 300) {
+      logMain(
+        `[perf] 主线程卡顿 ${drift}ms（启动后 ${((now - startedAt) / 1000).toFixed(1)}s）`
+      );
+    }
+    if (now - startedAt > limitMs) {
+      clearInterval(startupLagTimer as NodeJS.Timeout);
+      startupLagTimer = null;
+      logMain("[perf] 启动体检结束（90 秒）");
+    }
+  }, 100);
+}
+
 function summarizePathState(label: string, targetPath: string): string {
   try {
     const exists = fs.existsSync(targetPath);
@@ -273,40 +308,12 @@ function logPackagedPathDiagnostics() {
       )
     ),
     summarizePathState(
-      "asar-unpacked-face-worker",
-      path.join(
-        process.resourcesPath,
-        "app.asar.unpacked",
-        "scripts",
-        "face-worker.mjs"
-      )
-    ),
-    summarizePathState(
       "asar-unpacked-wd14-tagger-worker",
       path.join(
         process.resourcesPath,
         "app.asar.unpacked",
         "scripts",
         "wd14-tagger-worker.mjs"
-      )
-    ),
-    // NEXT：PixAI 打标 worker 与它的预处理模块（同目录，worker 静态 import 它）
-    summarizePathState(
-      "asar-unpacked-pixai-tagger-worker",
-      path.join(
-        process.resourcesPath,
-        "app.asar.unpacked",
-        "scripts",
-        "pixai-tagger-worker.mjs"
-      )
-    ),
-    summarizePathState(
-      "asar-unpacked-pixai-preprocess",
-      path.join(
-        process.resourcesPath,
-        "app.asar.unpacked",
-        "scripts",
-        "pixai-preprocess.mjs"
       )
     ),
     summarizePathState(
@@ -454,6 +461,18 @@ function getIconPath(): string {
   return path.join(app.getAppPath(), "assets", "icon.png");
 }
 
+/*
+ * 自用（2026-10-18 · 会话#9 用户口径）：「托盘的大概缩放到这样」（给了张头部特写）。
+ * 托盘只有 16px，整张立绘缩下去会糊成一团 → 托盘单独用**头部特写**（同样是透明底）✓
+ */
+function getTrayIconPath(): string {
+  const name = "icon-tray.png";
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, name);
+  }
+  return path.join(app.getAppPath(), "assets", name);
+}
+
 function buildTrayMenu(): Electron.Menu {
   return Menu.buildFromTemplate([
     {
@@ -493,7 +512,9 @@ function rebuildTrayMenu() {
 onMainLocaleChanged(rebuildTrayMenu);
 
 function createTray() {
-  const iconPath = getIconPath();
+  // 托盘优先用"头部特写"；没有就退回整图 ✓
+  const trayIconPath = getTrayIconPath();
+  const iconPath = fs.existsSync(trayIconPath) ? trayIconPath : getIconPath();
   if (fs.existsSync(iconPath)) {
     const img = nativeImage.createFromPath(iconPath);
     tray = new Tray(img.resize({ width: 16, height: 16 }));
@@ -634,42 +655,25 @@ const mediaSemaphore = new IoSemaphore(16);
 //
 // ── AI model availability (copy from resources or dev paths) ─────────
 
-async function verifyCurrentFaceModels(modelsDir: string): Promise<{
-  invalidFiles: string[];
-  valid: boolean;
-}> {
-  const activeFaceModel = getActiveFaceModel();
-  const invalidFiles: string[] = [];
-
-  for (const fileName of activeFaceModel.modelFiles) {
-    const entry = MODEL_MANIFEST.find(
-      (candidate) =>
-        candidate.subPath === "face" && candidate.fileName === fileName
-    );
-    const filePath = path.join(modelsDir, "face", fileName);
-    if (
-      !(
-        entry &&
-        (await verifyModelFile(filePath, entry.sha256, entry.sizeBytes))
-      )
-    ) {
-      invalidFiles.push(fileName);
-    }
-  }
-
-  return { invalidFiles, valid: invalidFiles.length === 0 };
-}
-
 async function hasCurrentModels(modelsDir: string): Promise<boolean> {
+  /*
+   * 自用（NEXT，2026-10，用户要求）：**不再把 opus-mt（中译英）算作"当前模型"** ✗→✓。
+   *
+   * 缘由：用户已要求把 SigLIP 与 opus-mt **彻底移除**（旧模型不好用、也不留回退），
+   * 而嵌入模型换成了**中文原生**的 Chinese-CLIP —— 中文查询直接编码，**根本不走翻译那一步**。
+   *
+   * 为什么必须删掉这两条检查：原来它们检查 `Xenova/opus-mt-zh-en/onnx/` 下的两个文件，
+   * 模型一旦被移除，这里**永远返回 false** → `ensureModelAvailable()` 每次都判定
+   * "模型不完整" → 反复重新复制/下载，删了也白删 ✗。
+   *
+   * 注意第一条 marker **保持原样**：`getEmbeddingModelFile()` 会按**当前**嵌入模型
+   * 解析路径，换成 Chinese-CLIP 后它自然指向 `chinese-clip-.../model_quantized.onnx` ✓。
+   */
   const markers = [
     getEmbeddingModelFile(modelsDir, "vision_model_quantized.onnx"),
-    getTranslationModelFile(modelsDir, "encoder_model_quantized.onnx"),
-    getTranslationModelFile(modelsDir, "decoder_model_merged_quantized.onnx"),
   ];
-  const faceValidation = await verifyCurrentFaceModels(modelsDir);
-  return (
-    markers.every((marker) => fs.existsSync(marker)) && faceValidation.valid
-  );
+  // 自用（2026-10-18 · 会话#9）：SFace 已整体剔除，不再校验人脸模型 ✓
+  return markers.every((marker) => fs.existsSync(marker));
 }
 
 async function copyBundledModels(modelsDir: string): Promise<void> {
@@ -678,30 +682,20 @@ async function copyBundledModels(modelsDir: string): Promise<void> {
     bundledModels,
     "vision_model_quantized.onnx"
   );
-  const bundledFaceValidation = await verifyCurrentFaceModels(bundledModels);
-
   log.info(
-    "[ensureModelAvailable] bundledModels=%s exists=%s bundledMarker=%s exists=%s faceValid=%s",
+    "[ensureModelAvailable] bundledModels=%s exists=%s bundledMarker=%s exists=%s",
     bundledModels,
     fs.existsSync(bundledModels),
     bundledMarker,
-    fs.existsSync(bundledMarker),
-    bundledFaceValidation.valid
+    fs.existsSync(bundledMarker)
   );
-  if (!(fs.existsSync(bundledMarker) && bundledFaceValidation.valid)) {
-    throw new Error(
-      `Bundled AI models are incomplete or failed hash verification; invalid face files: ${bundledFaceValidation.invalidFiles.join(", ") || "none"}`
-    );
+  if (!fs.existsSync(bundledMarker)) {
+    throw new Error("Bundled AI models are incomplete or failed hash verification");
   }
 
   log.info("Copying AI models from bundled resources...");
   try {
     await copyModelsOnce();
-    await fs.promises.cp(
-      path.join(bundledModels, "face"),
-      path.join(modelsDir, "face"),
-      { recursive: true }
-    );
     const copied = await hasCurrentModels(modelsDir);
     const visionMarker = getEmbeddingModelFile(
       modelsDir,
@@ -717,10 +711,10 @@ async function copyBundledModels(modelsDir: string): Promise<void> {
     );
     if (!copied || size <= 0) {
       throw new Error(
-        "Copied AI models failed startup verification, including the active face model"
+        "Copied AI models failed startup verification"
       );
     }
-    log.info("AI models copied and current face model hashes verified");
+    log.info("AI models copied and hash verified");
   } catch (err) {
     log.error({ err }, "Failed to copy AI models from resources");
     throw err;
@@ -746,18 +740,11 @@ async function copyDevModels(modelsDir: string): Promise<void> {
     log.info({ source: candidate }, "Copying AI models from dev path");
     try {
       await fs.promises.cp(candidate, modelsDir, { recursive: true });
-      const copiedFaceValidation = await verifyCurrentFaceModels(modelsDir);
-      if (copiedFaceValidation.valid) {
-        log.info("AI models copied and current face model hashes verified");
+      if (await hasCurrentModels(modelsDir)) {
+        log.info("AI models copied and hash verified");
         return;
       }
-      log.warn(
-        {
-          invalidFiles: copiedFaceValidation.invalidFiles,
-          source: candidate,
-        },
-        "Dev model copy rejected because the active face model failed hash verification"
-      );
+      log.warn({ source: candidate }, "Dev model copy failed verification");
     } catch (err) {
       log.warn({ err, source: candidate }, "Failed to copy from dev path");
     }
@@ -767,9 +754,16 @@ async function copyDevModels(modelsDir: string): Promise<void> {
 
 async function ensureModelAvailable(): Promise<void> {
   const modelsDir = path.join(getDataPath(), "models");
-  if (await hasCurrentModels(modelsDir)) {
+  /*
+   * 自用（2026-10-17）：把这一步的耗时写进 main.log ——
+   * 它正好是"白屏那 6~22 秒"的终点，必须量出来到底是"校验本身慢"还是"被别的东西挡住"。
+   */
+  const checkStartedAt = Date.now();
+  const modelsReady = await hasCurrentModels(modelsDir);
+  logMain(`[perf] 模型校验 ${Date.now() - checkStartedAt}ms → ${modelsReady}`);
+  if (modelsReady) {
     log.info(
-      "AI models already cached and face hashes verified at %s",
+      "AI models already cached and hash verified at %s",
       modelsDir
     );
     return;
@@ -845,6 +839,9 @@ function createWindow(httpPort: number, httpAuthToken: string) {
     minWidth: 720,
     minHeight: 480,
     show: false,
+    // 自用（2026-10-17）：**别再是默认白** —— 窗口先出来时用主题底色，
+    // 这样"还没画完就叫出来"看到的是深/浅底色，而不是刺眼的白屏 ✗→✓
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#08090a" : "#fbfbfc",
     ...(savedBounds && isBoundsVisible(savedBounds)
       ? { x: savedX, y: savedY }
       : {}),
@@ -1004,13 +1001,55 @@ function createWindow(httpPort: number, httpAuthToken: string) {
     }
     mainWindow?.webContents.send("window:maximize-change", false);
   });
+  /*
+   * 自用（2026-10-17，用户口径）：**窗口要等"界面真的画出来"再显示** ✓
+   *
+   * 用户观察（关键）：「托盘图标都出来了，窗口却自己不弹；我点开它才看到白屏；
+   *   等它自己出来就没有白屏」→ 也就是说，**弹窗时机**决定了会不会看到白屏 ✗。
+   *
+   * 为什么不能用 `ready-to-show`：它只代表"网页的**第一个空白帧**画好了"
+   * —— 实测**启动后 0.8 秒**就触发，那时 React 连一个字都还没渲染 ✗，
+   * 于是窗口先出来、里面一片白/空 ✗（用户看到的正是这个）。
+   *
+   * 所以改成：**渲染层在自己画完第一帧后发一条 IPC 回来**（`app:renderer-ready`），
+   * 主进程收到才 `show()` ✓ —— 窗口一出现就是界面（dev 版多等的几秒是 Vite 渲染代价，
+   * 打包版几乎瞬间，所以打包版感觉不到）。
+   * 兜底：12 秒还没收到（极端情况）就照常显示，绝不至于"永远不开窗" ✓。
+   */
+  let windowShown = false;
+  const showMainWindowWhenRendered = (reason: string) => {
+    if (windowShown || isQuitting || !mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+    windowShown = true;
+    mainWindow.show();
+    mainWindow.focus();
+    logMain(
+      `[perf] 窗口已显示（${reason}，启动后 ${((Date.now() - startupProbeStartedAt) / 1000).toFixed(1)}s）`
+    );
+  };
+  const onRendererReady = () => showMainWindowWhenRendered("渲染层首帧已画");
+  ipcMain.on("app:renderer-ready", onRendererReady);
+  const rendererReadyFallback = setTimeout(
+    () => showMainWindowWhenRendered("等渲染首帧超时 12s 兜底"),
+    12_000
+  );
   mainWindow.once("ready-to-show", () => {
-    mainWindow?.show();
-    mainWindow?.focus();
+    // 只记录时间，**不再据此显示窗口**（那时通常是空白帧）
+    logMain(
+      `[perf] ready-to-show（首个空白帧，启动后 ${((Date.now() - startupProbeStartedAt) / 1000).toFixed(1)}s）`
+    );
   });
   mainWindow.webContents.on("did-finish-load", () => {
+    logMain(
+      `[perf] 渲染层加载完成（启动后 ${((Date.now() - startupProbeStartedAt) / 1000).toFixed(1)}s）`
+    );
     lifecycleBridge.publish("initial");
     applyUiZoomScale();
+  });
+  mainWindow.once("closed", () => {
+    clearTimeout(rendererReadyFallback);
+    ipcMain.removeListener("app:renderer-ready", onRendererReady);
   });
   mainWindow.webContents.on("console-message", (details) => {
     if (details.level !== "warning" && details.level !== "error") {
@@ -1407,183 +1446,6 @@ async function runStartupCleanup() {
 }
 
 // ── Bootstrap background services (non-blocking after window is shown) ──
-/**
- * 无头打标：`--run-pixai-tagging`（NEXT 新增，见 `PixAI集成实施计划.md`）。
- *
- * 为什么要有它：
- *  1. **全库重跑不必开着界面**。实测 PixAI 单张 CPU ≈ 6.5 秒、DirectML ≈ 0.6 秒，
- *     8 万张就是 145 小时 / 13 小时 —— 挂一夜更实际。进度照常写进
- *     `<userData>/logs/app.log`（最多每 10 秒一行）。
- *  2. **自动化验证**：配合 `AI_IMAGE_MANAGER_USER_DATA_DIR=<临时目录>` 就能在
- *     **完全隔离的图库**里跑真打标，不去动用户的库（没有自定义 dataPath 时，
- *     图库默认就是 userData 目录，见 `utils/data-path.ts`）。
- *
- * 退出码：`0` 全部成功 / `1` 有失败（日志里有 photoId 与原因）/ `2` 抛错或开关不对。
- */
-async function runHeadlessPixaiTagging(): Promise<number> {
-  const { getActiveTagger } = await import("@/config/private-build");
-  if (getActiveTagger() !== "pixai") {
-    log.error(
-      "[Headless] private-build 的 usePixaiTagger 不是 true —— 无头入口只支持 PixAI"
-    );
-    return 2;
-  }
-
-  const { ensureLocalModel } = await import("@/services/ai/model-loader");
-  const { runPixaiTagging } = await import("@/services/ai/pixai-tagger");
-  const modelsDir = await ensureLocalModel();
-
-  // 无头入口也走互斥：否则命令行打标会和界面里的建向量同时抢显卡
-  const blocked = tryAcquireGpu("tagging");
-  if (blocked) {
-    log.error(`[Headless] 打标未启动：${blocked}`);
-    return 2;
-  }
-
-  // `--tag-limit=N` 只打前 N 张（快速验证用）
-  const limitArg = process.argv.find((arg) => arg.startsWith("--tag-limit="));
-  const maxPhotos = limitArg
-    ? Number.parseInt(limitArg.slice("--tag-limit=".length), 10)
-    : undefined;
-
-  /**
-   * 默认「全库重跑」，加 `--tag-resume` 则从断点续跑。
-   *
-   * ⚠️ 这里用的是 `resetCursor`：它现在的语义是**显式要求从头**（无条件归零）。
-   *    自用（需求 1）之后，界面上那条路（"生成 AI 标签"）传的是 `resetCursor: false`，
-   *    所以永远不会误伤已经在跑的断点。曾有一版把两者混在一个判定里，
-   *    结果本命令在**已有游标的库**上静默变成"续跑"（第 10 轮发现并修掉，
-   *    见 `services/ai/tagging-cursor.ts` 的注释）。
-   */
-  const resume = process.argv.includes("--tag-resume");
-  if (!resume) {
-    const { getPixaiTaggingBaseline } = await import("@/services/ai/pixai-tagger");
-    const before = getPixaiTaggingBaseline();
-    log.info(
-      `[Headless] 全库重跑：原进度约 ${before.done}/${before.total}，将从头开始；` +
-        "想从断点续跑请加 --tag-resume"
-    );
-  } else {
-    log.info("[Headless] --tag-resume：从断点续跑，不清空游标");
-  }
-
-  log.info(
-    `[Headless] PixAI 打标开始：modelsDir=${modelsDir}` +
-      (maxPhotos ? `，只打 ${maxPhotos} 张` : "，全库") +
-      `，GPU=${process.argv.includes("--tag-gpu") ? "尝试 DirectML" : "否（CPU）"}`
-  );
-
-  let lastLoggedAt = 0;
-  const result = await runPixaiTagging(modelsDir, {
-    ...(maxPhotos && Number.isFinite(maxPhotos) ? { maxPhotos } : {}),
-    // 默认全库重跑（它就是唯一会真正归零的开关）；--tag-resume 时保持续跑
-    resetCursor: !resume,
-    // `--tag-gpu` 才尝试 DirectML：它快 10 倍以上（实测 0.6s vs 6.5s/张），
-    // 但有原生崩溃风险（客户端会自动降级一次到 CPU，不会死循环）。
-    useGpu: process.argv.includes("--tag-gpu"),
-    onProgress: (p) => {
-      const now = Date.now();
-      if (now - lastLoggedAt < 10_000 && p.done < p.total) {
-        return;
-      }
-      lastLoggedAt = now;
-      const percent = p.total > 0 ? ((p.done / p.total) * 100).toFixed(1) : "?";
-      log.info(
-        `[Headless] 进度 ${p.done}/${p.total} (${percent}%) 已标 ${p.tagged} 失败 ${p.failed}`
-      );
-    },
-  });
-
-  releaseGpu("tagging");
-  log.info(
-    `[Headless] 完成：总数 ${result.total}、成功 ${result.tagged}、失败 ${result.failed}` +
-      (result.cancelled ? "（被中止）" : "")
-  );
-  return result.failed > 0 ? 1 : 0;
-}
-
-/**
- * 无头建向量（"特征提取"）：`--run-embedding [--embed-limit=N]`。
- *
- * 为什么要有它：**吞吐问题主要出在这条链上**（SigLIP + worker 池），
- * 而它原本只能开界面点按钮才会跑，无法在命令行量化"多少张/秒"。
- * 有了它就能：
- *   1. 在隔离图库里跑基准（配 `AI_IMAGE_MANAGER_USER_DATA_DIR`），不影响真实库；
- *   2. 改并发/批量/预处理后，用同一条命令做**前后对比**（这是唯一可信的对比方式）。
- *
- * 会处理"待建向量"的照片：`isAiProcessed = 0` 的照片，以及**已标记处理过但向量库里没有**的
- * 照片（embedder 自己会重新排队）。所以想只测 N 张，先在隔离库把那 N 张的
- * `is_ai_processed` 置 0（脚本里就这么做）。
- *
- * 退出码：`0` 正常跑完 / `1` 抛错 / `2` 前置条件不满足。
- */
-async function runHeadlessEmbedding(): Promise<number> {
-  const limitArg = process.argv.find((arg) => arg.startsWith("--embed-limit="));
-  const limit = limitArg
-    ? Number.parseInt(limitArg.slice("--embed-limit=".length), 10)
-    : undefined;
-
-  const { embedAllPhotos } = await import("@/services/ai/embedder");
-
-  // 无头入口也走互斥：否则命令行建向量会和界面里的打标同时抢显卡
-  const blocked = tryAcquireGpu("embedding");
-  if (blocked) {
-    log.error(`[Headless] 建向量未启动：${blocked}`);
-    return 2;
-  }
-
-  if (limit && Number.isFinite(limit)) {
-    const { getDatabase } = await import("@/db");
-    const { photos } = await import("@/db/schema");
-    const { eq, sql } = await import("drizzle-orm");
-    // 只放开前 N 张"已处理"的照片 → embedder 会精确地只处理它们
-    const db = getDatabase();
-    const candidates = db
-      .select({ id: photos.id })
-      .from(photos)
-      .where(sql`${photos.isAiProcessed} = 1 AND ${photos.deletedAt} IS NULL`)
-      .limit(limit)
-      .all()
-      .map((row) => row.id);
-    for (const id of candidates) {
-      db.update(photos)
-        .set({ isAiProcessed: false })
-        .where(eq(photos.id, id))
-        .run();
-    }
-    log.info(
-      `[Headless] 已把 ${candidates.length} 张标记为待建向量（仅测这批）`
-    );
-  }
-
-  let lastLoggedAt = 0;
-  let totalProcessed = 0;
-  const startedAt = Date.now();
-  const embeddedCount = await embedAllPhotos((progress) => {
-    totalProcessed = Math.max(totalProcessed, progress.processed ?? 0);
-    const now = Date.now();
-    if (
-      now - lastLoggedAt < 10_000 &&
-      (progress.processed ?? 0) < (progress.total ?? 0)
-    ) {
-      return;
-    }
-    lastLoggedAt = now;
-    const elapsedSec = (now - startedAt) / 1000;
-    const rate = elapsedSec > 0 ? (totalProcessed / elapsedSec).toFixed(2) : "?";
-    log.info(
-      `[Headless] 建向量进度 ${progress.processed ?? 0}/${progress.total ?? 0}（${rate} 张/秒）`
-    );
-  });
-  const elapsedSec = (Date.now() - startedAt) / 1000;
-  releaseGpu("embedding");
-  log.info(
-    `[Headless] 建向量完成：处理 ${embeddedCount} 张，耗时 ${elapsedSec.toFixed(1)}s，` +
-      `平均 ${(elapsedSec / Math.max(1, embeddedCount)).toFixed(3)} 秒/张（${(embeddedCount / Math.max(0.001, elapsedSec)).toFixed(2)} 张/秒）`
-  );
-  return 0;
-}
-
 async function startBackgroundServices() {
   try {
     logMain("[bg] startLevel(Critical) begin");
@@ -1837,6 +1699,8 @@ app.whenReady().then(async () => {
 
     await setupORPC();
     createWindow(httpPort, getHttpServerAuthToken());
+    // 自用（2026-10-17）：启动期主线程卡顿体检（90 秒后自动停，见 startStartupLagProbe）
+    startStartupLagProbe();
     createTray();
     registerGlobalShortcuts();
     checkForUpdates();
@@ -1858,64 +1722,6 @@ app.whenReady().then(async () => {
       backgroundStartup.finally(() => {
         setTimeout(() => app.quit(), 100);
       });
-    }
-
-    // ── 只重跑「词表导入/改名」：`--import-pixai-vocab` ──────────────────
-    // 用途：改了中文名表（`pixai-zh-names.ts`）之后，把库里已有的标签行**改名**，
-    // 不必重新打一遍标签（导入逻辑自带 toRename，几秒钟就能完成）。
-    if (process.argv.includes("--import-pixai-vocab")) {
-      void (async () => {
-        let exitCode = 2;
-        try {
-          await backgroundStartup;
-          const { ensureLocalModel } = await import(
-            "@/services/ai/model-loader"
-          );
-          const { importPixaiVocabulary } = await import(
-            "@/services/ai/pixai-tagger"
-          );
-          const modelsDir = await ensureLocalModel();
-          const stats = importPixaiVocabulary(modelsDir);
-          log.info({ stats }, "[Headless] PixAI 词表导入/改名完成");
-          exitCode = 0;
-        } catch (error) {
-          log.error({ err: error }, "[Headless] PixAI 词表导入失败");
-        }
-        app.exit(exitCode);
-      })();
-    }
-
-    // ── 无头打标（NEXT）：`--run-pixai-tagging [--tag-limit=N]` ─────────
-    // 全库重跑不必开着界面；配 AI_IMAGE_MANAGER_USER_DATA_DIR 可在隔离图库里验证。
-    // 详见 runHeadlessPixaiTagging() 的注释。退出码 0/1/2。
-    if (process.argv.includes("--run-pixai-tagging")) {
-      void (async () => {
-        let exitCode = 2;
-        try {
-          // 等后台服务（含向量库）就绪，否则特征写不进去
-          await backgroundStartup;
-          exitCode = await runHeadlessPixaiTagging();
-        } catch (error) {
-          log.error({ err: error }, "[Headless] 打标过程抛错");
-        }
-        app.exit(exitCode);
-      })();
-    }
-
-    // ── 无头建向量：`--run-embedding [--embed-limit=N]` ────────────────
-    // 用于量化"特征提取多少张/秒"，以及改并发/批量后的前后对比。
-    if (process.argv.includes("--run-embedding")) {
-      void (async () => {
-        let exitCode = 2;
-        try {
-          await backgroundStartup;
-          exitCode = await runHeadlessEmbedding();
-        } catch (error) {
-          log.error({ err: error }, "[Headless] 建向量过程抛错");
-          exitCode = 1;
-        }
-        app.exit(exitCode);
-      })();
     }
 
     // ── Background color data backfill (non-blocking, deferred 5s) ─────
@@ -2097,12 +1903,6 @@ async function cleanupApplicationBeforeQuit(): Promise<void> {
     log.warn({ err: error }, "Failed to dispose wander lifecycle bridge");
   }
   wanderLifecycleBridge = null;
-
-  // Face detection is not a registry-owned service and may have its own
-  // Electron worker pool. Invalidate the run before terminating its children
-  // so rejected worker promises cannot persist late results during shutdown.
-  cancelFaceDetection();
-  shutdownFacePool();
 
   // Kill forked ELECTRON_RUN_AS_NODE workers first. This both unlocks the
   // installed executable for MSI and causes pending service operations to

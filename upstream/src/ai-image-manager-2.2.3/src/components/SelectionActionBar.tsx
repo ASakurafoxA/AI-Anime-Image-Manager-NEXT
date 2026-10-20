@@ -162,7 +162,8 @@ export function SelectionActionBar({
             />
           </>
         )}
-        {onAddToAlbum && (
+
+        {!PRIVATE_BUILD.slimSelectionToolbar && onAddToAlbum && (
           <MenuAction
             disabled={executing !== null}
             executing={executing === "album"}
@@ -171,7 +172,7 @@ export function SelectionActionBar({
             onClick={wrapAction("album", onAddToAlbum)}
           />
         )}
-        {onAddTag && (
+        {!PRIVATE_BUILD.slimSelectionToolbar && onAddTag && (
           <MenuAction
             disabled={executing !== null}
             executing={executing === "tag"}
@@ -193,7 +194,7 @@ export function SelectionActionBar({
         {((!PRIVATE_BUILD.hideCull && onStartCull) ||
           (!PRIVATE_BUILD.hideCloud && onUploadToCloud) ||
           (!PRIVATE_BUILD.hideCloud && onShare) ||
-          onRename ||
+          (!PRIVATE_BUILD.slimSelectionToolbar && onRename) ||
           onConvert) && (
           <MoreActions
             disabled={executing !== null}
@@ -234,7 +235,7 @@ export function SelectionActionBar({
                 onClick={wrapAction("share", onShare, { closeMore: true })}
               />
             )}
-            {onRename && (
+            {!PRIVATE_BUILD.slimSelectionToolbar && onRename && (
               <MoreAction
                 disabled={executing !== null}
                 executing={executing === "rename"}
@@ -253,6 +254,19 @@ export function SelectionActionBar({
               />
             )}
           </MoreActions>
+        )}
+
+        {onRename && (
+          <>
+            <div className="selection-menu-divider" />
+            <MenuAction
+              disabled={executing !== null}
+              executing={executing === "rename"}
+              icon={<Pencil size={18} />}
+              label={t("rename")}
+              onClick={wrapAction("rename", onRename)}
+            />
+          </>
         )}
 
         {onDelete && (

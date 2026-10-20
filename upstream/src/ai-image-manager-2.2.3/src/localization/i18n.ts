@@ -1606,7 +1606,8 @@ i18n.use(initReactI18next).init({
         aiStartIndex: "开始 AI 索引",
         aiRebuildIndex: "重建向量索引",
         aiRebuildIndexHint:
-          "向量库与当前嵌入模型不兼容（换过模型或旧版本建的索引）。会清空已建向量与「已处理」标记后从头重建，不会动照片和标签。",
+          "会清空：搜索向量、以图搜图特征、角色特征（CCIP）和「已处理」标记，然后从头重建。照片、标签（含手动标签）都不会动；重建后角色识别要重新点「获取全库角色特征」。",
+        aiRebuildIndexConfirmTitle: "重建向量索引？",
         aiIndexComplete: "AI 索引完成 ({{processed}}/{{total}})",
         aiIndexNewPhotos: "索引新图像",
         aiLoadingEmbedding: "正在加载动漫识别模型... {{percent}}%",
@@ -4215,7 +4216,8 @@ i18n.use(initReactI18next).init({
         aiStartIndex: "Start AI Indexing",
         aiRebuildIndex: "Rebuild vector index",
         aiRebuildIndexHint:
-          "The vector store was built with a different embedding model. This clears vectors and processed flags, then rebuilds from scratch; photos and tags are untouched.",
+          "Clears: search vectors, image-search features, character features (CCIP) and the processed flags, then rebuilds from scratch. Photos and tags (including manual tags) are untouched; after rebuilding, click \"Get all character features\" again for character recognition.",
+        aiRebuildIndexConfirmTitle: "Rebuild the vector index?",
         aiIndexComplete: "AI index complete ({{processed}}/{{total}})",
         aiIndexNewPhotos: "Index New Images",
         aiLoadingEmbedding: "Loading anime recognition model... {{percent}}%",

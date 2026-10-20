@@ -1543,7 +1543,17 @@ export const PhotoGrid = memo(
     );
 
     const groupHeaders = useMemo((): GroupHeader[] => {
-      if (sort !== "date" || displayPhotos.length === 0) {
+      /*
+       * 自用（2026-10-16，用户要求 ✓，**"最不容易出 bug"的那一种做法** ✓）：
+       * **关掉分组时，这里直接不生成任何分组标题** ✓ —— 而不是在"画标题 / 算位置 /
+       * 悬浮小标签 / 分层轮转"每个地方各判断一次开关 ✗（那种散点判断才是 bug 温床 ✗，
+       * 搜索结果的"塌成一列"和"排成台阶"两次事故都出在那儿 ✓）。
+       * 这样一来：`groupHeaders` 为空 ✓ → 标题不会画 ✓、`headerPositions` 为空 ✓、
+       * 滚动时的悬浮月份小标签不显示 ✓、`useMasonryLayout` 的分组边界分支根本不会进 ✓。
+       * 上层（`routes/index.tsx`）对**搜索结果强制 `showGroupHeaders={false}`** ✓，
+       * 所以搜索结果永远是普通瀑布流 ✓；主图库照旧听「图片按时间分组」开关 ✓。
+       */
+      if (!showGroupHeaders || sort !== "date" || displayPhotos.length === 0) {
         groupHeaderCacheRef.current = null;
         return [];
       }
@@ -1585,7 +1595,12 @@ export const PhotoGrid = memo(
         sort,
       };
       return headers;
-    }, [displayPhotos, sort, i18n.language, routeKey]);
+    /*
+     * 自用（2026-10-16）：**依赖里必须带 `showGroupHeaders`** ✓ ——
+     * 原来漏了它 ✗，于是"开关一翻 / 开始搜索"时这个 memo **不会重算** ✗，
+     * 分组标题会一直沿用旧结果（正是那种"改了没反应"的隐形 bug ✗）。
+     */
+    }, [displayPhotos, sort, i18n.language, routeKey, showGroupHeaders]);
 
     const sequenceModeToggle = onSequenceModeChange ? (
       <div className="flex shrink-0 whitespace-nowrap rounded-md border border-border p-0.5 text-[11px]">

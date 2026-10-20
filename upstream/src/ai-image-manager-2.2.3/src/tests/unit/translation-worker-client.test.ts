@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  CHINESE_CLIP_V1_ADAPTER_ID,
+  SIGLIP_V1_ADAPTER_ID,
+  setActiveEmbeddingAdapter,
+} from "@/services/ai/model-adapter";
 
 const mocks = vi.hoisted(() => ({
   existsSync: vi.fn(() => true),
@@ -89,6 +94,15 @@ afterEach(() => {
   _resetTranslationClientForTest();
   vi.useRealTimers();
 });
+
+/*
+ * 自用（2026-10 换中文 CLIP）：这套用例描述的是 **SigLIP + opus-mt 翻译**那条路径
+ *（它仍保留作回退路线），而默认活动模型已换成 Chinese-CLIP
+ *（中文原生、不再需要翻译模型）→ 所以这里显式切回 SigLIP 跑；
+ * 用例结束再恢复默认，避免影响别的用例。
+ */
+beforeEach(() => setActiveEmbeddingAdapter(SIGLIP_V1_ADAPTER_ID));
+afterEach(() => setActiveEmbeddingAdapter(CHINESE_CLIP_V1_ADAPTER_ID));
 
 describe("translation worker client", () => {
   it("并发初始化共享同一个 Promise 和同一个 worker", async () => {

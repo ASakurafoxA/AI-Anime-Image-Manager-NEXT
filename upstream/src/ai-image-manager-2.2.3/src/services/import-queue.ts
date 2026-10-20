@@ -1,4 +1,6 @@
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import fs from "node:fs";
+import path from "node:path";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { BrowserWindow } from "electron";
 import { getDatabase } from "@/db";
 import { PRIVATE_BUILD } from "@/config/private-build";
@@ -51,6 +53,8 @@ export interface ImportQueueStatus {
   current: ImportTask | null;
   /** History — all completed / failed / cancelled tasks. */
   history: ImportTask[];
+  /** 自用：大图库的开机补扫等用户点「开始扫描」（见 enqueueOrAskForConfirmation）✓ */
+  pendingStartupScans: Array<{ folderPath: string; photoCount: number }>;
   pending: ImportTask[];
 }
 
@@ -110,7 +114,7 @@ export function forgetInterruptedImports(folderPaths: string[]): void {
 }
 
 /** Reconcile only interrupted roots, never rescan every library on startup. */
-export function resumeInterruptedImports(): void {
+export async function resumeInterruptedImports(): Promise<void> {
   if (suspending) {
     // The registry can restart in-process when the data directory changes.
     // Its stop hook drains the old scan before we restore the new profile.
@@ -124,9 +128,22 @@ export function resumeInterruptedImports(): void {
   recoveryStarted = true;
   const roots = readUnfinishedRoots();
   setSetting(RECOVERY_KEY, JSON.stringify(roots));
+  /*
+   * 自用（2026-10-16）：**被强杀后留下的"未完成导入"也走同一道闸门** ✓。
+   * 以前这里一律自动重扫 ✗ —— 反复强杀 → 每次开机都全库重扫一遍 ✗，
+   * 正是"开机就未响应、连取消都点不了"的另一半来源 ✓。
+   */
+  const settings = readStartupScanSettings();
   for (const folderPath of roots) {
     try {
-      enqueueImport(folderPath);
+      /*
+       * 被中断的导入确实没做完，跟文件夹时间无关 → **不做预检**，直接按大小决定 ✓
+       *
+       * 自用（2026-10-17 第二轮，**按用户口径回退**）：这里**不**强制"一律先问" ✗。
+       * 用户指出：设置里写的就是「≥30000 张才在顶栏二次确认」，小目录直接扫没有影响 ✓
+       * —— 保持与设置文案一致，比"一律打扰"更好 ✓。
+       */
+      await enqueueOrAskForConfirmation(folderPath, settings, false);
     } catch (error) {
       // Keep unavailable roots durable, but try only once per application run.
       history.push({
@@ -143,6 +160,246 @@ export function resumeInterruptedImports(): void {
 
 let catchUpTimer: NodeJS.Timeout | null = null;
 let watchedAiTimer: NodeJS.Timeout | null = null;
+
+// ── 自用（2026-10-16）：开机补扫的开关与「大图库先问一句」 ────────────────
+//
+// 背景（用户实测过的坑）✗：
+//   开机补扫会把**整个树根重新走一遍**（本机 E:\图 24,723 张 + 推特 1,167 张），
+//   而"上次扫描被强杀"还会被记账本记住、**下次开机又自动重扫一遍** ✗
+//   → 界面未响应、连「取消」都点不了，只能强杀 ✓。
+//
+// 现在改成**用户一个开关 + 大图库先问一句** ✓：
+//   · `imports.startupCatchUpScan`：总开关（默认沿用 private-build 的值 = 关）✓
+//   · 阈值**固定 10000 张**（用户定的：图库只增不减，没必要让他选数字 ✓）
+//   · 达到阈值就不自动扫，改为在顶栏问一句 ✓
+//   · 被强杀留下的"未完成导入"走同一道闸门 ✓（不再开机自动全库重扫 ✓）
+
+const STARTUP_SCAN_SETTING_KEY = "imports.startupCatchUpScan";
+/**
+ * 自用（2026-10-16，用户点名要的第二个开关 ✓）：
+ *   · 开（默认）= 先做**只读预检**（只看文件夹修改时间，约 3 秒），没变化就跳过 ✓
+ *   · 关 = 跳过预检，**每次都全量扫一遍**（约 7~10 秒起，图越大越久）✓
+ */
+const PRECHECK_SETTING_KEY = "imports.startupScanPrecheck";
+
+/**
+ * 自用：多少张算"大图库"→ 先问一句 ✓。
+ * **固定 30000**，不给用户选（用户口径：图库只增不减，选数字没意义 ✓）。
+ */
+const LARGE_RESCAN_THRESHOLD = 30_000;
+
+export interface StartupScanSettings {
+  confirmLarge: boolean;
+  enabled: boolean;
+  largeThreshold: number;
+  /** 是否先做"只看文件夹时间"的只读预检（默认 true ✓）。 */
+  precheck: boolean;
+}
+
+/** 读取开机补扫的开关（读不到就用默认值，绝不抛错）✓。 */
+export function readStartupScanSettings(): StartupScanSettings {
+  // 注意：private-build 里的值是字面量 `false`，这里必须显式标成 boolean ✗→✓
+  let enabled: boolean = PRIVATE_BUILD.startupCatchUpScan;
+  let precheck = true;
+  try {
+    const rawEnabled = getSetting(STARTUP_SCAN_SETTING_KEY);
+    if (rawEnabled !== null) {
+      enabled = rawEnabled === "true";
+    }
+    const rawPrecheck = getSetting(PRECHECK_SETTING_KEY);
+    if (rawPrecheck !== null) {
+      precheck = rawPrecheck === "true";
+    }
+  } catch {
+    /* 读不到就用默认 */
+  }
+  return {
+    confirmLarge: true,
+    enabled,
+    largeThreshold: LARGE_RESCAN_THRESHOLD,
+    precheck,
+  };
+}
+
+/** 等用户点「开始扫描」的开机补扫（大图库不自动扫 ✓）。 */
+const pendingStartupScans: Array<{ folderPath: string; photoCount: number }> = [];
+
+export function getPendingStartupScans(): Array<{
+  folderPath: string;
+  photoCount: number;
+}> {
+  return pendingStartupScans.map((item) => ({ ...item }));
+}
+
+/** 用户点「开始扫描」→ 把待确认的目录投递进导入队列 ✓。 */
+export function confirmPendingStartupScans(): number {
+  const items = pendingStartupScans.splice(0, pendingStartupScans.length);
+  for (const item of items) {
+    try {
+      enqueueImport(item.folderPath);
+    } catch {
+      /* 根目录不可用（离线盘 / 被改名）时跳过 */
+    }
+  }
+  broadcast();
+  return items.length;
+}
+
+/** 用户点「先跳过」→ 本次开机不再问（下次开机还会问）✓。 */
+export function dismissPendingStartupScans(): number {
+  const count = pendingStartupScans.length;
+  pendingStartupScans.length = 0;
+  broadcast();
+  return count;
+}
+
+/**
+ * 某个目录（含整棵子目录）在图库里有几张照片 —— 用来判断"算不算大图库" ✓。
+ * 用**一条递归查询**按路径定位目录再数照片，避免把几千个目录 id 塞进语句里 ✗。
+ */
+function countIndexedPhotosUnderPath(folderPath: string): number {
+  try {
+    const db = getDatabase();
+    const normalized = normalizeImportFolderPath(folderPath);
+    const row = db.get<{ c: number }>(sql`
+      WITH RECURSIVE subtree(id) AS (
+        SELECT id FROM folders WHERE lower(${folders.path}) = lower(${normalized})
+        UNION
+        SELECT f.id FROM folders f JOIN subtree s ON f.parent_id = s.id
+      )
+      SELECT count(*) AS c
+        FROM photos p
+        JOIN subtree s ON p.folder_id = s.id
+       WHERE p.deleted_at IS NULL
+    `);
+    return Number(row?.c ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 投递一次扫描：先做"有没有变化"的**只读预检** ✓，再按大小决定要不要问一句 ✓。
+ *
+ * 预检（B′，2026-10-16 用户实测定型 ✓）：
+ *   文件夹的"修改日期"会在它**里面**新增/删除/改名任何东西时更新（系统机制 ✓），
+ *   所以只要**整棵树里任何一个文件夹**的时间比"上次扫描时间"新，就说明可能有新图 ✓；
+ *   一个都没有 → **静默跳过**，不扫、不写库、不弹提示 ✓。
+ *   实测（本机 `E:\图` 4,415 个目录 / 7.6 万个文件）：
+ *     · 全量扫一遍（什么都没变）**约 7~10 秒**（走目录 2.5s + 逐张确认 3.9s + 数据库）
+ *     · B′ 预检 **约 3 秒**，而且**完全不碰数据库、不碰图片文件** ✓
+ *   ⚠️ 覆盖不到的情况：**同名覆盖**已有文件（文件夹时间不变）——
+ *   但那种情况本来也不需要重新导入（照片已在库里）✓。
+ *
+ * @param allowPrecheck 这次调用**是否允许**做预检（调用方决定）。
+ *   开机补扫允许 ✓；**被强杀后恢复被中断的导入不允许** ✗
+ *   （那次导入确实没做完，跟文件夹时间无关，必须接着做 ✓）。
+ *   另外还要看用户开关 `settings.precheck` ✓（关掉 = 每次都全量扫 ✓）。
+ * @returns "scanned" = 已投递扫描；"pending" = 放进待确认；"unchanged" = 没变化，跳过
+ */
+async function enqueueOrAskForConfirmation(
+  folderPath: string,
+  settings: StartupScanSettings,
+  allowPrecheck: boolean
+): Promise<"scanned" | "pending" | "unchanged"> {
+  if (allowPrecheck && settings.precheck) {
+    const changed = await folderTreeChangedSinceLastScan(folderPath);
+    if (changed === false) {
+      console.log(
+        `[ImportQueue] 开机补扫：${folderPath} 目录树没有任何变化（只读预检），跳过 ✓`
+      );
+      return "unchanged";
+    }
+  }
+
+  if (!settings.confirmLarge) {
+    enqueueImport(folderPath);
+    return "scanned";
+  }
+  const photoCount = countIndexedPhotosUnderPath(folderPath);
+  if (photoCount >= settings.largeThreshold) {
+    const key = importPathKey(folderPath);
+    if (
+      !pendingStartupScans.some(
+        (item) => importPathKey(item.folderPath) === key
+      )
+    ) {
+      pendingStartupScans.push({ folderPath, photoCount });
+    }
+    console.log(
+      `[ImportQueue] 大图库先问一句：${folderPath} 已有 ${photoCount} 张（阈值 ${settings.largeThreshold}），不自动扫描`
+    );
+    return "pending";
+  }
+  enqueueImport(folderPath);
+  return "scanned";
+}
+
+/** 读某个目录"上次扫描完成"的时间（没有记录就返回 null）✓。 */
+function readFolderLastScannedAt(folderPath: string): number | null {
+  try {
+    const db = getDatabase();
+    const normalized = normalizeImportFolderPath(folderPath);
+    const row = db.get<{ t: number | null }>(sql`
+      SELECT last_scanned_at AS t
+        FROM folders
+       WHERE lower(${folders.path}) = lower(${normalized})
+    `);
+    return row?.t ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 只读预检：整棵目录树里，有没有**任何一个文件夹**的修改时间比"上次扫描"新 ✓。
+ * @returns true = 可能有变化（要扫）；false = 一点没变（可跳过）；null = 判断不了（按"有变化"处理）
+ */
+async function folderTreeChangedSinceLastScan(
+  folderPath: string
+): Promise<boolean | null> {
+  const lastScannedAt = readFolderLastScannedAt(folderPath);
+  if (lastScannedAt === null) {
+    // 从没扫过 → 判断不了，按"有变化"走原来的逻辑 ✓
+    return null;
+  }
+  let rootStat: fs.Stats;
+  try {
+    rootStat = await fs.promises.stat(folderPath);
+  } catch {
+    // 根目录不可用（离线盘 / 被改名）：这一轮跳过，下次启动再试 ✓
+    return false;
+  }
+
+  const stack = [folderPath];
+  let visited = 0;
+  while (stack.length > 0) {
+    const dir = stack.pop() as string;
+    let entries: fs.Dirent[];
+    try {
+      // 根目录已经 stat 过（上面），子目录在这里 stat ✓
+      const dirStat = dir === folderPath ? rootStat : await fs.promises.stat(dir);
+      if (dirStat.mtimeMs > lastScannedAt) {
+        return true;
+      }
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        stack.push(path.join(dir, entry.name));
+      }
+    }
+    // 让出事件循环，避免几千个目录连续 stat 把主进程占住 ✓
+    visited++;
+    if (visited % 500 === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+  // 连根目录一起看过，都没有比"上次扫描"新的 → 确实没变化 ✓
+  return false;
+}
 
 /**
  * 自用版：软件运行中新增的文件，索引后自动触发 AI 处理（见 private-build.ts 的
@@ -199,7 +456,9 @@ export function scheduleWatchedFilesAiProcessing(delayMs = 30_000): void {
 export function scheduleStartupCatchUpScan(
   delayMs = 25000
 ): NodeJS.Timeout | null {
-  if (!PRIVATE_BUILD.startupCatchUpScan) {
+  // 自用（2026-10-16）：默认值来自 private-build，**用户可在「设置 → 应用行为」里改** ✓
+  const settings = readStartupScanSettings();
+  if (!settings.enabled) {
     return null;
   }
   if (catchUpTimer) {
@@ -207,20 +466,44 @@ export function scheduleStartupCatchUpScan(
   }
   catchUpTimer = setTimeout(() => {
     catchUpTimer = null;
-    let roots: { id: number; path: string }[] = [];
-    try {
-      roots = getIndexedRootFolders();
-    } catch {
-      return;
-    }
-    for (const root of roots) {
+    void (async () => {
+      let roots: { id: number; path: string }[] = [];
       try {
-        // enqueueImport 内部按路径去重，已在队列/扫描中的根不会被重复投递
-        enqueueImport(root.path);
+        roots = getIndexedRootFolders();
       } catch {
-        // 根目录不可用（离线盘 / 被改名）时跳过，下次启动再试
+        return;
       }
-    }
+      let enqueued = 0;
+      let unchanged = 0;
+      for (const root of roots) {
+        try {
+          /*
+           * 自用（2026-10-16）：这里先做**只读预检**（B′）✓ ——
+           * 整棵树里没有任何文件夹比"上次扫描"新，就静默跳过：
+           * 不扫、不写库、不弹提示条 ✓（实测：全量扫约 7~10 秒，预检约 3 秒且不碰数据库 ✓）。
+           * 通用做法，不针对某一种目录结构写死 ✓。
+           */
+          const outcome = await enqueueOrAskForConfirmation(
+            root.path,
+            settings,
+            true
+          );
+          if (outcome === "scanned") {
+            enqueued++;
+          } else if (outcome === "unchanged") {
+            unchanged++;
+          }
+        } catch {
+          // 根目录不可用（离线盘 / 被改名）时跳过，下次启动再试
+        }
+      }
+      console.log(
+        `[ImportQueue] 开机补扫：${roots.length} 个根 → 投递扫描 ${enqueued} 个 / 没变化跳过 ${unchanged} 个 / 待确认 ${pendingStartupScans.length} 个`
+      );
+      if (pendingStartupScans.length > 0) {
+        broadcast();
+      }
+    })();
   }, delayMs);
   return catchUpTimer;
 }
@@ -249,6 +532,7 @@ function broadcast(): void {
     pending: queue.map((t, i) => ({ ...t, position: i + 1 })),
     current: current ? { ...current } : null,
     history: history.slice(-20),
+    pendingStartupScans: getPendingStartupScans(),
   };
 
   for (const win of BrowserWindow.getAllWindows()) {
@@ -576,6 +860,7 @@ export function getImportQueueStatus(): ImportQueueStatus {
     pending: queue.map((t, i) => ({ ...t, position: i + 1 })),
     current: current ? { ...current } : null,
     history: history.slice(-20),
+    pendingStartupScans: getPendingStartupScans(),
   };
 }
 

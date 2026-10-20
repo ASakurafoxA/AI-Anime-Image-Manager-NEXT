@@ -1,9 +1,8 @@
-import { albums } from "./albums";
+﻿import { albums } from "./albums";
 import { app } from "./app";
 import { cloud } from "./cloud";
 import { cull } from "./cull";
 import { diagnostics } from "./diagnostics";
-import { faces } from "./faces";
 import { localization } from "./localization";
 import { photos } from "./photos";
 import { plugins } from "./plugins";
@@ -16,7 +15,6 @@ import { window } from "./window";
 export const router = {
   albums,
   cloud,
-  faces,
   settings,
   theme,
   window,

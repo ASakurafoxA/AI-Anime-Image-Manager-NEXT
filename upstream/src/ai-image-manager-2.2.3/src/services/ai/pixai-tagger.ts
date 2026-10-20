@@ -23,7 +23,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lte, sql } from "drizzle-orm";
 import { PRIVATE_BUILD } from "@/config/private-build";
 import { getDatabase } from "@/db";
 import { photos, photoTags, tags } from "@/db/schema";
@@ -642,11 +642,12 @@ export function isPixaiVocabularyImported(): boolean {
  * `done` = 库里已打标的张数，`total` = 全库张数。
  */
 export function getPixaiTaggingBaseline(): { done: number; total: number } {
-  const libraryTotal = countRemaining(0);
-  return {
-    done: Math.max(0, libraryTotal - countRemaining(readCursor())),
-    total: libraryTotal,
-  };
+  /*
+   * 2026-10-20（会话#10）：`done` 改成**按数据统计**（真的已经有自动标签的张数），
+   * 不再用"游标之前的张数"。旧写法在"导入时自动打标（走 photoIds、不推进游标）"
+   * 之后会算成 0/X，界面看起来像从头重来 —— 用户实测就是这个现象。
+   */
+  return { done: countTaggedPhotos(), total: countPhotos() };
 }
 
 /** 是否已经跑完过一次全库重扫（决定下次点按钮是否重置游标）。 */
@@ -655,14 +656,37 @@ export function isFullPixaiRunDone(): boolean {
 }
 
 /**
+ * 强制下一次做**全库重打**（"跳过已有自动标签"的优化关掉）。
+ *
+ * 为什么需要这个标记：断点续跑改成按数据判定后，"只清游标"已经不足以触发重打了
+ * （游标归零也不会再打一遍有标签的图）——
+ * 换打标模型必须走这个显式开关，否则 `resetPixaiTaggingProgress()` 会变成空操作。
+ */
+const FORCE_FULL_KEY = "pixai.tagger.forceFullRescan";
+
+/**
+ * 读一下"是否要求全库重打"（**不**清标记）。
+ *
+ * 为什么不在开头就清：全库重打可能跑几个小时，中途暂停/退出很常见；
+ * 标记留着，下次点「生成 AI 标签」才能接着把剩下的补完。
+ * 跑完一轮（没取消、没停滞）时才由 `runPixaiTagging` 清掉。
+ */
+function isForceFullRescanPending(): boolean {
+  return getSetting(FORCE_FULL_KEY) === "1";
+}
+
+/**
  * 自用（需求 1）：**强制**下次从第 0 张开始全库重扫。
  *
  * 只有"换了模型、必须把旧标签全部重打"这类用户明确要求时才调用它 ——
- * 日常的"继续打标"靠游标自动续跑，不要清游标（清了就等于从头再来）。
+ * 日常的"继续打标"靠断点自动续跑，不要清（清了就等于从头再来）。
+ * 2026-10-20（会话#10）：除了清游标，还要立 `forceFullRescan` 标记，
+ * 否则"按数据判定"的续跑会跳过所有已有标签的照片，等于没重打。
  */
 export function resetPixaiTaggingProgress(): void {
   setSetting(CURSOR_KEY, "0");
   setSetting(FULL_RUN_KEY, "0");
+  setSetting(FORCE_FULL_KEY, "1");
 }
 
 /** 确认词表已导入；必要时执行导入。 */
@@ -686,16 +710,71 @@ function readCursor(): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-function countRemaining(cursor: number): number {
+/** 全库（未删除）张数。 */
+function countPhotos(): number {
   const row = getDatabase()
     .select({ n: sql<number>`count(*)` })
     .from(photos)
-    .where(and(isNull(photos.deletedAt), gt(photos.id, cursor)))
+    .where(isNull(photos.deletedAt))
     .get();
   return Number(row?.n ?? 0);
 }
 
-function loadPhotosAfterCursor(cursor: number, limit: number): PhotoRow[] {
+/** id ≤ 给定值的未删除张数（"全库重打"时用它当进度，因为游标就是进度）。 */
+function countPhotosUpTo(photoId: number): number {
+  const row = getDatabase()
+    .select({ n: sql<number>`count(*)` })
+    .from(photos)
+    .where(and(isNull(photos.deletedAt), lte(photos.id, photoId)))
+    .get();
+  return Number(row?.n ?? 0);
+}
+
+/**
+ * 已经有自动标签的照片数 —— **"真的打完标"的唯一口径**。
+ *
+ * 为什么不用游标算：游标只记"处理到哪个 id"，而导入时的自动打标走
+ * `photoIds` 分支、不推进游标；一旦两者脱节，界面就会出现"打了 2 万张却显示 0"。
+ *
+ * ⚠️ 只数**没被软删**的照片：否则已删图的标签会让 done 超过 total（进度 >100%）。
+ */
+function countTaggedPhotos(): number {
+  const row = getDatabase()
+    .select({ n: sql<number>`count(*)` })
+    .from(photos)
+    .where(
+      and(
+        isNull(photos.deletedAt),
+        sql`EXISTS (SELECT 1 FROM photo_tags pt WHERE pt.photo_id = ${photos.id} AND pt.origin = 'auto')`
+      )
+    )
+    .get();
+  return Number(row?.n ?? 0);
+}
+
+/** 还没有任何自动标签的照片数（= 这一轮真正要处理的数量）。 */
+function countUntaggedPhotos(): number {
+  const row = getDatabase()
+    .select({ n: sql<number>`count(*)` })
+    .from(photos)
+    .where(and(isNull(photos.deletedAt), notTaggedSql()))
+    .get();
+  return Number(row?.n ?? 0);
+}
+
+/** SQL 片段：这张照片**还没有任何自动标签**（打标断点续跑的判定条件）。 */
+function notTaggedSql() {
+  return sql`NOT EXISTS (SELECT 1 FROM photo_tags pt WHERE pt.photo_id = ${photos.id} AND pt.origin = 'auto')`;
+}
+
+function loadPhotosAfterCursor(
+  cursor: number,
+  limit: number,
+  onlyUntagged = false
+): PhotoRow[] {
+  const where = onlyUntagged
+    ? and(isNull(photos.deletedAt), gt(photos.id, cursor), notTaggedSql())
+    : and(isNull(photos.deletedAt), gt(photos.id, cursor));
   return getDatabase()
     .select({
       id: photos.id,
@@ -703,7 +782,7 @@ function loadPhotosAfterCursor(cursor: number, limit: number): PhotoRow[] {
       path: photos.path,
     })
     .from(photos)
-    .where(and(isNull(photos.deletedAt), gt(photos.id, cursor)))
+    .where(where)
     .orderBy(photos.id)
     .limit(limit)
     .all();
@@ -723,6 +802,39 @@ function loadPhotosByIds(ids: number[]): PhotoRow[] {
     .where(and(isNull(photos.deletedAt), inArray(photos.id, ids)))
     .orderBy(photos.id)
     .all();
+}
+
+/**
+ * 把"已经不存在/已软删"的 id 剔掉，只留库里真实存在、未删除的照片。
+ *
+ * 为什么需要（用户实测的怪数字）：导入后的自动打标把待打标 id 排进队列，
+ * 若其中一部分照片随后被删掉/重新导入（id 变了），队列里会留下**幽灵 id**：
+ * 进度总数仍是旧值（例如 4381），而库里只剩 1358 张 —— 界面就成了
+ * "136/4381" 这种对不上的数字，而且这些 id 会白跑一遍（每批 0 行）。
+ */
+function filterAlivePhotoIds(ids: number[]): number[] {
+  if (ids.length === 0) {
+    return [];
+  }
+  const db = getDatabase();
+  const alive = new Set<number>();
+  const CHUNK = 400; // SQLite 变量上限 999，留余量
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const rows = db
+      .select({ id: photos.id })
+      .from(photos)
+      .where(
+        and(
+          isNull(photos.deletedAt),
+          inArray(photos.id, ids.slice(i, i + CHUNK))
+        )
+      )
+      .all();
+    for (const row of rows) {
+      alive.add(row.id);
+    }
+  }
+  return ids.filter((id) => alive.has(id));
 }
 
 /**
@@ -1036,7 +1148,9 @@ export async function runPixaiTagging(
     const batchSize = BATCH_SIZE;
 
     if (options.photoIds && options.photoIds.length > 0) {
-      const ids = [...new Set(options.photoIds)];
+      // 队列里可能留着已删除 / 已不存在的 id（见 filterAlivePhotoIds 的说明）：
+      // 先剔掉，否则总数会显示成旧值、进度也白跑
+      const ids = filterAlivePhotoIds([...new Set(options.photoIds)]);
       const limited = options.maxPhotos
         ? ids.slice(0, options.maxPhotos)
         : ids;
@@ -1060,32 +1174,49 @@ export async function runPixaiTagging(
         options.onProgress?.({ done, total, tagged, failed });
       }
     } else {
-      if (
+      // 两种"从头全库重打"：调用方显式传 resetCursor，或之前调过
+      // `resetPixaiTaggingProgress()`（它会立一个标记，跑完一轮才清）
+      const fullRescan =
         shouldResetTaggingCursor(options, {
           cursor: readCursor(),
           fullRunDone: isFullPixaiRunDone(),
-        })
-      ) {
+        }) || isForceFullRescanPending();
+      if (fullRescan) {
         // 「从头全库重跑」的唯一入口：调用方显式传 `resetCursor: true`
         // （界面上点按钮走的是 false → 断点续跑；无头 --run-pixai-tagging 默认 true）。
         // 另有一个更彻底的 `resetPixaiTaggingProgress()`（连"跑完过一轮"的标记一起清），
         // 留给"换模型要把旧标签全部重打"的显式操作。
         setSetting(CURSOR_KEY, "0");
       }
+      /*
+       * 2026-10-20（会话#10）：**断点续跑改成按数据判定**，不再只靠游标。
+       *
+       * 实测出来的两个毛病（用户报的"退出再点打标，进度没继承"）：
+       *   ① 游标只是"处理到哪个 id"的高水位，导入时的自动打标走 `photoIds` 分支、
+       *      **不推进游标** → 库里明明已经有两万多张有标签，游标却还停在很低的值；
+       *   ② 于是下次点「生成 AI 标签」既从很低的游标重新扫，界面也显示成 0/全库，
+       *      已经打好的照片被**从头再打一遍**。
+       *
+       * 现在：正常续跑时**跳过已经有自动标签的照片**（`onlyUntagged`），
+       * 进度按「已打标张数 / 全库张数」报。只有显式要求从头（resetCursor: true）
+       * 才不跳过 —— 那是"换模型全部重打"的口径。
+       */
+      const onlyUntagged = !fullRescan;
       let cursor = readCursor();
+      /** 本轮真正处理了多少张（与"累计已完成"分开，maxPhotos 才有意义）。 */
+      let processedThisRun = 0;
       /*
        * 自用（方案 A · 问题 6）：进度用**累计口径**上报。
        *
        *   processed = 库里已完成 + 本次已完成，  total = 全库张数
        *
-       * 为什么：原来 total 是"还剩多少张"、processed 是"本次处理了多少张"，
-       * 界面就成了"0 / 剩余" —— 看着像从头重跑，其实已经在续跑。
        * 换成累计口径后，界面自然显示"已完成 X / 全库 Y"，一眼就知道是在继续，
        * 而速度/预估也仍然正确（剩余时间 = (total − processed) / 速度）。
        */
-      const libraryTotal = countRemaining(0);
-      done = Math.max(0, libraryTotal - countRemaining(cursor));
-      total = libraryTotal;
+      total = countPhotos();
+      // 续跑：已完成 = 真的有自动标签的张数；全库重打：已完成 = 游标之前处理过的张数
+      //（重新打的这一轮里，游标本身就是进度）
+      done = fullRescan ? countPhotosUpTo(cursor) : countTaggedPhotos();
       // 先报一次累计基线：否则界面第一帧会是"0 / 全库"那种误导数字
       options.onProgress?.({ done, failed, tagged, total });
       for (;;) {
@@ -1097,10 +1228,14 @@ export async function runPixaiTagging(
         if (cancelRequested) {
           break;
         }
-        if (options.maxPhotos && done >= options.maxPhotos) {
+        if (options.maxPhotos && processedThisRun >= options.maxPhotos) {
           break;
         }
-        const rows = loadPhotosAfterCursor(cursor, batchSize * pixaiWorkers);
+        const rows = loadPhotosAfterCursor(
+          cursor,
+          batchSize * pixaiWorkers,
+          onlyUntagged
+        );
         if (rows.length === 0) {
           break;
         }
@@ -1115,6 +1250,14 @@ export async function runPixaiTagging(
          *  用户再点一次就会从这批重试，这正是断点续跑的意义。
          */
         if (batch.written === 0) {
+          /*
+           * 2026-10-20（会话#10）：被"取消/抢占"打断时（例如建向量要拿回显卡），
+           * 这一批 0 成功是**取消造成的**，不是系统性问题 —— 别报成"整批失败"，
+           * 也别把游标停在这里当停滞处理。
+           */
+          if (cancelRequested) {
+            break;
+          }
           stalledAt = rows[0].id;
           failed += rows.length;
           options.onProgress?.({ done, total, tagged, failed });
@@ -1129,7 +1272,10 @@ export async function runPixaiTagging(
         }
         cursor = rows[rows.length - 1].id;
         setSetting(CURSOR_KEY, String(cursor));
-        done += rows.length;
+        processedThisRun += rows.length;
+        // 续跑模式下每张处理完的照片都会多出自动标签，所以按 written 加；
+        // 全库重扫模式下"已完成"就是"处理过的张数"，按 rows.length 加。
+        done += onlyUntagged ? batch.written : rows.length;
         tagged += batch.written;
         failed += rows.length - batch.written;
         options.onProgress?.({ done, total, tagged, failed });
@@ -1141,6 +1287,8 @@ export async function runPixaiTagging(
       // 标记"已完成一次全库重扫"：下次点按钮只做增量，避免重复扫全库。
       // 需要再强制全库重扫时，清掉 app_settings 里的 pixai.tagger.fullRunDone 即可。
       setSetting(FULL_RUN_KEY, "1");
+      // 全库重打这一轮跑完了，标记可以撤（中途取消/停滞就留着，下次接着补完）
+      setSetting(FORCE_FULL_KEY, "0");
     }
     log.info(
       {
@@ -1170,10 +1318,10 @@ export function getPixaiTaggingStatus(): {
   cursor: number;
   remaining: number;
 } {
-  const cursor = readCursor();
   return {
     imported: isPixaiVocabularyImported(),
-    cursor,
-    remaining: countRemaining(cursor),
+    cursor: readCursor(),
+    // "还剩多少"按数据算（没有自动标签的张数），不再用"游标之后还剩多少"
+    remaining: countUntaggedPhotos(),
   };
 }

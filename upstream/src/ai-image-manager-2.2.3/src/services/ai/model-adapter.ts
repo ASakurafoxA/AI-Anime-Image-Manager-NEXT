@@ -1,6 +1,6 @@
 import path from "node:path";
 
-export type EmbeddingAdapterFamily = "siglip";
+export type EmbeddingAdapterFamily = "siglip" | "chinese-clip";
 export type EmbeddingAdapterId = string;
 export type EmbeddingNormalization = "l2";
 export type WorkerExecutionProvider = "cpu" | "directml";
@@ -170,11 +170,126 @@ export const SIGLIP_V1_ADAPTER: EmbeddingAdapterDescriptor = {
   thresholdProfileId: "siglip-v1-base-patch16-224-default",
 };
 
-const adapterRegistry = new Map<EmbeddingAdapterId, EmbeddingAdapterDescriptor>(
-  [[SIGLIP_V1_ADAPTER.id, SIGLIP_V1_ADAPTER]]
-);
+/** 自用（2026-10）：Chinese-CLIP 的产物清单（两塔合并在同一个 ONNX 里）。 */
+const CHINESE_CLIP_ARTIFACTS: ModelArtifactSpec[] = [
+  {
+    relativePath: "Xenova/chinese-clip-vit-base-patch16/onnx/model_quantized.onnx",
+    sha256: "a2c2849329eafb24100acec5a9421a39f8cb445296444c5c98855b69e5e7a751",
+    sizeBytes: 190_842_404,
+    required: true,
+  },
+  {
+    relativePath: "Xenova/chinese-clip-vit-base-patch16/config.json",
+    sha256: "19447ad8c20d274f0644a6663af56286be98bd2d0e5f9472fcb318e04fcd6961",
+    sizeBytes: 844,
+    required: true,
+  },
+  {
+    relativePath: "Xenova/chinese-clip-vit-base-patch16/preprocessor_config.json",
+    sha256: "61a78fdd2c7ac17b54b6190c0f4cb23423192c535003d52528d01e318a47608b",
+    sizeBytes: 546,
+    required: true,
+  },
+  {
+    relativePath: "Xenova/chinese-clip-vit-base-patch16/special_tokens_map.json",
+    sha256: "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    sizeBytes: 125,
+    required: true,
+  },
+  {
+    relativePath: "Xenova/chinese-clip-vit-base-patch16/tokenizer.json",
+    sha256: "7dfbf1966ebf99d471c3796e9b457329d2b2182b817e144f1e904b957745c839",
+    sizeBytes: 439_124,
+    required: true,
+  },
+  {
+    relativePath: "Xenova/chinese-clip-vit-base-patch16/tokenizer_config.json",
+    sha256: "38fbc894183595cc1168e36150251b2fb658197b3a49f6908cce88ae22acd52a",
+    sizeBytes: 1_315,
+    required: true,
+  },
+  {
+    relativePath: "Xenova/chinese-clip-vit-base-patch16/vocab.txt",
+    sha256: "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+    sizeBytes: 109_540,
+    required: true,
+  },
+];
 
-let activeAdapterId = SIGLIP_V1_ADAPTER_ID;
+export const CHINESE_CLIP_V1_ADAPTER_ID = "chinese-clip-v1-base-patch16";
+
+/**
+ * 自用（2026-10 换模型）：中文 CLIP（`Xenova/chinese-clip-vit-base-patch16`）。
+ *
+ * 为什么换：同一句话 + 同一张图，SigLIP（英文翻译后）相似度只有 **13%**，
+ * 而这个模型是 **35%** —— 中文原生编码，不需要翻译那一步。
+ *
+ * ⚠️ 两个关键差异（都已用独立脚本验证）：
+ *   1. ONNX 是**两塔合并**的一张图（`onnx/model_quantized.onnx`），声明了
+ *      `input_ids` / `attention_mask` / `pixel_values` 三个输入 → worker 会给
+ *      "没主动提供"的输入补零张量（只跑一塔时另一塔喂零，实测互不干扰）。
+ *   2. `@xenova/transformers` v2 的 ChineseCLIPModel **不完整**（没有
+ *      get_text_features、也不暴露子塔）→ 文本塔走 `engine: "onnxruntime-node"`，
+ *      只用它的 tokenizer，推理自己用 onnxruntime 跑。
+ */
+export const CHINESE_CLIP_V1_ADAPTER: EmbeddingAdapterDescriptor = {
+  schemaVersion: 1,
+  id: CHINESE_CLIP_V1_ADAPTER_ID,
+  family: "chinese-clip",
+  displayName: "Chinese-CLIP Base Patch16-224",
+  modelId: "Xenova/chinese-clip-vit-base-patch16",
+  revision: "main",
+  artifacts: CHINESE_CLIP_ARTIFACTS,
+  embeddingSpace: {
+    dimensions: 512,
+    normalization: "l2",
+    image: {
+      modelRelativePath:
+        "Xenova/chinese-clip-vit-base-patch16/onnx/model_quantized.onnx",
+      inputName: "pixel_values",
+      outputName: "image_embeds",
+      dimensions: 512,
+      imageSize: 224,
+      resizeFit: "cover",
+      // CLIP 系标准归一化（与 SigLIP 的 0.5/0.5 不同）
+      mean: [0.48145466, 0.4578275, 0.40821073],
+      std: [0.26862954, 0.26130258, 0.27577711],
+    },
+    text: {
+      engine: "onnxruntime-node",
+      modelRelativePath:
+        "Xenova/chinese-clip-vit-base-patch16/onnx/model_quantized.onnx",
+      tokenizerRelativePath:
+        "Xenova/chinese-clip-vit-base-patch16/tokenizer.json",
+      inputNames: { inputIds: "input_ids", attentionMask: "attention_mask" },
+      outputName: "text_embeds",
+      dimensions: 512,
+      maxLength: 52,
+      padding: "max_length",
+    },
+  },
+  capabilities: {
+    imageToImage: true,
+    textToImage: true,
+    tagging: false,
+    duplicateDetection: true,
+  },
+  thresholdProfileId: "chinese-clip-v1-base-patch16-default",
+};
+
+
+const adapterRegistry = new Map<EmbeddingAdapterId, EmbeddingAdapterDescriptor>([
+  [SIGLIP_V1_ADAPTER.id, SIGLIP_V1_ADAPTER],
+  [CHINESE_CLIP_V1_ADAPTER.id, CHINESE_CLIP_V1_ADAPTER],
+]);
+
+/*
+ * 自用（2026-10 换模型）：活动模型已换成 **Chinese-CLIP**。
+ * 理由：同一句话 + 同一张图，SigLIP（经英译）相似度只有 13%，它是 35%；
+ * 而且中文原生 → 不再需要 opus-mt 翻译那一步。
+ * 需要回退时把下面这行改回 SIGLIP_V1_ADAPTER_ID 即可（两个适配器都还注册着）。
+ */
+let activeAdapterId = CHINESE_CLIP_V1_ADAPTER_ID;
 
 export function registerEmbeddingAdapter(
   adapter: EmbeddingAdapterDescriptor

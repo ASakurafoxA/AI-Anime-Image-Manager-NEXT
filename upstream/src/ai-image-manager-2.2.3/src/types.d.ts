@@ -24,6 +24,8 @@ interface Window {
     startDrag: (filePath: string) => void;
     copyImageToClipboard: (filePath: string) => Promise<boolean>;
     restartApp: () => void;
+    /** 自用：界面画出第一帧后通知主进程显示窗口（见 preload 与 main.ts） */
+    notifyRendererReady?: () => void;
     installUpdate: () => void;
     setLanguage: (lang: string) => void;
     openExternal: (url: string) => void;

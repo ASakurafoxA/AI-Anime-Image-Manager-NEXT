@@ -76,8 +76,40 @@ export function isWd14TaggingRunning(): boolean {
   return running;
 }
 
+/**
+ * 自用（2026-10-17，用户口径）：**真正挂起式暂停（WD14 版）** ✓
+ *
+ * 和 PixAI 一样：pause 只置标志 → **循环在批边界原地等**、**worker 不销毁**（模型保持热态），
+ * 所以"继续"是秒接 ✓（老做法是取消 + 等停 + 重新初始化，几秒钟 ✗）
+ */
+let suspendRequested = false;
+
+/** 自用：是否处于挂起状态 ✓ */
+export function isWd14TaggingSuspended(): boolean {
+  return suspendRequested;
+}
+
+/** 自用：挂起（不杀 worker、不丢进度）✓ */
+export function pauseWd14Tagging(): void {
+  suspendRequested = true;
+}
+
+/** 自用：恢复（清标志，循环立刻接着跑）✓ */
+export function resumeWd14Tagging(): void {
+  suspendRequested = false;
+}
+
+/** 自用：挂起等待（批边界调用；取消优先）✓ */
+async function waitWhileSuspended(): Promise<void> {
+  while (suspendRequested && !cancelRequested) {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+}
+
 export function cancelWd14Tagging(): void {
   cancelRequested = true;
+  // 自用：取消同时清挂起，否则循环会卡在等待里 ✗
+  suspendRequested = false;
 }
 
 function vocabPath(modelsDir: string): string {
@@ -587,6 +619,7 @@ export async function runWd14Tagging(
 
   running = true;
   cancelRequested = false;
+  suspendRequested = false;
   try {
     ensureWd14Vocabulary(modelsDir);
     // 自用修复：调用方没显式传 useGpu 时，读应用里的「GPU 加速」设置。
@@ -613,6 +646,10 @@ export async function runWd14Tagging(
         : ids;
       total = limited.length;
       for (let i = 0; i < limited.length; i += batchSize) {
+        if (cancelRequested) {
+          break;
+        }
+        await waitWhileSuspended();
         if (cancelRequested) {
           break;
         }
@@ -648,6 +685,10 @@ export async function runWd14Tagging(
       total = libraryTotal;
       options.onProgress?.({ done, failed, tagged, total });
       for (;;) {
+        if (cancelRequested) {
+          break;
+        }
+        await waitWhileSuspended();
         if (cancelRequested) {
           break;
         }

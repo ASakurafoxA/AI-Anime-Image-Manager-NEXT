@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   Eye,
   Images,
+  PauseCircle,
   RefreshCw,
   ScanSearch,
   ShieldCheck,
@@ -36,6 +37,7 @@ import {
   TooltipContent as AppTooltipContent,
   TooltipTrigger as AppTooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useGlobalAiStatus } from "@/hooks/use-global-ai-status";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import type {
   DuplicateGroupPhotosResult,
@@ -110,9 +112,20 @@ function useDuplicatesQuery() {
         queryFn: () =>
           duplicateActions.scan(false) as Promise<DuplicatesResult>,
         staleTime: 0,
+        /*
+         * 自用（2026-10-17，用户实测："第一次点暂停，过一会它又自己开始扫"）：
+         * **这里必须关掉重试** ✗→✓ —— 默认重试会在"暂停/取消"把这次请求结束时
+         * 自动再发起，看上去就是"暂停后又自己开始了"（实测每暂停一次冒出 3~4 个新扫描）✗✗。
+         */
+        retry: false,
       });
     } catch {
       // 失败已经写进 query 状态，由界面上的错误提示展示
+    } finally {
+      // 暂停/取消后阶段变了，主动刷一次进度 → 界面立刻显示「已暂停」✓
+      void queryClient.invalidateQueries({
+        queryKey: ["duplicate-scan-progress"],
+      });
     }
   }, [queryClient]);
   const initialQueryFailed = query.isError && !query.data;
@@ -736,6 +749,12 @@ function DuplicateQueryError({
 export function DuplicatesPage() {
   const { t } = useTranslation();
   const reduceMotion = useReducedMotion();
+  /*
+   * 自用（2026-10-17，用户口径）：查重不吃显卡，所以**不和任何任务互斥** ✓，
+   * 只需要在"有 AI 任务在跑"时提示一句"会变慢"（提示，不拦）✓
+   */
+  const globalAi = useGlobalAiStatus();
+  const aiRunning = globalAi.isRunning;
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const parentRef = useRef<HTMLDivElement>(null);
@@ -1173,7 +1192,40 @@ export function DuplicatesPage() {
     applyKeepCount.mutate({ count, group });
   };
 
-  const scanBusy = isFetching || rescan.isPending;
+  /*
+   * 自用（2026-10-17，用户实测："退出到主界面，重复检测被取消了"）：
+   * **进度查询要能独立于本页存活** ✓
+   *
+   * 之前这条查询是 `enabled: scanBusy` —— 只在本页自己正在取数时才轮询，
+   * 一离开页面就停、回来也不知道后台还在扫 → 界面显示成"从来没扫过/被取消" ✗。
+   * 现在它一进页面就问一次，并回答"后台是不是正在扫"（`active`）：
+   * 只要 active 就按 500ms 轮询，扫完自然停 ✓。
+   */
+  const localScanBusy = isFetching || rescan.isPending;
+  const progress = useQuery({
+    queryKey: ["duplicate-scan-progress"],
+    queryFn: duplicateActions.getScanProgress,
+    enabled: true,
+    /*
+     * 自用（2026-10-17 第三轮，用户实测："取消后点重新扫描，计数器没清零"）：
+     * **本页一律按 1 秒轮询**（扫描进行中 500ms）✓ ——
+     * 之前只在"本页正在取数 / 后台 active"时才轮询，而"重新扫描"是一个 **mutation**
+     * （不算 isFetching）、后台新的 active 又要靠轮询才知道 → **没人去问** →
+     * 界面一直显示上一次的 `432 / 77299`，看起来就是"计数器没清零" ✗✗。
+     * 现在是内存里一个很小的对象，1 秒问一次没有负担 ✓。
+     */
+    refetchInterval: (query) =>
+      localScanBusy || query.state.data?.active ? 500 : 1000,
+    refetchOnWindowFocus: false,
+  });
+  const remoteScanActive = progress.data?.active === true;
+  /*
+   * 自用（2026-10-17，待办「查重的暂停 / 断点继续」）：
+   * 进度里的阶段是 `paused` 就显示「已暂停 + 继续」✓ —— 它**不随页面卸载丢失**
+   * （阶段存在主进程里），所以离开再回来仍然能看到"已暂停、可以继续" ✓。
+   */
+  const paused = progress.data?.stage === "paused";
+  const scanBusy = localScanBusy || remoteScanActive;
   const [showScanProgress, setShowScanProgress] = useState(false);
   useEffect(() => {
     if (!scanBusy) {
@@ -1185,13 +1237,34 @@ export function DuplicatesPage() {
   }, [scanBusy]);
   const reviewBusy =
     Object.values(savingGroups).some(Boolean) || applyKeepCount.isPending;
-  const progress = useQuery({
-    queryKey: ["duplicate-scan-progress"],
-    queryFn: duplicateActions.getScanProgress,
-    enabled: scanBusy,
-    refetchInterval: scanBusy ? 500 : false,
+  /*
+   * 自用（2026-10-17）：暂停 —— 停下后立刻把进度刷一次，界面才能马上变成「已暂停」✓
+   * （进度查询虽然也在按 1 秒轮询，但主动刷一次能"点了就变"，不用等下一秒）
+   */
+  const pauseScan = useMutation({
+    mutationFn: duplicateActions.pauseScan,
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ["duplicate-scan-progress"] }),
   });
-  const cancelScan = useMutation({ mutationFn: duplicateActions.cancelScan });
+
+  /*
+   * 自用：进页面时如果后台**已经在扫**，直接接回去 ✓
+   *
+   * 不能再显示"开始检测"（会让人以为没在扫），而要用 `beginScan()` 把这次扫描
+   * join 回来 —— 它会先取消在飞的只读请求、再按"扫描"路径取一次；
+   * 而 `findDuplicates` 的 key 只看"扫什么"，同 key 的请求会**加入**正在跑的那次
+   * （不会把它顶掉），结果在扫描结束时回到这里 ✓。
+   * （不用 `markScanStarted()+refetch()`：进页面那次只读请求可能还在飞，
+   *   同 key 会把 refetch 去重掉，扫描根本没接上 ✗ —— beginScan 里已有这个教训。）
+   */
+  const attachScanRef = useRef(false);
+  useEffect(() => {
+    if (!(remoteScanActive && !attachScanRef.current)) {
+      return;
+    }
+    attachScanRef.current = true;
+    void beginScan();
+  }, [beginScan, remoteScanActive]);
 
   const filteredGroups = useMemo(() => {
     if (filter === "dismissed") {
@@ -1390,20 +1463,39 @@ export function DuplicatesPage() {
                 </AppTooltipTrigger>
                 <AppTooltipContent>{scanProgressLabel}</AppTooltipContent>
               </AppTooltip>
+              {/*
+                自用（2026-10-17 第三轮，按用户口径）：**去掉「取消」** ✓
+                用户原话："实际上不需要取消的功能 —— 暂停已经等价于取消（都能停下、
+                结果都不清空），而且退出软件重开点开始检测也会接着扫"✓
+                （`cancelDuplicateScan` 接口保留：被新请求顶掉时仍走同一条"停下"路径 ✓）
+              */}
               <button
                 className="shrink-0 rounded border border-border px-2 py-0.5"
-                disabled={cancelScan.isPending}
-                onClick={() => cancelScan.mutate()}
+                disabled={pauseScan.isPending}
+                onClick={() => pauseScan.mutate()}
                 type="button"
               >
-                {t("cancel")}
+                {t("aiPause")}
               </button>
             </div>
           ) : (
-            <span className="ml-auto flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
-              <ShieldCheck className="h-3.5 w-3.5 text-success" />
-              {t("duplicateSafetyHint")}
-            </span>
+            <>
+              {/*
+                自用（2026-10-17，用户口径）：查重**不和任何任务互斥** ✓（它不吃显卡），
+                但会抢 CPU/磁盘 —— 所以这里只是**提示一句"会变慢"**，不拦、不排队 ✓
+              */}
+              {aiRunning ? (
+                <span className="ml-auto flex min-w-0 items-center gap-1 text-[10px] text-warning">
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  {t("duplicateScanBusyHint")}
+                </span>
+              ) : (
+                <span className="ml-auto flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
+                  <ShieldCheck className="h-3.5 w-3.5 text-success" />
+                  {t("duplicateSafetyHint")}
+                </span>
+              )}
+            </>
           )}
         </nav>
 
@@ -1421,7 +1513,7 @@ export function DuplicatesPage() {
               DUPLICATES_TOOLBAR_CONTENT_GAP,
           }}
         >
-          {showStartPanel ? (
+          {showStartPanel && !paused ? (
             /* 自用：没有历史结果时的入口（以前是一进页面就自动扫） */
             <div className="flex h-full items-center justify-center text-center">
               <div>
@@ -1442,6 +1534,29 @@ export function DuplicatesPage() {
               </div>
             </div>
           ) : null}
+          {/*
+            自用（2026-10-17，待办「查重的暂停 / 断点继续」）：
+            暂停后的面板 —— 明确告诉用户"没有白扫"，点「继续」会接着扫 ✓
+          */}
+          {paused && !scanBusy ? (
+            <div className="flex h-full items-center justify-center text-center">
+              <div>
+                <PauseCircle className="mx-auto h-10 w-10 text-muted-foreground/40" />
+                <p className="mt-3 font-medium text-[16px]">{t("aiPaused")}</p>
+                <p className="mt-2 text-[13px] text-muted-foreground">
+                  {t("duplicatePausedHint")}
+                </p>
+                <button
+                  className="mt-4 rounded-[6px] bg-primary px-4 py-1.5 font-medium text-[13px] text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+                  disabled={isFetching}
+                  onClick={beginScan}
+                  type="button"
+                >
+                  {t("aiResume")}
+                </button>
+              </div>
+            </div>
+          ) : null}
           {!showStartPanel && isLoading ? (
             <div className="space-y-4">
               {[0, 1, 2].map((item) => (
@@ -1457,7 +1572,7 @@ export function DuplicatesPage() {
               refetch();
             }}
             retrying={isFetching}
-            visible={!showStartPanel && initialQueryFailed}
+            visible={!showStartPanel && initialQueryFailed && !paused}
           />
           {!showStartPanel && queryReady && filteredGroups.length === 0 ? (
             <div className="flex h-full items-center justify-center text-center">

@@ -75,6 +75,13 @@ export interface LanListResult {
 }
 
 export interface LanListParams {
+  /**
+   * 隐藏文件夹开关（**与桌面端同名同义**）：
+   * 为真时**不返回**「被标记为隐藏」的文件夹（含其全部子孙）里的照片，
+   * 列表 / 文件名搜索 / 按标签检索 / 语义搜索**一律**生效；
+   * 缺省（或不传）等于关闭 —— 老客户端的行为一个字节都不变。
+   */
+  excludeHiddenFolders?: boolean;
   /** 只看收藏。*/
   favoriteOnly?: boolean;
   /** 只看某个文件夹（**含其子孙**，与桌面点文件夹的行为一致）。*/
@@ -139,6 +146,8 @@ function reparentToSurvivors<T extends { id: number; parentId: number | null }>(
 interface PhotoQueryRow {
   fileDate: number | null;
   filename: string;
+  /** 只用于"这张图在不在隐藏文件夹里"的判断，**不会**出现在响应里。*/
+  folderId: number | null;
   height: number | null;
   id: number;
   width: number | null;
@@ -147,6 +156,8 @@ interface PhotoQueryRow {
 const PHOTO_COLUMNS = {
   fileDate: photos.fileDate,
   filename: photos.filename,
+  // 只用来做隐藏文件夹过滤；`toSummary()` 的字段白名单里没有它（第 3 条铁律）
+  folderId: photos.folderId,
   height: photos.height,
   id: photos.id,
   width: photos.width,
@@ -178,6 +189,71 @@ function clampOffset(offset: number | undefined): number {
   return Math.max(0, Math.trunc(offset as number));
 }
 
+// ── 隐藏文件夹开关（`excludeHiddenFolders`）──────────────────────────────
+//
+// 语义与桌面端**完全一致**（顶栏那个"眼睛"开关）：为真时不显示
+// 「被标记为隐藏」的文件夹及其**整棵子树**里的照片；为假/缺省时照常显示。
+//
+// 复用桌面同一套解析（`resolveExcludedFolderIds` → `expandExcludedFolderIds`），
+// 所以"哪些文件夹算隐藏""子孙算不算"两边永远一致，局域网侧不另写一套规则。
+
+/**
+ * 开关打开时要排除的文件夹 id 集合（黑名单 + 其全部子孙）。
+ *
+ * @param excludeHiddenFolders 缺省/为假 → **空集合**，即"不过滤"（老客户端行为不变）。
+ */
+function excludedFolderIdSet(
+  excludeHiddenFolders: boolean | undefined
+): Set<number> {
+  return excludeHiddenFolders
+    ? new Set(resolveExcludedFolderIds())
+    : new Set<number>();
+}
+
+/**
+ * 这一行是不是"隐藏文件夹里的照片"。
+ *
+ * `folderId` 为 NULL（孤儿照片）时**不算** —— 与桌面 `queryPhotos()` 里
+ * `or(isNull(photos.folderId), notInArray(...))` 的口径一致，否则那些照片会凭空消失。
+ */
+function isHiddenFolderRow(
+  row: { folderId: number | null },
+  excluded: Set<number>
+): boolean {
+  return row.folderId !== null && excluded.has(row.folderId);
+}
+
+/** 丢掉落在隐藏文件夹里的行（集合为空时原样返回）。*/
+function dropHiddenFolderRows<T extends { folderId: number | null }>(
+  rows: T[],
+  excluded: Set<number>
+): T[] {
+  return excluded.size === 0
+    ? rows
+    : rows.filter((row) => !isHiddenFolderRow(row, excluded));
+}
+
+/**
+ * 把一批照片 id 里"落在隐藏文件夹里"的挑掉。
+ *
+ * 语义搜索的命中是**绕过 `queryPhotos()` 的**（向量检索直接给照片 id，
+ * 再做 id 补全），所以 SQL 那一层的过滤帮不上忙，必须在这里自己补一遍。
+ */
+function keepVisiblePhotoIds(ids: number[], excluded: Set<number>): number[] {
+  if (excluded.size === 0 || ids.length === 0) {
+    return ids;
+  }
+  const rows = getDatabase()
+    .select({ folderId: photos.folderId, id: photos.id })
+    .from(photos)
+    .where(inArray(photos.id, ids))
+    .all();
+  const hiddenIds = new Set(
+    rows.filter((row) => isHiddenFolderRow(row, excluded)).map((row) => row.id)
+  );
+  return hiddenIds.size === 0 ? ids : ids.filter((id) => !hiddenIds.has(id));
+}
+
 function toSummary(row: PhotoQueryRow): LanPhotoSummary {
   return {
     fileDate: row.fileDate ?? null,
@@ -190,7 +266,10 @@ function toSummary(row: PhotoQueryRow): LanPhotoSummary {
 }
 
 /** 按 id 批量取（保持传入顺序），用于语义搜索结果的补全。*/
-function loadSummariesInOrder(ids: number[]): LanPhotoSummary[] {
+function loadSummariesInOrder(
+  ids: number[],
+  excluded: Set<number> = new Set<number>()
+): LanPhotoSummary[] {
   if (ids.length === 0) {
     return [];
   }
@@ -201,7 +280,7 @@ function loadSummariesInOrder(ids: number[]): LanPhotoSummary[] {
     .where(and(inArray(photos.id, ids), isNull(photos.deletedAt)))
     .all();
   const byId = new Map<number, PhotoQueryRow>();
-  for (const row of rows) {
+  for (const row of dropHiddenFolderRows(rows, excluded)) {
     byId.set(row.id, row);
   }
   const out: LanPhotoSummary[] = [];
@@ -217,12 +296,14 @@ function loadSummariesInOrder(ids: number[]): LanPhotoSummary[] {
 /**
  * 语义搜索分页。
  *
+ * @param excluded 开关打开时要排除的文件夹 id 集合（空集合 = 不过滤）。
  * @returns 命中结果；AI 未就绪或检索失败时返回 null（调用方回退到文件名匹配）。
  */
 async function listBySemanticSearch(
   query: string,
   offset: number,
-  limit: number
+  limit: number,
+  excluded: Set<number>
 ): Promise<LanListResult | null> {
   if (!isAiSearchReady()) {
     return null;
@@ -231,15 +312,21 @@ async function listBySemanticSearch(
     // 语义检索只能"要前 N 条"，所以要翻到 offset+limit 就得按需多要一点。
     const wanted = Math.min(offset + limit, LAN_SEMANTIC_MAX_RESULTS);
     const hits = await searchByText(query, wanted);
-    const pageIds = hits.slice(offset, offset + limit).map((hit) => hit.photoId);
+    // 隐藏文件夹的排除必须在**切片之前**做，否则这一页会缺几张、而页码已经跳过去了。
+    const visibleIds = keepVisiblePhotoIds(
+      hits.map((hit) => hit.photoId),
+      excluded
+    );
+    const pageIds = visibleIds.slice(offset, offset + limit);
     return {
+      // 是否还有下一页看的是**原始召回**够不够多（被过滤掉的命中不该让翻页提前结束）
       hasMore: hits.length >= wanted && wanted < LAN_SEMANTIC_MAX_RESULTS,
-      items: loadSummariesInOrder(pageIds),
+      items: loadSummariesInOrder(pageIds, excluded),
       limit,
       mode: "semantic",
       offset,
       // ⚠️ 语义搜索的 total 是"召回条数"，不是全库命中数 —— 前端不要当成总数显示
-      total: hits.length,
+      total: visibleIds.length,
     };
   } catch (error) {
     // 不静默吞错：说清楚失败了，然后明确回退。
@@ -254,8 +341,11 @@ async function listBySemanticSearch(
  * 「全部照片」列表（分页 / 排序 / 搜索）。
  *
  * 搜索与桌面同一优先级：**语义优先，AI 未就绪时回退文件名包含匹配**。
- * ⚠️ 与桌面保持一致：**搜索不套用文件夹黑名单** —— 用户要的就是
- * "R-18 目录不进主界面但仍可搜索"；而不带搜索词的普通列表是套黑名单的。
+ *
+ * 隐藏文件夹（顶栏那个"眼睛"开关，参数 `excludeHiddenFolders`）：
+ * 打开时不返回隐藏文件夹（含子孙）里的照片，**列表 / 文件名搜索 / 按标签检索 /
+ * 语义搜索一视同仁**（与桌面顶栏开关的口径一致）；缺省/关闭时照常返回。
+ * 老客户端不带这个参数，因此行为与改动前完全一样。
  */
 export async function listLanPhotos(
   params: LanListParams
@@ -263,15 +353,18 @@ export async function listLanPhotos(
   const limit = clampLimit(params.limit);
   const offset = clampOffset(params.offset);
   const query = params.search?.trim();
+  const excluded = excludedFolderIdSet(params.excludeHiddenFolders);
 
   if (query) {
-    const semantic = await listBySemanticSearch(query, offset, limit);
+    const semantic = await listBySemanticSearch(query, offset, limit, excluded);
     if (semantic) {
       return semantic;
     }
   }
 
   const result = queryPhotos({
+    // 交给桌面同一套 SQL 过滤：这样 `total` 与分页（offset/limit）都是对的
+    excludeHiddenFolders: params.excludeHiddenFolders ?? false,
     favoriteOnly: params.favoriteOnly,
     folderId: params.folderId,
     limit,
@@ -282,7 +375,11 @@ export async function listLanPhotos(
     tagId: params.tagId,
     tagMode: "or",
   });
-  const items = result.items.map((row) => toSummary(row));
+  // 出口再兜一道：`queryPhotos()` 之外的路径（语义搜索等）也走同一套判断，
+  // 一个开关覆盖所有"返回照片"的分支，不会有的分支漏掉。
+  const items = dropHiddenFolderRows(result.items, excluded).map((row) =>
+    toSummary(row)
+  );
   return {
     hasMore: offset + items.length < result.total,
     items,

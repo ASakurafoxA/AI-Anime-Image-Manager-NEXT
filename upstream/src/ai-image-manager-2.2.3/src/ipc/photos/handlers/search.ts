@@ -17,9 +17,6 @@ import { getDatabase } from "@/db";
 import {
   advancedExifData,
   exifData,
-  faceIdentities,
-  faceIdentityMembers,
-  faceVectors,
   photos,
   photoTags,
   tags,
@@ -34,11 +31,11 @@ import {
   getSensitivityMultiplier,
 } from "@/services/ai/search-sensitivity";
 import {
-  searchByImage as aiSearchByImage,
   searchByText as aiSearchByText,
   searchByTextWithPlan as aiSearchByTextWithPlan,
   isAiSearchReady,
 } from "@/services/ai-embedder";
+import { searchByImageWithPhash } from "@/services/image-search";
 import { createImageSearchPreview } from "@/services/image-search-preview";
 import type { RewrittenQuery } from "@/services/query-rewrite";
 import { rewriteQuery, timeFilterToDateRange } from "@/services/query-rewrite";
@@ -70,6 +67,47 @@ import {
   SearchSchema,
 } from "./shared";
 
+/**
+ * 自用（2026-10 修「灰色占位图」）：
+ * 多路召回（标签/文件名/语义/自动标签）会把**同一张照片**带回多次，
+ * 结果里出现重复 id 会让前端 React 键冲突（日志里的
+ * "Encountered two children with the same key"），那些格子会渲染成灰色占位、
+ * 一直加载不出来。
+ *
+ * 这里按 photoId 去重，重复时保留**证据最强**的一条（rankScore + similarity 最大），
+ * 避免因为去重反而丢掉分数更高的那条。
+ */
+function dedupeRankedByPhotoId<
+  T extends { photoId: number; rankScore: number; similarity: number },
+>(list: T[]): T[] {
+  const best = new Map<number, T>();
+  const strengthOf = (entry: T): number =>
+    (Number.isFinite(entry.rankScore) ? entry.rankScore : 0) +
+    (Number.isFinite(entry.similarity) ? entry.similarity : 0);
+  for (const entry of list) {
+    const current = best.get(entry.photoId);
+    if (!current || strengthOf(entry) > strengthOf(current)) {
+      best.set(entry.photoId, entry);
+    }
+  }
+  return [...best.values()];
+}
+
+/**
+ * 自用（方案 B）：检索**永远搜全库**（不因「隐藏文件夹」开关而改变召回），
+ * 开关只决定这些照片**显不显示**。这里算出隐藏目录 id 集合，
+ * 给每行标一个 `inHiddenFolder`，交给界面做显示过滤。
+ */
+function collectHiddenFolderIds(): Set<number> {
+  try {
+    // 无参调用：它内部会用 getAllFolderPathItems() 取当前所有文件夹
+    return new Set(resolveExcludedFolderIds());
+  } catch {
+    return new Set();
+  }
+}
+
+import { resolveExcludedFolderIds } from "@/services/folder-exclusions";
 export const getImageSearchPreview = os
   .input(ImageSearchPreviewSchema)
   .handler(async ({ input }) => createImageSearchPreview(input.imagePath));
@@ -130,8 +168,33 @@ function withoutInternalSearchScores<
 }
 
 // ── 熔断与超时配置 ──────────────────────────────────────────────────
-const AI_SEARCH_TIMEOUT_MS = 2000;
+/*
+ * 自用（2026-10-16，**修"搜三次才出结果"**）：
+ *
+ * 实测日志：搜索本身只要 **14~107ms** ✓，但外层硬超时照样判它超时 ✗
+ * （`[Timeout] AI semantic search exceeded 2000ms` + `pipeline=… semanticOnly=0`），
+ * → **已经算好、已经打进缓存的结果被整路丢弃** ✗ → 用户看到 0 结果 → 再搜第二次、第三次 ✓。
+ *
+ * 失败时间点有强指向：正好落在"**启动满 2 分钟、后台维护/索引开始干活**"那一刻 ✓
+ * （日志：`[AI] Maintenance: … startup catch-up` 紧邻三次超时 ✓）——后台在占 LanceDB 和磁盘 ✗，
+ * 搜索就被拖过 2 秒 ✗，然后被丢掉 ✗。
+ *
+ * 所以把"已预热"的预算从 2s 放宽到 6s ✓：
+ * · 正常情况搜索是毫秒级 ✓ → 这个数字**完全不参与**，用户感受不到任何变化 ✓；
+ * · 只有后台正忙时才多等几秒 ✓ —— 比"搜三次才出结果"好得多 ✓。
+ * 冷启动（模型/库还没初始化）仍然是 10s ✓，那条没动 ✓。
+ */
+const AI_SEARCH_TIMEOUT_MS = 6000;
 const AI_SEARCH_COLD_TIMEOUT_MS = 10_000;
+/*
+ * 自用（2026-10 bug 修复）：**语义分支的召回深度上限**。
+ *
+ * 背景：`resultWindowEnd = offset + limit`，而语义分支拿它当召回深度用。
+ * 用户把「结果数」调到 500 时，深度也变成 500 → LanceDB 那一路超过上面那条
+ * 2 秒硬超时 → 整路被丢弃 → 对纯中文句子（标签/文件名/人名都没命中）就变成 **0 结果**。
+ * 而语义只需要拿到足够填满一页的候选，200 已经远超最终保留量（cutoff 之后通常只有几十条）。
+ */
+const SEMANTIC_MAX_DEPTH = 200;
 const COLOR_VECTOR_TIMEOUT_MS = 250;
 const SEARCH_PIPELINE_VERSION =
   process.env.AI_SEARCH_PIPELINE === "v2" ? "v2" : "hybrid-v3";
@@ -253,24 +316,34 @@ export const searchByImage = os
       };
     }
 
-    let results: Array<{ photoId: number; similarity: number }> = [];
+    // 两段式：先 pHash（毫秒级，回答「这张图我存过吗」），
+    // 命中就把完全相同（只差分辨率/格式）的副本排在结果最前面；
+    // 没命中再靠 CLIP 找裁图/改图这类「看起来像的」。
+    let results: Array<{
+      photoId: number;
+      similarity: number;
+      isExactCopy: boolean;
+      phashDistance: number | null;
+    }> = [];
     try {
-      results = await aiSearchByImage(input.imagePath, input.limit);
+      results = await searchByImageWithPhash(input.imagePath, input.limit);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error("[searchByImage] AI search failed:", message);
+      console.error("[searchByImage] image search failed:", message);
       return {
         results: [],
-        error: `AI 搜索失败: ${message || "未知错误"}`,
+        error: `搜索失败: ${message || "未知错误"}`,
         errorCode: "AI_SEARCH_FAILED" as const,
       };
     }
 
+    const exactCopyCount = results.filter((r) => r.isExactCopy).length;
     const photoIds = results.map((r) => r.photoId);
     if (photoIds.length === 0) {
       return {
         results: [],
-        error: "未找到相似图片（请确认 AI 模型已就绪且图片已索引）",
+        exactCopyCount: 0,
+        error: "没有找到相同或相似的图片",
         errorCode: "NO_MATCHES" as const,
       };
     }
@@ -292,13 +365,26 @@ export const searchByImage = os
           ...photo,
           match: { kind: "image" as const, score: r.similarity },
           similarity: r.similarity,
+          // 自用：指纹命中的「完全相同副本」（通常只是分辨率/格式不同）。
+          // 界面据此可把这些图排在最前并标明「已存过」。
+          isExactCopy: r.isExactCopy,
+          phashDistance: r.phashDistance,
           fileDate: photo.fileDate,
         };
       })
       .filter((p): p is NonNullable<typeof p> => p !== null && p.id != null);
 
-    const scored = applyTimeDecay(merged);
-    return { results: withoutInternalSearchScores(scored) };
+    // 指纹命中是「完全相同」，不该被时间衰减重新排序 —— 只对语义结果排序
+    const exactPart = merged.filter((p) => p.isExactCopy);
+    const similarPart = merged.filter((p) => !p.isExactCopy);
+    const scored = applyTimeDecay(similarPart);
+    return {
+      results: [
+        ...withoutInternalSearchScores(exactPart),
+        ...withoutInternalSearchScores(scored),
+      ],
+      exactCopyCount,
+    };
   });
 
 // ── 超时包装器 ──────────────────────────────────────────────────────
@@ -386,6 +472,7 @@ export const searchCompound = os
       shutterMax,
       cursor,
       limit,
+      minSimilarity,
       offset,
     } = input;
     const activeSensitivity = getActiveSearchSensitivity();
@@ -1009,7 +1096,20 @@ export const searchCompound = os
         // 路 1：SigLIP 文本推理 + LanceDB 向量召回
         semanticAvailable
           ? withTimeout(
-              aiSearchByTextWithPlan(q, resultWindowEnd),
+              aiSearchByTextWithPlan(
+                q,
+                Math.min(resultWindowEnd, SEMANTIC_MAX_DEPTH),
+                /*
+                 * 自用（2026-10-16，**修"筛选阈值和角标不是一个刻度"**）：
+                 * 顶栏滑杆（CompoundSearchParams.minSimilarity）在这里第一次被主进程**真正读取** ✓
+                 * —— 以前全项目只有 zod schema 声明了它，没人用 ✗，滑杆怎么拖都没反应。
+                 * 它一路传到 scoring.ts 当语义结果的硬下限：卡片角标显示的就是同一份
+                 * 原始余弦相似度（PhotoCard: match.score * 100），所以"滑杆 ≥ 40%"
+                 * 与"角标 ≥ 40%"是同一个刻度 ✓（用户原话"筛选阈值和角标不是一个刻度"）。
+                 * 续页（cursor）走同一个 handler，input 里的 minSimilarity 一样带上 ✓。
+                 */
+                { minSimilarity }
+              ),
               aiSearchTimeoutMs,
               aiSearchWasReady
                 ? "AI semantic search"
@@ -1070,28 +1170,12 @@ export const searchCompound = os
             )
             .all();
         })(),
-        // 路 4：人脸识别名搜索（token 化匹配中文姓名）
-        deferSearchBranch(() =>
-          db
-            .select({ id: photos.id, name: faceIdentities.name })
-            .from(photos)
-            .innerJoin(faceVectors, eq(faceVectors.photoId, photos.id))
-            .innerJoin(
-              faceIdentityMembers,
-              eq(faceIdentityMembers.faceVectorId, faceVectors.id)
-            )
-            .innerJoin(
-              faceIdentities,
-              eq(faceIdentities.id, faceIdentityMembers.identityId)
-            )
-            .where(
-              and(
-                isNull(photos.deletedAt),
-                or(...buildTokenConditions(nameTokens, faceIdentities.name, q))
-              )
-            )
-            .all()
-        ),
+        /*
+         * ⚠️ 2026-10-18（会话#9）：原来这里还有「路 4：人脸识别名搜索」——
+         * 靠 `face_identities.name` 匹配人物名。SFace 已整体剔除，
+         * **这条需求由"角色标签搜索"覆盖**（角色 = 「角色」分类下的标签，
+         * 走的是上面那条标签路），所以这里直接去掉 ✗
+         */
       ]);
 
       // 拆解 allSettled 结果，记录降级日志
@@ -1153,10 +1237,6 @@ export const searchCompound = os
         settled[2].status === "fulfilled"
           ? (settled[2].value as { id: number }[])
           : [];
-      const personPhotoRows =
-        settled[3].status === "fulfilled"
-          ? (settled[3].value as { id: number; name: string }[])
-          : [];
 
       if (settled[0].status === "rejected") {
         console.warn(
@@ -1175,12 +1255,6 @@ export const searchCompound = os
           settled[2].reason?.message
         );
       }
-      if (settled[3].status === "rejected") {
-        console.warn(
-          "[Search] Person search degraded:",
-          settled[3].reason?.message
-        );
-      }
 
       const normalizedExactQuery = q.trim().toLocaleLowerCase();
       const isFullMatch = (value: string): boolean =>
@@ -1196,11 +1270,6 @@ export const searchCompound = os
             ]
           : aiResults;
       const exactEvidence: ExactSearchEvidence[] = [
-        ...personPhotoRows.map((row) => ({
-          exact: isFullMatch(row.name),
-          photoId: row.id,
-          source: "person" as const,
-        })),
         ...buildTagSearchEvidence(
           tagPhotoRows,
           SEARCH_PIPELINE_VERSION === "hybrid-v3"
@@ -1353,7 +1422,8 @@ export const searchCompound = os
           .where(inArray(photos.id, allIds))
           .all();
         const photoMap = new Map(photoList.map((p) => [p.id, p]));
-        const combined = rerankedList
+        const hiddenFolderIds = collectHiddenFolderIds();
+        const combined = dedupeRankedByPhotoId(rerankedList)
           .map((r) => {
             const photo = photoMap.get(r.photoId);
             if (!photo) {
@@ -1362,6 +1432,7 @@ export const searchCompound = os
             return {
               ...photo,
               exactMatch: r.exact,
+              inHiddenFolder: hiddenFolderIds.has(photo.folderId ?? -1),
               match: toSearchMatch(r),
               rankScore: r.rankScore,
               similarity: r.similarity,
@@ -1482,7 +1553,8 @@ export const searchCompound = os
         .where(inArray(photos.id, filteredIds))
         .all();
       const photoMap = new Map(photoList.map((p) => [p.id, p]));
-      const combined = filtered
+      const hiddenFolderIds = collectHiddenFolderIds();
+      const combined = dedupeRankedByPhotoId(filtered)
         .map((r) => {
           const photo = photoMap.get(r.photoId);
           if (!photo) {
@@ -1491,6 +1563,7 @@ export const searchCompound = os
           return {
             ...photo,
             exactMatch: r.exact,
+            inHiddenFolder: hiddenFolderIds.has(photo.folderId ?? -1),
             match: toSearchMatch(r),
             rankScore: r.rankScore,
             similarity: r.similarity,

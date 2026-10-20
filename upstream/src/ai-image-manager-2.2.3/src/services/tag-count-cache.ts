@@ -64,22 +64,38 @@ interface TagCountCacheEntry {
   revision: number;
 }
 
-let entry: TagCountCacheEntry | null = null;
+/**
+ * 内存缓存：**每个文件夹一份**（而不是只存最后一份）。
+ *
+ * 之前的单槽写法有个致命后果：侧边栏按 folderId 取缓存，
+ * 于是"点任意文件夹 → 必然未命中 → 重算"。而这条统计是**同步 SQL**，
+ * 实测在用户库上要 **4106ms**（folderId=28），期间主进程被堵住、照片列表也排不进去。
+ * 上限 8 条：一份 counts 约一万多个数字，内存可以忽略。
+ */
+const MAX_CACHE_ENTRIES = 8;
+const cacheEntries = new Map<string, TagCountCacheEntry>();
+
+function cacheKeyOf(folderId: number | null, revision: number): string {
+  return `${folderId ?? "all"}@${revision}`;
+}
 
 /** 取缓存；命中返回 Map，未命中返回 null（调用方负责重算并写回）。*/
 export function readTagCountCache(
   folderId: number | null,
   revision: number
 ): Map<number, number> | null {
+  const key = cacheKeyOf(folderId, revision);
+  const entry = cacheEntries.get(key);
   if (!entry) {
     return null;
   }
-  if (entry.folderId !== folderId || entry.revision !== revision) {
-    return null;
-  }
   if (Date.now() - entry.at > TTL_MS) {
+    cacheEntries.delete(key);
     return null;
   }
+  // LRU：命中即置后，腾位时先淘汰最久没用的
+  cacheEntries.delete(key);
+  cacheEntries.set(key, entry);
   return entry.counts;
 }
 
@@ -89,12 +105,21 @@ export function writeTagCountCache(
   revision: number,
   counts: Map<number, number>
 ): void {
-  entry = { at: Date.now(), counts, folderId, revision };
+  const key = cacheKeyOf(folderId, revision);
+  cacheEntries.delete(key);
+  cacheEntries.set(key, { at: Date.now(), counts, folderId, revision });
+  while (cacheEntries.size > MAX_CACHE_ENTRIES) {
+    const oldest = cacheEntries.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    cacheEntries.delete(oldest);
+  }
 }
 
 /** 清空内存缓存（图库内容变化时调用）。落盘快照不删 —— 它靠指纹自己失效。*/
 export function clearTagCountCache(): void {
-  entry = null;
+  cacheEntries.clear();
 }
 
 function snapshotFilePath(): string {

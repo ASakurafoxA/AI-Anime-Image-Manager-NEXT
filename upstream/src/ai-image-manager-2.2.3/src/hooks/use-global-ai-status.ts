@@ -17,6 +17,27 @@ import { queryClient } from "@/providers/QueryProvider";
 
 export interface GlobalAiProgress {
   canCancel: boolean;
+  /**
+   * 自用（2026-10）：任务被**暂停**（当前只有打标会暂停）。
+   * 暂停时 isRunning 为 false，界面必须靠这个字段决定"进度条还要不要显示"
+   * —— 否则按了暂停整条顶栏就消失，用户再也找不到进度和继续入口。
+   */
+  isPaused?: boolean;
+  /**
+   * 自用（2026-10-20 · 会话#10）：**被暂停的是哪个任务**。
+   *
+   * 为什么不能只看 `phase`：暂停后 `phase` 只是个"类任务"标签，而「继续」
+   * 必须调对接口 —— 打标要 `batchGenerateTags`（从断点续跑），建向量要
+   * `resumeAiIndexing`。早先按 `phase === "embedding"` 猜，暂停打标时被猜成
+   * "建向量"，点继续调用的是 resumeAiIndexing → 打标根本没动
+   *（用户实测："点继续也不会继续"）。
+   */
+  pausedKind?: "embedding" | "tagging" | null;
+  /**
+   * 自用（2026-10-18 · 会话#9）：任务**还在启动**（识别进程正在各自加载模型）。
+   * 界面靠它把进度条切成"走马灯"，而不是定在 0% 上看着像卡住。
+   */
+  isStarting?: boolean;
   /** Whether any background AI task is currently active. */
   isRunning: boolean;
   /**
@@ -34,7 +55,8 @@ export interface GlobalAiProgress {
     | "loading-model"
     | "embedding"
     | "tagging"
-    | "face-detection"
+    /** 自用（会话#9）：人物页「获取全库角色特征」（CCIP 全库重算，几小时级）。 */
+    | "character-features"
     | "import-queue";
   /** Human-readable status line for the UI. */
   statusText: string;
@@ -64,6 +86,8 @@ interface ScanPayload {
 interface AiProgressPayload {
   channel: "ai-progress";
   downloadPercent?: number;
+  /** 自用（2026-10）：暂停标记（暂停建向量/打标时由主进程主动推送）。 */
+  isPaused?: boolean;
   phase:
     | "idle"
     | "loading"
@@ -79,11 +103,28 @@ interface AiProgressPayload {
   total: number;
 }
 
-interface FaceProgressPayload {
-  channel: "face-detection-progress";
-  phase: "idle" | "running" | "complete";
-  processed: number;
+/**
+ * 自用（2026-10-18 · 会话#9）：CCIP「获取全库角色特征」的进度。
+ *
+ * 与上面几条不同，它**不是** postMessage 推送，而是主进程里的一份内存计数
+ * （`getCcipBuildProgress()`），所以只能由渲染进程按秒轮询。
+ */
+interface CharacterFeatureProgressPayload {
+  done: number;
+  embedded: number;
+  etaSeconds: number | null;
+  failed: number;
+  photosPerSecond: number | null;
+  running: boolean;
+  /** 还在启动识别进程（每个进程各自加载一次模型）。 */
+  starting?: boolean;
   total: number;
+  /** 这次跑的显卡名字（顶栏写明，一眼看出走没走对路）。 */
+  device?: string | null;
+  /** 实际开了几个识别进程。 */
+  workers?: number;
+  workersReady?: number;
+  workersTotal?: number;
 }
 
 interface QueueTask {
@@ -181,17 +222,23 @@ function processQueueHistory(
 interface ProgressSnapshot {
   aiPercent: number;
   aiPhase: AiProgressPayload["phase"];
+  /** 自用（2026-10）：当前是否处于"已暂停"。 */
+  aiIsPaused: boolean;
   /** 自用（问题 4）：原始张数，用于算速度/预估。 */
   aiProcessed: number | null;
   aiText: string;
   aiTotal: number | null;
-  facePercent: number;
-  faceText: string;
+  /** 自用（会话#9）：角色特征（CCIP）全库构建 —— 是否在跑 / 张数 / 文案 */
+  ccipPercent: number;
+  ccipProcessed: number | null;
+  ccipStarting: boolean;
+  ccipText: string;
+  ccipTotal: number | null;
+  /** 自用（2026-10-17）：角色识别的原始张数，供顶栏算速度 / 预估剩余时间 ✓ */
   hasAi: boolean;
-  hasFace: boolean;
+  hasCcip: boolean;
   hasQueue: boolean;
   hasScan: boolean;
-  isFaceRunning: boolean;
   isScanning: boolean;
   queueCurrent: QueueTask | null;
   queuePending: number;
@@ -237,7 +284,7 @@ function getAiSnapshot(ai: AiProgressPayload | null) {
     } else if (ai.phase === "embedding") {
       aiPct = clampPct(ai.processed, ai.total);
       aiText = `AI 特征提取 ${ai.processed}/${ai.total}`;
-    } else if (ai.phase === "tagging") {
+    } else if (ai.phase === "tagging" || ai.phase === "tagging-paused") {
       aiPct = clampPct(ai.processed, ai.total);
       // 自用（方案 A · 问题 6）：累计口径 + 本次还需，避免看起来像从头重跑
       aiText = `AI 标签生成 ${ai.processed}/${ai.total}（还需 ${Math.max(0, ai.total - ai.processed)}）`;
@@ -245,6 +292,7 @@ function getAiSnapshot(ai: AiProgressPayload | null) {
   }
   return {
     hasAi: aiActive,
+    aiIsPaused: ai?.isPaused === true,
     aiPhase: ai?.phase ?? "idle",
     aiPercent: aiPct,
     // 自用（问题 4）：把原始张数一并带出去（特征提取/打标才有意义）
@@ -253,19 +301,52 @@ function getAiSnapshot(ai: AiProgressPayload | null) {
     aiTotal: ai?.total ?? null,
   };
 }
-
-function getFaceSnapshot(
-  face: FaceProgressPayload | null,
-  faceRunning: boolean
-) {
-  const faceActive = face !== null && face.phase === "running" && faceRunning;
-  const facePct = face ? clampPct(face.processed, face.total) : 0;
-  const faceText = face ? `人脸检测中 ${face.processed}/${face.total}` : "";
+/**
+ * 自用（2026-10-18 · 会话#9）：角色特征（CCIP）全库构建的快照。
+ *
+ * 用户口径：「没有进度条我也不知道它识别特征到什么程度、有没有出问题」
+ * —— 所以这里除了百分比，还要把 **已处理/总数/已写入/失败** 都摆到顶栏上，
+ * 失败数不为 0 时直接把「失败 N 张」写进文案，肉眼就能看出是不是出了问题 ✓。
+ */
+function getCcipSnapshot(ccip: CharacterFeatureProgressPayload | null) {
+  const running = ccip?.running === true;
+  const total = ccip?.total ?? 0;
+  const done = ccip?.done ?? 0;
+  const failed = ccip?.failed ?? 0;
+  /*
+   * 自用（2026-10-18 · 会话#9）：**启动阶段**要单独说清楚。
+   * 每个识别进程都要各自加载一次模型，4 个进程并行加载要十几秒；
+   * 这段时间如果只显示"0/65003、0 张/秒"，用户会以为卡死 ✗
+   * → 显示「正在启动识别进程 2/4…」，并且用走马灯（不显示百分比）。
+   */
+  const starting =
+    running && total > 0 && (ccip?.starting === true || done === 0);
+  const device = ccip?.device ? ` · 显卡：${ccip.device}` : "";
+  const workers = ccip?.workers ? ` · ${ccip.workers} 进程` : "";
+  let text = "";
+  if (starting) {
+    const ready = ccip?.workersReady ?? 0;
+    const totalWorkers = ccip?.workersTotal ?? 0;
+    text =
+      totalWorkers > 0
+        ? `角色特征提取：正在启动识别进程 ${ready}/${totalWorkers}（每个进程要加载一次模型）${device}`
+        : "角色特征提取：正在统计待处理照片...";
+  } else if (running) {
+    text =
+      total > 0
+        ? `角色特征提取 ${done}/${total}（还需 ${Math.max(0, total - done)}）${device}${workers}`
+        : "角色特征提取：正在统计待处理照片...";
+    if (failed > 0) {
+      text += ` · 失败 ${failed} 张`;
+    }
+  }
   return {
-    hasFace: faceActive,
-    isFaceRunning: faceRunning,
-    facePercent: facePct,
-    faceText,
+    hasCcip: running,
+    ccipPercent: total > 0 ? clampPct(done, total) : 0,
+    ccipProcessed: running && !starting ? done : null,
+    ccipStarting: starting,
+    ccipText: text,
+    ccipTotal: running && !starting && total > 0 ? total : null,
   };
 }
 
@@ -290,14 +371,13 @@ function getQueueSnapshot(
 function buildSnapshot(
   scan: ScanPayload | null,
   ai: AiProgressPayload | null,
-  face: FaceProgressPayload | null,
-  faceRunning: boolean,
+  ccip: CharacterFeatureProgressPayload | null,
   queue: QueueStatusPayload | null,
   queueRunning: boolean
 ): ProgressSnapshot {
   const scanSnap = getScanSnapshot(scan);
   const aiSnap = getAiSnapshot(ai);
-  const faceSnap = getFaceSnapshot(face, faceRunning);
+  const ccipSnap = getCcipSnapshot(ccip);
   const queueSnap = getQueueSnapshot(queue, queueRunning);
 
   return {
@@ -307,14 +387,17 @@ function buildSnapshot(
     scanText: scanSnap.scanText,
     hasAi: aiSnap.hasAi,
     aiPhase: aiSnap.aiPhase,
+    aiIsPaused: aiSnap.aiIsPaused,
     aiPercent: aiSnap.aiPercent,
     aiProcessed: aiSnap.aiProcessed,
     aiText: aiSnap.aiText,
     aiTotal: aiSnap.aiTotal,
-    hasFace: faceSnap.hasFace,
-    isFaceRunning: faceSnap.isFaceRunning,
-    facePercent: faceSnap.facePercent,
-    faceText: faceSnap.faceText,
+    hasCcip: ccipSnap.hasCcip,
+    ccipPercent: ccipSnap.ccipPercent,
+    ccipProcessed: ccipSnap.ccipProcessed,
+    ccipStarting: ccipSnap.ccipStarting,
+    ccipText: ccipSnap.ccipText,
+    ccipTotal: ccipSnap.ccipTotal,
     hasQueue: queueSnap.hasQueue,
     queueCurrent: queueSnap.queueCurrent,
     queuePending: queueSnap.queuePending,
@@ -325,10 +408,10 @@ function buildSnapshot(
 /**
  * Resolution order (highest priority first):
  *   1. Queue running (import + AI) — the user's explicit action
- *   2. Face detection running
- *   3. SigLIP model loading / embedding
- *   4. File scan / indexing
- *   5. Idle
+ *   3. CCIP character-feature build (hours-long, must never be a black box)
+ *   4. SigLIP model loading / embedding / tagging
+ *   5. File scan / indexing
+ *   6. Idle
  */
 /**
  * 自用（问题 4）：`deriveStatus` 只管"阶段 / 百分比 / 文案"，
@@ -358,13 +441,48 @@ function deriveStatus(snap: ProgressSnapshot): DerivedGlobalAiProgress {
     };
   }
 
-  if (snap.hasFace && snap.isFaceRunning) {
+  /*
+   * 自用（2026-10-18 · 会话#9）：CCIP 全库「获取角色特征」。
+   *
+   * 这一步动辄几小时，用户原话：「没有进度条我也不知道他识别特征到什么程度，
+   * 有没有出问题」→ 所以它的优先级放在角色识别之后、建向量/打标之前：
+   * 导入、角色识别这类"用户正在盯着点"的短任务先占顶栏，剩下的长时间占顶栏 ✓。
+   */
+  if (snap.hasCcip) {
     return {
       canCancel: false,
       isRunning: true,
-      percent: snap.facePercent,
-      statusText: snap.faceText,
-      phase: "face-detection",
+      isStarting: snap.ccipStarting,
+      percent: snap.ccipPercent,
+      statusText: snap.ccipText,
+      phase: "character-features",
+    };
+  }
+
+  /*
+   * 自用（2026-10）：**先判断"已暂停"**，再判断各运行阶段。
+   * 暂停时 isRunning=false（不算在跑），但 isPaused=true —— 顶栏靠它继续显示，
+   * 用户也才有地方点「继续」。
+   *
+   * 2026-10-20（会话#10）：**被暂停的是谁要单独带上**（`pausedKind`）。
+   * 之前这里用 `phase === "tagging" ? "tagging" : "embedding"` 猜，
+   * 而暂停打标时相位是 `tagging-paused` → 猜成 embedding →
+   * 顶栏同时冒出"暂停/已暂停/继续"三个键、点「继续」调的又是建向量的接口，
+   * 打标根本没动（用户实测："点继续也不会继续"）。
+   */
+  if (snap.hasAi && snap.aiIsPaused) {
+    const taggingPaused =
+      snap.aiPhase === "tagging" || snap.aiPhase === "tagging-paused";
+    return {
+      canCancel: false,
+      isPaused: true,
+      pausedKind: taggingPaused ? "tagging" : "embedding",
+      isRunning: false,
+      percent: snap.aiPercent,
+      statusText: `${
+        snap.aiText || (taggingPaused ? "AI 标签生成" : "AI 特征提取")
+      } · 已暂停`,
+      phase: taggingPaused ? "tagging" : "embedding",
     };
   }
 
@@ -385,6 +503,23 @@ function deriveStatus(snap: ProgressSnapshot): DerivedGlobalAiProgress {
       percent: snap.aiPercent,
       statusText: snap.aiText,
       phase: "embedding",
+    };
+  }
+
+  /*
+   * 自用（2026-10）：暂停打标时相位是 `tagging-paused`（见 ipc/photos/handlers/ai.ts），
+   * 以前这里没有这个分支 → 会被当成 idle → isRunning=false → 顶栏整条消失。
+   * 现在显式处理：不算"运行中"，但标记为"已暂停"，让进度条继续显示。
+   */
+  if (snap.hasAi && snap.aiPhase === "tagging-paused") {
+    return {
+      canCancel: false,
+      isPaused: true,
+      pausedKind: "tagging",
+      isRunning: false,
+      percent: snap.aiPercent,
+      statusText: `${snap.aiText || "AI 标签生成"} · 已暂停`,
+      phase: "tagging",
     };
   }
 
@@ -433,12 +568,13 @@ function useGlobalAiStatusState(): GlobalAiProgress {
   const { t } = useTranslation();
   const [scan, setScan] = useState<ScanPayload | null>(null);
   const [ai, setAi] = useState<AiProgressPayload | null>(null);
-  const [face, setFace] = useState<FaceProgressPayload | null>(null);
-  const [faceRunning, setFaceRunning] = useState(false);
+  /** 自用（会话#9）：CCIP 全库角色特征构建的进度（轮询拿到的快照）。 */
+  const [ccip, setCcip] = useState<CharacterFeatureProgressPayload | null>(
+    null
+  );
   const [queue, setQueue] = useState<QueueStatusPayload | null>(null);
   const [queueRunning, setQueueRunning] = useState(false);
 
-  const faceActiveRef = useRef(false);
   const lastAiPhaseRef = useRef<AiProgressPayload["phase"]>("idle");
   const prevQueueDoneIdsRef = useRef<Set<number>>(new Set());
   const seenTerminalTaskIdsRef = useRef<Set<number>>(new Set());
@@ -512,18 +648,6 @@ function useGlobalAiStatusState(): GlobalAiProgress {
     }
   }, []);
 
-  const handleFaceMsg = useCallback((payload: FaceProgressPayload) => {
-    setFace(payload);
-    faceActiveRef.current = payload.phase === "running";
-    setFaceRunning(payload.phase === "running");
-    if (payload.phase === "complete") {
-      setTimeout(() => {
-        setFace((prev) => (prev?.phase === "complete" ? null : prev));
-        setFaceRunning(false);
-      }, 3000);
-    }
-  }, []);
-
   // ── postMessage listener ─────────────────────────────────────
 
   const handleMessage = useCallback(
@@ -554,17 +678,6 @@ function useGlobalAiStatusState(): GlobalAiProgress {
           queryClient.invalidateQueries({ queryKey: ["aiStatus"] });
           queryClient.invalidateQueries({ queryKey: ["dashboard", "stats"] });
           break;
-        case "face-detection-progress":
-          handleFaceMsg(e.data as FaceProgressPayload);
-          break;
-        case "face-detection-done":
-          setFace(null);
-          setFaceRunning(false);
-          faceActiveRef.current = false;
-          queryClient.invalidateQueries({ queryKey: ["faces", "identities"] });
-          queryClient.invalidateQueries({
-            queryKey: ["faces", "review-queue"],
-          });
           break;
         case "import-queue-status":
           handleQueueStatus(e.data as QueueStatusPayload);
@@ -573,7 +686,7 @@ function useGlobalAiStatusState(): GlobalAiProgress {
           break;
       }
     },
-    [handleQueueStatus, handleScanMsg, handleFaceMsg, t]
+    [handleQueueStatus, handleScanMsg, t]
   );
 
   useEffect(() => {
@@ -590,16 +703,14 @@ function useGlobalAiStatusState(): GlobalAiProgress {
 
     async function init() {
       try {
-        const [aiStatus, faceStatus, queueStatus] = await Promise.all([
+        const [aiStatus, queueStatus] = await Promise.all([
           ipc.client.photos.getAiProgress({}).catch(() => null),
-          ipc.client.faces.getDetectionProgress({}).catch(() => null),
           ipc.client.photos.getImportQueueStatus({}).catch(() => null),
         ]);
         if (cancelled) {
           return;
         }
         applyInitAi(aiStatus);
-        applyInitFace(faceStatus);
         applyInitQueue(queueStatus);
       } catch {
         /* best-effort */
@@ -619,18 +730,6 @@ function useGlobalAiStatusState(): GlobalAiProgress {
           total: p.total,
           downloadPercent: p.downloadPercent,
         });
-      }
-    }
-
-    function applyInitFace(raw: unknown) {
-      if (!raw) {
-        return;
-      }
-      const p = raw as FaceProgressPayload;
-      if (p.phase === "running") {
-        setFace(p);
-        faceActiveRef.current = true;
-        setFaceRunning(true);
       }
     }
 
@@ -655,17 +754,82 @@ function useGlobalAiStatusState(): GlobalAiProgress {
     };
   }, []);
 
+  /*
+   * 自用（2026-10-18 · 会话#9）：CCIP 全库「获取角色特征」的进度轮询。
+   *
+   * 为什么只能轮询：这份进度是主进程里的内存计数（getCcipBuildProgress），
+   * 没有 postMessage 通道；1 秒一次的开销可以忽略，而任务本身要跑几小时。
+   * 空闲时降到 2 秒 —— 既能及时"发现有人开始跑"，也不至于一直白转。
+   */
+  const ccipRunningRef = useRef(false);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      try {
+        const raw = (await ipc.client.photos.getCharacterFeatureProgress(
+          {}
+        )) as CharacterFeatureProgressPayload;
+        if (stopped) {
+          return;
+        }
+        const running = raw?.running === true;
+        ccipRunningRef.current = running;
+        // 没在跑就置空，顶栏最迟 2 秒后自己收起来（不留一条僵尸进度）
+        setCcip(running ? raw : null);
+      } catch {
+        /* 轮询失败不打扰用户（主进程忙的时候会偶发） */
+      } finally {
+        if (!stopped) {
+          timer = setTimeout(
+            () => void tick(),
+            ccipRunningRef.current ? 1000 : 2000
+          );
+        }
+      }
+    };
+
+    void tick();
+    return () => {
+      stopped = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, []);
+
   // ── Derive unified status ──────────────────────────────────────
 
-  const snap = buildSnapshot(scan, ai, face, faceRunning, queue, queueRunning);
+  const snap = buildSnapshot(scan, ai, ccip, queue, queueRunning);
   const derived = deriveStatus(snap);
-  // 自用（问题 4）：把"按张数推进"的两个阶段的原始张数挂上去，供界面算速度/预估。
-  const countable = derived.phase === "embedding" || derived.phase === "tagging";
-  return {
-    ...derived,
-    processed: countable ? snap.aiProcessed : null,
-    total: countable ? snap.aiTotal : null,
-  };
+  /*
+   * 自用（问题 4 / 2026-10-17）：把"按张数推进"的阶段的原始张数挂上去，
+   * 供界面算 速度 / 预估剩余时间 ✓。
+   *
+   * ⚠️ 2026-10-18（会话#9）：SFace 人脸链路已整体剔除，`face-detection` 这一档不再存在 ✓
+   * 现在只有 embedding / tagging（建向量、打标）+ character-features（CCIP 全库构建）。
+   */
+  const countableSource =
+    derived.phase === "embedding" || derived.phase === "tagging"
+      ? "ai"
+      : derived.phase === "character-features"
+        ? "ccip"
+        : null;
+  const processed =
+    countableSource === "ai"
+      ? snap.aiProcessed
+      : countableSource === "ccip"
+        ? snap.ccipProcessed
+        : null;
+  const total =
+    countableSource === "ai"
+      ? snap.aiTotal
+      : countableSource === "ccip"
+        ? snap.ccipTotal
+        : null;
+  return { ...derived, processed, total };
 }
 
 export function GlobalAiStatusProvider({ children }: { children: ReactNode }) {

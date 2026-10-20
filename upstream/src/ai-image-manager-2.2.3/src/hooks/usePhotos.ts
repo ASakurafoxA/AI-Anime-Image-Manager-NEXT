@@ -6,6 +6,8 @@ const PAGE_SIZE = 100;
 
 interface UsePhotosParams {
   enabled?: boolean;
+  /** 自用：按标签检索时是否也排除隐藏文件夹（见 shared.ts 的同名参数）。 */
+  excludeHiddenFolders?: boolean;
   favoriteOnly?: boolean;
   folderId?: number | null;
   order?: "asc" | "desc";
@@ -26,6 +28,7 @@ interface UsePhotosParams {
  */
 export function usePhotos({
   folderId,
+  excludeHiddenFolders,
   ungroupedOnly = false,
   tagId,
   tagIds,
@@ -45,6 +48,7 @@ export function usePhotos({
         tagIds: tagIds ?? null,
         tagMode: tagMode ?? "or",
         favoriteOnly: favoriteOnly ?? false,
+        excludeHiddenFolders: excludeHiddenFolders ?? false,
         sort,
         order,
       },
@@ -57,6 +61,7 @@ export function usePhotos({
         tagIds: tagIds?.length ? tagIds : undefined,
         tagMode: tagIds?.length ? tagMode : undefined,
         favoriteOnly: favoriteOnly || undefined,
+        excludeHiddenFolders: excludeHiddenFolders || undefined,
         sort,
         order,
         offset: pageParam as number,

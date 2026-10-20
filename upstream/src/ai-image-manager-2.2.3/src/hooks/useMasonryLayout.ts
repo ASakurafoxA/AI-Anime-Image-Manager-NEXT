@@ -49,6 +49,13 @@ interface MasonryLayoutCache {
   inputSnapshot: MasonryLayoutInputSnapshot[];
   itemCount: number;
   layoutKey: string;
+  /**
+   * 自用：续页（`canReuse`）是从半途接着排的 —— 「层内轮转」的进度必须一起带过去 ✓，
+   * 否则续页那一段又会从第 0 列重新开始 ✗（详见 computeLayout 上方的长注释 ✓）。
+   */
+  levelFlattened: boolean;
+  levelPick: number;
+  levelTop: number | null;
   positions: MasonryItem[];
   showGroupHeaders: boolean;
   visibilityIndex: number[];
@@ -105,6 +112,35 @@ function hasMatchingHeaderPrefix(
   );
 }
 
+/*
+ * 自用（2026-10-16，用户反馈 ✓）：「全部图片」搜索之后，**结果挤成一列、图片很窄** ✗。
+ * 用户原话：「他现在展示是这样的一列下来，改成像主界面一样平铺在界面」✓。
+ *
+ * 真因不在列数（列数下限本来就是 2 ✗），而在**分组标题把照片全塞进第 0 列** ✗：
+ *   ① 搜索结果是**按相似度**排序的（`ipc/photos/handlers/search.ts` 里
+ *      `combined.sort(...)`），相邻两张的拍摄月份几乎总不同 ✗；
+ *      而主图库按要求是**按日期**排序的，同一个月的照片连成一片 ✓。
+ *   ② `buildPhotoGroupHeaders` 一遇到「月份变化」就插一个标题 → 搜索结果里
+ *      **几乎每张照片自带一个分组标题** ✗
+ *      （实测：12 张跨月照片 → 12 个标题；12 张同月 → 1 个标题 ✓）。
+ *   ③ 分组边界会把**各列拉到同一高度**（`columnHeights.fill(newBase)` ✓，
+ *      标题要横盖整行，这一步本身是对的 ✓）；但紧接着选列用的是
+ *      「谁比第 0 列更矮」（`columnHeights[column] < columnHeights[shortestColumn]`，
+ *      **相等不成立** ✗）→ 各列等高时**永远返回第 0 列** ✗；
+ *      放下第一张后，下一个分组标题又把它拉平、又回到第 0 列……
+ *      **一整列到底** ✗。实测（jsdom，容器 1200px → 5 列）：12 张 230px 宽的卡片
+ *      左偏移全是 `0px`，竖着排成一条 —— 正是用户截图里那副"一列、很窄、挤在左边" ✗。
+ * 所以「搜索（相似度序 → 一堆标题）塌成一列」而「主图库（日期序 → 少数标题）正常平铺」✓。
+ *
+ * 修法：**只改“落到哪一列”**，列数 / 列宽 / 分组标题的语义全都不动 ✓。
+ *   ① 分组边界照旧把各列对齐到同一高度（标题横盖整行 ✓）；
+ *   ② 但各列**等高**时不再一律选第 0 列：用「层内轮转」挑列 ✓——
+ *      这一层上一次放到第 N 列，下一次就放到第 N+1 列 ✓，
+ *      于是每个分组标题的照片会依次铺到第 1、2、3…列，不再叠成一列 ✓；
+ *   ③ 判断“等高”只看**当前最短的那一档**（带 0.5px 容差 ✓）：
+ *      同一分组里后续照片会自然落到更高的列上，于是走原来的“谁最短谁接” ✓——
+ *      分组内的多张照片行为、以及主图库的观感都保持不变 ✓。
+ */
 /** Core masonry calculation. `groupHeaders` always use global item indexes. */
 function computeLayout(
   items: Array<{ fullWidth?: boolean; width: number; height: number }>,
@@ -116,12 +152,20 @@ function computeLayout(
   showGroupHeaders: boolean,
   initialColumnHeights?: number[],
   existingHeaders?: HeaderPosition[],
-  existingVisibilityIndex?: number[]
+  existingVisibilityIndex?: number[],
+  levelResume: {
+    levelFlattened: boolean;
+    levelPick: number;
+    levelTop: number | null;
+  } = { levelFlattened: false, levelPick: 0, levelTop: null }
 ): {
   positions: MasonryItem[];
   columnHeights: number[];
   headerPositions: HeaderPosition[];
   visibilityIndex: number[];
+  levelFlattened: boolean;
+  levelPick: number;
+  levelTop: number | null;
 } {
   const headerHeight = 36;
   const positions: MasonryItem[] = [];
@@ -132,6 +176,14 @@ function computeLayout(
   const headerMap = new Map(
     (groupHeaders ?? []).map((header) => [header.beforeIndex, header.label])
   );
+  // 自用：分组边界把各列对齐出来的那个高度叫“一层”✓；
+  // 同一层里按列轮转放 ✓ —— 多如牛毛的分组标题就是这么被摊到各列的 ✓。
+  // `levelTop === null` 表示这一层已经排满（每列都在这一高度放过一张 ✓）。
+  let levelTop: number | null = levelResume.levelTop;
+  let levelPick = levelResume.levelPick;
+  // 自用：本层是否有列真的被“对齐”过 —— 只有对齐过才需要轮转 ✓。
+  //（没有分组标题时首屏各列本来都是 0，那不是“层”，不能轮转 ✓。）
+  let levelFlattened = levelResume.levelFlattened;
 
   for (let i = 0; i < items.length; i++) {
     const globalIndex = startIndex + i;
@@ -139,10 +191,26 @@ function computeLayout(
     if (headerLabel !== undefined) {
       const maxHeight = Math.max(...columnHeights);
       headerPositions.push({ label: headerLabel, top: maxHeight });
-      const newBase = showGroupHeaders
-        ? maxHeight + headerHeight + gap
-        : maxHeight;
-      columnHeights.fill(newBase);
+      if (showGroupHeaders) {
+        /*
+         * 自用（2026-10-16，**修"搜索结果向右下走成台阶"** ✗→✓）：
+         *
+         * 只有**真的会画出月份标题**时，才需要"把各列拉平" ✓（标题要横盖整行 ✓）。
+         * 关掉分组时标题根本不显示 ✗ —— 但这里以前**照样** fill + 开新层 ✗，
+         * 而搜索结果（按相似度排序 ✓）的月份边界**几乎每张一个** ✓
+         * → 每张都被当成"新的一层" ✓ → 一张一列地往右下走 → **台阶** ✗（用户截图 ✓）。
+         *
+         * 所以：关掉分组时**完全不碰布局** ✓ —— 回到普通的"谁最短谁接"瀑布流 ✓，
+         * 也就是用户要的"和主界面一样平铺" ✓。
+         * （打开分组时行为不变 ✓：拉平 + 层内轮转，标题才会被摊到各列 ✓。）
+         */
+        const newBase = maxHeight + headerHeight + gap;
+        columnHeights.fill(newBase);
+        // 自用：记住这一层的高度 ✓；轮转进度（levelPick）跨分组保留 ✓ ——
+        // 否则每个分组都从第 0 列重新开始，搜索结果还是会全挤在第 0 列 ✗。
+        levelTop = newBase;
+        levelFlattened = true;
+      }
     }
 
     const item = items[i];
@@ -156,6 +224,10 @@ function computeLayout(
         width,
       });
       columnHeights.fill(top + item.height + gap);
+      // 整行卡片之后所有列又对齐了，等价于新的一层 ✓。
+      levelTop = top + item.height + gap;
+      levelPick = 0;
+      levelFlattened = true;
       continue;
     }
     const rawAspect =
@@ -169,14 +241,47 @@ function computeLayout(
         shortestColumn = column;
       }
     }
+    let targetColumn = shortestColumn;
+    // 自用：① 各列与“最短列”等高（刚过分组标题的那种情况 ✓）→ 按层内轮转挑列 ✓；
+    //       ② 否则一律走原来的「最短列」✓（分组内多张 / 主图库的观感不变 ✓）。
+    if (
+      levelFlattened &&
+      levelTop !== null &&
+      Math.abs(columnHeights[shortestColumn] - levelTop) < 0.5
+    ) {
+      const start = levelPick % columnCount;
+      for (let offset = 0; offset < columnCount; offset++) {
+        const column = (start + offset) % columnCount;
+        if (Math.abs(columnHeights[column] - levelTop) < 0.5) {
+          targetColumn = column;
+          break;
+        }
+      }
+      // 只有真按轮转放下去了，才把轮转推进一格 ✓（否则本层就此排满 ✓）。
+      if (targetColumn === start) {
+        levelPick++;
+      }
+      // 自用：本层还有空列吗？没有就把 `levelTop` 置空，
+      // 之后重新回到原来的「最短列」（正常往下堆 ✓）。
+      let levelFree = false;
+      for (let column = 0; column < columnCount; column++) {
+        if (Math.abs(columnHeights[column] - levelTop) < 0.5) {
+          levelFree = true;
+          break;
+        }
+      }
+      if (!levelFree) {
+        levelTop = null;
+      }
+    }
 
     positions.push({
       height: itemHeight,
-      left: shortestColumn * (colWidth + gap),
-      top: columnHeights[shortestColumn],
+      left: targetColumn * (colWidth + gap),
+      top: columnHeights[targetColumn],
       width: colWidth,
     });
-    columnHeights[shortestColumn] += itemHeight + gap;
+    columnHeights[targetColumn] += itemHeight + gap;
   }
 
   return {
@@ -189,6 +294,9 @@ function computeLayout(
       positions,
       existingVisibilityIndex
     ),
+    levelFlattened,
+    levelPick,
+    levelTop,
   };
 }
 
@@ -208,6 +316,9 @@ function createCache(
     columnHeights: number[];
     headerPositions: HeaderPosition[];
     visibilityIndex: number[];
+    levelFlattened: boolean;
+    levelPick: number;
+    levelTop: number | null;
   }
 ): MasonryLayoutCache {
   return {
@@ -219,6 +330,9 @@ function createCache(
     inputSnapshot: snapshotLayoutInputs(items),
     itemCount: items.length,
     layoutKey,
+    levelFlattened: result.levelFlattened,
+    levelPick: result.levelPick,
+    levelTop: result.levelTop,
     positions: result.positions,
     showGroupHeaders,
     visibilityIndex: result.visibilityIndex,
@@ -281,7 +395,14 @@ export function useMasonryLayout(
         showGroupHeaders,
         previous.columnHeights,
         previous.headerPositions,
-        previous.visibilityIndex
+        previous.visibilityIndex,
+        // 自用：接着上一轮的“层内轮转”继续排 ✓。
+        // 丢了它，续页（无限滚动）那一段又会从第 0 列重新开始 ✗。
+        {
+          levelFlattened: previous.levelFlattened,
+          levelPick: previous.levelPick,
+          levelTop: previous.levelTop,
+        }
       );
       const result = {
         ...appended,

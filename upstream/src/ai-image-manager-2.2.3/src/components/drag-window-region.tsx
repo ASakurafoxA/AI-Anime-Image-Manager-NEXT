@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useState } from "react";
+﻿import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { getPlatform } from "@/actions/app";
 import {
@@ -12,7 +12,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import icon from "../../assets/icon.png";
+import icon from "../../assets/icon-tray.png";
 
 interface DragWindowRegionProps {
   immersive?: boolean;
@@ -90,12 +90,13 @@ export default function DragWindowRegion({
       >
         {title && !isMacOS && (
           <div className="flex min-w-0 flex-1 select-none items-center gap-1.5 whitespace-nowrap p-2 text-muted-foreground text-xs">
+            {/* 自用（2026-10-18）：用户反馈"软件里的再大点" → 标题栏图标 14 → 18px ✓ */}
             <img
               alt=""
-              className="h-3.5 w-3.5"
-              height={14}
+              className="h-5 w-5"
+              height={20}
               src={icon}
-              width={14}
+              width={20}
             />
             <span className="min-w-0 truncate">{title}</span>
           </div>

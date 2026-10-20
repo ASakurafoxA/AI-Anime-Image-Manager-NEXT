@@ -1,4 +1,4 @@
-import { PRIVATE_BUILD } from "@/config/private-build";
+﻿import { PRIVATE_BUILD } from "@/config/private-build";
 import {
   ChevronLeft,
   ChevronRight,
@@ -70,6 +70,14 @@ interface PhotoLightboxProps {
   initialIndex: number;
   modalOpen?: boolean;
   onAddToAlbum?: (photoId: number) => void;
+  /**
+   * 自用（2026-10）：**点击图片以外的空白**时回调（不传则整块遮罩不响应点击，
+   * 与原来完全一致 —— 主图库那边就不传，行为一个字不变 ✓）。
+   *
+   * 用途：角色识别对话框里嵌入大图查看时，用户点空白 = 退出大图回到分组列表。
+   * 注意点击**图片本身**、按钮、顶部/底部控件条、右侧信息面板都**不算**空白 ✓。
+   */
+  onBackdropClick?: () => void;
   onClose: (result: { index: number; photoId: number }) => void;
   onToggleFavorite?: (photoId: number, nextFavorite: boolean) => Promise<void>;
   open: boolean;
@@ -128,6 +136,7 @@ export const PhotoLightbox = memo(function PhotoLightbox({
   modalOpen = false,
   open,
   onClose,
+  onBackdropClick,
   onToggleFavorite,
   onAddToAlbum,
   showThumbnailsInitially = false,
@@ -760,6 +769,35 @@ export const PhotoLightbox = memo(function PhotoLightbox({
       aria-label={t("lightboxReview")}
       aria-modal="true"
       className={`lightbox-interactive fixed inset-0 z-[1000] flex overflow-hidden bg-[#09090b] text-white outline-none ${controlsVisible ? "cursor-default" : "cursor-none"}`}
+      onClick={(event) => {
+        /*
+         * 自用（2026-10，用户要求）：点"图片以外的空白"→ 退出大图回到列表。
+         *
+         * ⚠️ 2026-10-18（会话#9 用户口径）：**所有模式下都生效** ——
+         * 原来只在调用方传了 `onBackdropClick` 时才生效（主图库不传 → 点了没反应 ✗），
+         * 现在没传就**默认按"关闭大图"处理**（`onClose`），调用方仍可用 `onBackdropClick` 覆盖 ✓
+         *
+         * 判定"空白"：点击目标既不是图片、也不是任何交互元素 / 控件条 / 信息面板。
+         * 这些排除项缺一不可 —— 否则点翻页按钮、点信息面板里的文字都会把大图关掉 ✗。
+         * 图片两侧的**黑边**同样算"空白"→ 点了就退出 ✓
+         */
+        const exitLightbox = onBackdropClick ?? requestClose;
+        if (!exitLightbox) {
+          return;
+        }
+        const target = event.target as HTMLElement | null;
+        if (!target) {
+          return;
+        }
+        if (
+          target.closest(
+            "[data-lightbox-image], button, a, input, select, textarea, [role='button'], [role='menu'], [data-lightbox-chrome], header, footer, aside"
+          )
+        ) {
+          return;
+        }
+        exitLightbox();
+      }}
       onContextMenu={(event) => {
         const target = event.target as HTMLElement;
         if (!target.closest("[data-lightbox-image]")) {
@@ -855,7 +893,9 @@ export const PhotoLightbox = memo(function PhotoLightbox({
                   }}
                   sideOffset={6}
                 >
-                  {onAddToAlbum && (
+                  {/* 自用版：去掉「添加到相册」（与右键菜单、多选操作栏保持一致；
+                      之前只改了那两处，大图模式这个入口漏掉了） */}
+                  {onAddToAlbum && !PRIVATE_BUILD.hidePhotoMenuExtras && (
                     <MenuButton
                       icon={<Rows3 className="h-4 w-4" />}
                       label={t("addToAlbum")}

@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import chokidar, { type FSWatcher } from "chokidar";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import exifr from "exifr";
 import PQueue from "p-queue";
 import sharp from "sharp";
 import { getDatabase } from "@/db";
@@ -24,6 +23,8 @@ import {
   resolveImageOrientation,
 } from "./image-orientation";
 import { extractRawPreview, isRawFile, readRawDimensions } from "./raw-preview";
+import { computePHash } from "./phash";
+import { invalidatePhashIndex } from "./phash-index";
 import { deletePhotoThumbnails, generateThumbnail } from "./thumbnailer";
 
 const log = createLogger("indexer");
@@ -94,6 +95,15 @@ interface IndexProgress {
 
 type ProgressCallback = (progress: IndexProgress) => void;
 let activeScanToken: { cancelled: boolean } | null = null;
+
+/**
+ * 自用（2026-10-16）：扫描进度**写进 app.log** ✓。
+ *
+ * 原来进度只发给界面（`scan-progress` / `import-queue-status`），出事时日志里什么都看不到 ✗
+ *（实测：卡住之后只能强杀进程，事后完全无法判断卡在哪个阶段、扫到哪 ✓）。
+ * 这里做**节流**：同一阶段最多每 5 秒记一条，避免刷爆日志 ✓。
+ */
+const SCAN_LOG_INTERVAL_MS = 5000;
 
 interface WatcherContext {
   db: ReturnType<typeof getDatabase>;
@@ -303,6 +313,65 @@ function watcherPathKey(folderPath: string): string {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
+/**
+ * 自用新增（2026-10，用户要求"在软件里重命名文件夹"）：
+ * **改名/移动文件夹期间的"事件屏蔽窗口"**。
+ *
+ * 为什么需要：chokidar **没有 rename 事件** —— 把一个文件夹改名，它看到的是
+ * "旧路径下每个文件 unlink + 新路径下每个文件 add"。而 `unlink` 的处理是
+ * `db.delete(photos)`（**硬删**），于是照片的标签/相册/收藏关联全被级联删掉 ✗。
+ *
+ * 所以软件自己改名时：改名前把**旧路径、新路径**（及其父目录）登记进来，
+ * 这段时间内这些路径上的 watcher 事件一律忽略 ✓ ——
+ * 数据库由 `renameFolder` 自己按前缀迁移，关联一张不丢 ✓。
+ *
+ * 用"带到期时间的窗口"而不是"改完再取消"：即使改名过程中抛错/进程重启，
+ * 也只影响这一小段时间，不会把监听**永久**弄坏 ✓。
+ */
+const suppressedWatcherPaths = new Map<string, number>();
+
+/** 登记要屏蔽的路径（默认 15 秒；覆盖 rename + 数据库迁移 + chokidar 的延迟投递）。 */
+export function suppressWatcherPaths(
+  paths: string[],
+  durationMs = 15_000
+): void {
+  const until = Date.now() + durationMs;
+  for (const target of paths) {
+    if (!target) {
+      continue;
+    }
+    suppressedWatcherPaths.set(watcherPathKey(target), until);
+    // 父目录也屏蔽：某些系统上目录本身的增删会产生父级事件
+    const parent = path.dirname(target);
+    if (parent && parent !== target) {
+      suppressedWatcherPaths.set(watcherPathKey(parent), until);
+    }
+  }
+}
+
+/** 这个路径当前是否处于屏蔽窗口内（含其子孙）。 */
+export function isWatcherPathSuppressed(filePath: string): boolean {
+  if (suppressedWatcherPaths.size === 0) {
+    return false;
+  }
+  const now = Date.now();
+  for (const [key, until] of suppressedWatcherPaths) {
+    if (until <= now) {
+      suppressedWatcherPaths.delete(key);
+    }
+  }
+  if (suppressedWatcherPaths.size === 0) {
+    return false;
+  }
+  const key = watcherPathKey(filePath);
+  for (const suppressed of suppressedWatcherPaths.keys()) {
+    if (key === suppressed || key.startsWith(`${suppressed}${path.sep}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function isIndexing(): boolean {
   return activeScanToken !== null;
 }
@@ -331,100 +400,8 @@ function shouldIndex(filePath: string): boolean {
 }
 
 // --- pHash (Perceptual Hash) — DCT-based ---
-// Resize → 32×32 grayscale → 2D DCT → top-left 8×8 low-freq → median threshold → 64-bit hex.
-// More robust than aHash against scaling, compression, and brightness changes.
-
-function dct1D(input: Float64Array): Float64Array {
-  const N = input.length;
-  const output = new Float64Array(N);
-  const piOver2N = Math.PI / (2 * N);
-  for (let k = 0; k < N; k++) {
-    let sum = 0;
-    for (let n = 0; n < N; n++) {
-      sum += input[n] * Math.cos((2 * n + 1) * k * piOver2N);
-    }
-    output[k] = sum;
-  }
-  return output;
-}
-
-function dct2D(matrix: Float64Array[], size: number): Float64Array[] {
-  // DCT on rows
-  const rowTransformed: Float64Array[] = [];
-  for (let i = 0; i < size; i++) {
-    rowTransformed.push(dct1D(matrix[i]));
-  }
-  // DCT on columns
-  const result: Float64Array[] = Array.from(
-    { length: size },
-    () => new Float64Array(size)
-  );
-  for (let j = 0; j < size; j++) {
-    const col = new Float64Array(size);
-    for (let i = 0; i < size; i++) {
-      col[i] = rowTransformed[i][j];
-    }
-    const colDct = dct1D(col);
-    for (let i = 0; i < size; i++) {
-      result[i][j] = colDct[i];
-    }
-  }
-  return result;
-}
-
-async function computePHash(input: string | Buffer): Promise<string | null> {
-  try {
-    const SIZE = 32;
-    const { data } = await sharp(input)
-      .rotate()
-      .resize(SIZE, SIZE, { fit: "fill" })
-      .grayscale()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-
-    const pixels = new Uint8Array(data);
-
-    // Build 32×32 float matrix
-    const matrix: Float64Array[] = [];
-    for (let i = 0; i < SIZE; i++) {
-      const row = new Float64Array(SIZE);
-      for (let j = 0; j < SIZE; j++) {
-        row[j] = pixels[i * SIZE + j];
-      }
-      matrix.push(row);
-    }
-
-    // 2D DCT
-    const dct = dct2D(matrix, SIZE);
-
-    // Extract top-left 8×8 (lowest frequency coefficients, excluding DC at [0][0])
-    const lowFreq: number[] = [];
-    for (let i = 0; i < 8; i++) {
-      for (let j = 0; j < 8; j++) {
-        if (i === 0 && j === 0) {
-          continue; // skip DC component
-        }
-        lowFreq.push(dct[i][j]);
-      }
-    }
-
-    // Median threshold
-    const sorted = [...lowFreq].sort((a, b) => a - b);
-    const median = sorted[Math.floor(sorted.length / 2)];
-
-    // 64-bit hash (63 values from 8×8 minus DC = 63, pad to 64)
-    let hash = 0n;
-    for (let i = 0; i < lowFreq.length; i++) {
-      if (lowFreq[i] > median) {
-        hash += 2n ** BigInt(i);
-      }
-    }
-
-    return hash.toString(16).padStart(16, "0");
-  } catch {
-    return null;
-  }
-}
+// 算法已抽到 `@/services/phash`，与「以图搜图」「查重」共用同一份实现
+// （算法一字未改，库里已有的 phash-v1 指纹继续有效）。
 
 async function readBasicMeta(filePath: string): Promise<{
   width: number;
@@ -477,40 +454,6 @@ async function readBasicMeta(filePath: string): Promise<{
   }
 }
 
-async function readExif(
-  filePath: string
-): Promise<Record<string, unknown> | null> {
-  // 自用精简版：关闭 EXIF 识别（见 src/config/private-build.ts）。
-  // 直接不解析，因此也不会产生下面那些"没有 EXIF"的告警 —— 上游 BUG-2 的根源。
-  if (PRIVATE_BUILD.disableExifExtraction) {
-    return null;
-  }
-  try {
-    const result = await exifr.parse(filePath, {
-      // 40KB first chunk — matches orientation()'s tuning for HEIC files
-      // where the meta box (containing EXIF via iloc/iinf) may sit beyond
-      // the default 512-byte first chunk (firstChunkSizeNode).
-      firstChunkSize: 40_000,
-    });
-    if (!result || Object.keys(result).length === 0) {
-      // 截图 / 下载图 / 插画等本来就没有相机 EXIF，这是正常情况而非错误。
-      // 用 debug 级别记录，避免刷爆日志（上游 BUG-2：实测 1h45m 产生 6,835 条）。
-      log.debug(
-        { filePath, ext: path.extname(filePath).toLowerCase() },
-        "EXIF extraction returned empty result"
-      );
-      return null;
-    }
-    return result;
-  } catch (err) {
-    log.warn(
-      { filePath, ext: path.extname(filePath).toLowerCase(), err },
-      "EXIF extraction threw an error"
-    );
-    return null;
-  }
-}
-
 interface PhotoRecord {
   colorBucket: number | null;
   colorSpace: string;
@@ -529,89 +472,6 @@ interface PhotoRecord {
   thumbnailPath: string | null;
   thumbnailSize: string;
   width: number;
-}
-
-// Parse shutter speed text (e.g. "0.001", "1/1000") to numeric seconds
-function parseShutterSpeedToNum(value: string | undefined): number | null {
-  if (value === undefined || value === "") {
-    return null;
-  }
-  // Fraction format: "1/1000", "1/60" etc.
-  const fracMatch = value.match(SHUTTER_FRACTION_RE);
-  if (fracMatch) {
-    const num = Number.parseFloat(fracMatch[1]);
-    const den = Number.parseFloat(fracMatch[2]);
-    if (den !== 0) {
-      return num / den;
-    }
-    return null;
-  }
-  // Decimal string: "0.001", "0.5" etc.
-  const num = Number.parseFloat(value);
-  return Number.isFinite(num) && num >= 0 ? num : null;
-}
-
-// Parse focal length text (e.g. "85", "24-70") to numeric value (first number)
-function parseFocalLengthToNum(value: string | undefined): number | null {
-  if (value === undefined || value === "") {
-    return null;
-  }
-  const num = Number.parseFloat(value);
-  return Number.isFinite(num) && num > 0 ? num : null;
-}
-
-// Clean focal length display text: rational→float precision artifacts produce
-// strings like "85.00000000001" which break GROUP BY and look ugly in charts.
-// Single-number → rounded to 0 decimals; zoom range "24-70" → kept as-is.
-function cleanFocalLengthText(raw: string | undefined): string | undefined {
-  if (!raw) {
-    return undefined;
-  }
-  const trimmed = raw.trim();
-  // Zoom range like "24-70" or "18-55"
-  if (FOCAL_RANGE_RE.test(trimmed)) {
-    // Clean each part: "24.000001-70.00001" → "24-70"
-    const parts = trimmed.split(FOCAL_SPLIT_RE);
-    const cleaned = parts.map((p) => {
-      const n = Number.parseFloat(p);
-      return Number.isFinite(n) ? Math.round(n).toString() : p;
-    });
-    return cleaned.join("-");
-  }
-  // Single number → round to nearest integer
-  const n = Number.parseFloat(trimmed);
-  if (Number.isFinite(n) && n > 0) {
-    return Math.round(n).toString();
-  }
-  return trimmed;
-}
-
-interface ExifRecord {
-  aperture?: number;
-  artist?: string;
-  cameraMake?: string;
-  cameraModel?: string;
-  copyright?: string;
-  dateDigitized?: number | null;
-  dateTaken?: number | null;
-  exposureCompensation?: number;
-  flash?: boolean;
-  focalLength?: string;
-  focalLength35mm?: string;
-  focalLengthNum?: number | null;
-  gpsAltitude?: number;
-  gpsLatitude?: number;
-  gpsLongitude?: number;
-  imageDescription?: string;
-  iso?: number;
-  lensMake?: string;
-  lensModel?: string;
-  orientation?: number;
-  photoId: number;
-  rawJson: string;
-  shutterSpeed?: string;
-  shutterSpeedNum?: number | null;
-  software?: string;
 }
 
 // ── Hue bucket helper ────────────────────────────────────────────────────
@@ -673,7 +533,6 @@ async function preparePhotoRecord(
   folderId: number | null
 ): Promise<{
   photoRecord: PhotoRecord;
-  exifRecord: ExifRecord | null;
   stat: fs.Stats;
   phash: string | null;
 } | null> {
@@ -757,99 +616,17 @@ async function preparePhotoRecord(
     dominantColors,
   };
 
-  // Extract EXIF
-  const exif = await readExif(filePath);
-  let exifRecord: ExifRecord | null = null;
-
-  if (exif && Object.keys(exif).length > 0) {
-    const focalLengthStr = exif.FocalLength?.toString();
-    const focalLengthNum = parseFocalLengthToNum(focalLengthStr);
-    const shutterSpeedStr = exif.ExposureTime?.toString();
-
-    // Derive camera model with fallback: phone photos (iPhone/OPPO/etc.)
-    // often have an empty Model tag but a descriptive LensModel like
-    // "iPhone 17 Pro Max back triple camera 6.765mm f/1.78".
-    // Extract the phone name from LensModel as a fallback.
-    let cameraModel = (exif.Model as string) || "";
-    const rawLensModel = (exif.LensModel as string) || "";
-    if (!cameraModel && rawLensModel) {
-      // Lens model format for phones: "<PhoneName> back <rest>"
-      const backIdx = rawLensModel.indexOf(" back ");
-      if (backIdx > 0) {
-        cameraModel = rawLensModel.slice(0, backIdx).trim();
-      }
-    }
-    // Last resort: use Make (brand name) if Model is still empty
-    if (!cameraModel) {
-      cameraModel = (exif.Make as string) || "";
-    }
-
-    // Derive camera make with the same fallback philosophy:
-    // 1. Use EXIF Make tag directly when present
-    // 2. When missing but we have a resolved camera model, extract the
-    //    first word or map known phone model prefixes to manufacturers.
-    let cameraMake = (exif.Make as string) || "";
-    if (!cameraMake && cameraModel) {
-      const modelLower = cameraModel.toLowerCase();
-      if (modelLower.startsWith("iphone") || modelLower.startsWith("ipad")) {
-        cameraMake = "Apple";
-      } else {
-        // Use first word of camera model as a best-effort make
-        cameraMake = cameraModel.split(" ")[0] || "";
-      }
-    }
-
-    exifRecord = {
-      photoId: 0, // Will be set after insert
-      cameraMake,
-      cameraModel,
-      lensMake: exif.LensMake as string,
-      lensModel: exif.LensModel as string,
-      focalLength: cleanFocalLengthText(focalLengthStr),
-      focalLength35mm: cleanFocalLengthText(
-        exif.FocalLengthIn35mmFormat?.toString()
-      ),
-      focalLengthNum:
-        focalLengthNum === null ? null : Math.round(focalLengthNum * 10) / 10,
-      aperture:
-        exif.FNumber == null
-          ? undefined
-          : Math.round((exif.FNumber as number) * 10) / 10,
-      shutterSpeed: shutterSpeedStr,
-      shutterSpeedNum: parseShutterSpeedToNum(shutterSpeedStr),
-      iso: exif.ISO as number,
-      exposureCompensation: exif.ExposureCompensation as number,
-      dateTaken: exif.DateTimeOriginal
-        ? new Date(exif.DateTimeOriginal as string).getTime()
-        : null,
-      dateDigitized: exif.DateTimeDigitized
-        ? new Date(exif.DateTimeDigitized as string).getTime()
-        : null,
-      flash: exif.Flash as boolean,
-      orientation: exif.Orientation as number,
-      gpsLatitude: (exif.latitude ?? exif.GPSLatitude) as number,
-      gpsLongitude: (exif.longitude ?? exif.GPSLongitude) as number,
-      gpsAltitude: exif.GPSAltitude as number,
-      software: exif.Software as string,
-      imageDescription: exif.ImageDescription as string,
-      artist: (exif.Artist ?? exif.Creator) as string,
-      copyright: exif.Copyright as string,
-      rawJson: JSON.stringify(exif),
-    };
-  } else if (!PRIVATE_BUILD.disableExifExtraction) {
-    // 没有相机 EXIF 是正常情况（截图 / 下载图 / 插画），不是错误。
-    // 用 debug 级别记录，避免刷爆日志（上游 BUG-2：实测 1h45m 产生 6,835 条）。
-    log.debug(
-      {
-        filePath,
-        ext: path.extname(filePath).toLowerCase(),
-        hasExif: exif !== null && exif !== undefined,
-      },
-      "No EXIF metadata extracted for photo"
-    );
-  }
-
-  return { photoRecord, exifRecord, stat, phash };
+  /*
+   * 自用（2026-10-17，用户口径）：**导入不再解析 EXIF** ✓
+   *
+   * 用户原话：「数据导入那步，不要 exif 了，原项目留下来的残留，用不上」——
+   * 每张图都要跑一次 exifr（读文件头 + 解析），而插画/截图几乎全是空结果，
+   * 白花时间还制造一堆"没有 EXIF"的日志 ✗。
+   *
+   * 现在这里**直接返回 null**：`exifData` 表结构、`getPhotoExif` 接口、
+   * 详情页的读取逻辑都保留（老数据还能看），只是**导入不再写入** ✓
+   */
+  return { photoRecord, stat, phash };
 }
 
 async function indexSingleFile(
@@ -898,7 +675,7 @@ async function indexSingleFile(
     return null;
   }
 
-  const { photoRecord, exifRecord, stat, phash } = prepared;
+  const { photoRecord, stat, phash } = prepared;
 
   // A scan or another overlapping watcher may have inserted this path while
   // metadata/thumbnail preparation yielded. Reuse its row instead of racing it.
@@ -926,15 +703,11 @@ async function indexSingleFile(
   // Incremental duplicate detection
   checkNewPhotoDuplicates(photoId, phash, filePath, stat.size);
 
-  // Insert EXIF if available
-  if (exifRecord) {
-    try {
-      exifRecord.photoId = photoId;
-      db.insert(exifData).values(exifRecord).run();
-    } catch (err: unknown) {
-      log.warn({ filePath, err }, "EXIF insert failed");
-    }
-  }
+  // 新图入索引 → 共用 pHash 索引（以图搜图 / 查重）必须失效重建。
+  // 它的变更判据只有「张数 + 最大 id」，这里插入新行刚好会被它发现；
+  // 但 phash 被**改写**（重新计算）时判据不变，所以显式失效更稳妥。
+  invalidatePhashIndex();
+
 
   queuePrimaryColorVectorUpsert(photoId, photoRecord.dominantColors);
 
@@ -961,6 +734,19 @@ export async function scanFolder(
   }
   const scanToken = { cancelled: false };
   activeScanToken = scanToken;
+  const scanStartedAt = Date.now();
+  let lastProgressLogAt = 0;
+  const reportProgress = (progress: IndexProgress): void => {
+    onProgress?.(progress);
+    const now = Date.now();
+    if (now - lastProgressLogAt >= SCAN_LOG_INTERVAL_MS) {
+      lastProgressLogAt = now;
+      log.info(
+        `[Scan] ${progress.phase} 已扫 ${progress.scanned}${progress.total > 0 ? `/${progress.total}` : ""}${progress.currentFile ? ` — ${progress.currentFile}` : ""}`
+      );
+    }
+  };
+  log.info(`[Scan] 开始扫描: ${folderPath}`);
   const newPhotoIds: number[] = [];
   const createdFolderIds: number[] = [];
 
@@ -1036,7 +822,7 @@ export async function scanFolder(
       }
       // Yield the event loop after reading each directory to prevent UI jank
       await new Promise<void>((r) => setImmediate(r));
-      onProgress?.({
+      reportProgress({
         scanned: files.length,
         total: 0,
         phase: "scanning",
@@ -1064,11 +850,56 @@ export async function scanFolder(
     // Auto-discover subdirectories that contain images and create folder records.
     // Walk up from each file's directory to the scan root, creating any missing
     // intermediate folder records with proper parentId linkage.
+    //
+    // 自用（2026-10-16，**修"导入大目录时界面点不动、连取消都点不了"**）：
+    // 原来这里是 `for (const f of files)` —— 对**每一个文件**都算一遍父目录，
+    // 而且整段没有一个 await（better-sqlite3 是**同步**的）✗：
+    //   2.4 万个文件 → 主线程里跑几万条同步 SQL，事件循环被完全占死 ✗，
+    //   界面收不到 IPC（连「取消」按钮都点不动）✓ 与实测现象一致。
+    // 现在两处改动：
+    //   ① 先按**目录去重**（2.4 万文件通常只有几百到几千个目录 ✓）；
+    //   ② 每处理 200 个目录**让出一次事件循环** → 取消/界面始终可响应 ✓。
     const dirToFolderId = new Map<string, number>();
     dirToFolderId.set(resolvedPath, folderId);
 
+    const uniqueDirs = new Set<string>();
     for (const f of files) {
-      let dir = path.dirname(f);
+      const parent = path.dirname(f);
+      if (parent !== resolvedPath) {
+        uniqueDirs.add(parent);
+      }
+    }
+    /*
+     * 自用：按**层级从浅到深**处理目录 ✓。
+     * 这样父目录一定先于子目录登记，parentId 永远能取到（原来的写法靠遍历顺序碰运气，
+     * 顺序不巧时最上层那个目录会拿到 parentId = null ✗）。
+     */
+    const orderedDirs = [...uniqueDirs].sort(
+      (a, b) =>
+        a.split(path.sep).length - b.split(path.sep).length ||
+        (a < b ? -1 : a > b ? 1 : 0)
+    );
+    log.info(
+      `[Scan] 目录登记：${files.length} 个文件 → ${orderedDirs.length} 个目录（已去重、按层级排序）`
+    );
+
+    let dirsProcessed = 0;
+    for (const startDir of orderedDirs) {
+      if (scanToken.cancelled) {
+        break;
+      }
+      dirsProcessed++;
+      if (dirsProcessed % 200 === 0) {
+        reportProgress({
+          scanned: files.length,
+          total: files.length,
+          phase: "indexing",
+          currentFile: startDir,
+        });
+        await new Promise<void>((r) => setImmediate(r));
+      }
+
+      let dir = startDir;
 
       // Collect missing ancestor directories (bottom-up)
       const missing: string[] = [];
@@ -1162,6 +993,13 @@ export async function scanFolder(
       batchStart < files.length;
       batchStart += BATCH_SIZE
     ) {
+      if (scanToken.cancelled) {
+        break;
+      }
+      // 自用（2026-10-16）：每批之间显式让出事件循环 ✓。
+      // 批次内部虽然有 await，但紧跟着的「查重 + 插入事务」是**同步**的 ✓；
+      // 显式让一次可以保证「取消」和界面刷新总能轮到 ✓。
+      await new Promise<void>((r) => setImmediate(r));
       const batchFiles = files.slice(batchStart, batchStart + BATCH_SIZE);
       const existingRows = db
         .select({ id: photos.id, folderId: photos.folderId, path: photos.path })
@@ -1180,7 +1018,7 @@ export async function scanFolder(
             return null;
           }
 
-          onProgress?.({
+          reportProgress({
             scanned,
             total: files.length,
             phase: "indexing",
@@ -1248,8 +1086,7 @@ export async function scanFolder(
       ) as Array<{
         type: "new";
         photoRecord: PhotoRecord;
-        exifRecord: ExifRecord | null;
-        stat: fs.Stats;
+              stat: fs.Stats;
         phash: string | null;
       }>;
 
@@ -1314,18 +1151,7 @@ export async function scanFolder(
               photoIds.push(photoId);
               newPhotoIds.push(photoId);
               insertedPairs.push({ photoId, record });
-
-              if (record.exifRecord) {
-                try {
-                  record.exifRecord.photoId = photoId;
-                  db.insert(exifData).values(record.exifRecord).run();
-                } catch (err: unknown) {
-                  log.warn(
-                    { filePath: record.photoRecord.path, err },
-                    "EXIF insert failed"
-                  );
-                }
-              }
+              // 自用（2026-10-17）：导入不再写 EXIF 记录 ✓
             }
           });
 
@@ -1370,15 +1196,7 @@ export async function scanFolder(
                   photoId,
                   record.photoRecord.dominantColors
                 );
-
-                if (record.exifRecord) {
-                  try {
-                    record.exifRecord.photoId = photoId;
-                    db.insert(exifData).values(record.exifRecord).run();
-                  } catch {
-                    /* skip */
-                  }
-                }
+                // 自用（2026-10-17）：导入不再写 EXIF 记录 ✓
               }
             } catch {
               skipped++;
@@ -1403,14 +1221,29 @@ export async function scanFolder(
     }
 
     // Clean up photos whose files no longer exist on disk — check all folders
+    //
+    // 自用（2026-10-16）：这一段原来也是**全程同步**的 ✗ ——
+    // 对每个目录把该目录**所有**照片查出来，再逐张 `fs.existsSync`（同步 stat）✗。
+    // 24,723 张图就是 2 万多次同步 stat + 同步 SQL → 事件循环同样被占死 ✓。
+    // 现在：每 500 张让出一次事件循环，并且「取消」能立刻中断这一段 ✓。
     const stalePhotoIds: number[] = [];
+    let staleChecked = 0;
     for (const [_dirPath, fid] of dirToFolderId) {
+      if (scanToken.cancelled) {
+        break;
+      }
       const dbPhotos = db
         .select({ id: photos.id, path: photos.path })
         .from(photos)
         .where(eq(photos.folderId, fid))
         .all();
       for (const p of dbPhotos) {
+        if (scanToken.cancelled) {
+          break;
+        }
+        if (++staleChecked % 500 === 0) {
+          await new Promise<void>((r) => setImmediate(r));
+        }
         if (!fs.existsSync(p.path)) {
           db.delete(exifData).where(eq(exifData.photoId, p.id)).run();
           db.delete(photos).where(eq(photos.id, p.id)).run();
@@ -1469,13 +1302,18 @@ export async function scanFolder(
     reloadFolderMatcher();
 
     if (!scanToken.cancelled) {
-      onProgress?.({
+      reportProgress({
         scanned: files.length,
         total: files.length,
         phase: "complete",
         currentFile: "",
       });
     }
+
+    /* 自用（2026-10-16）：一条**总账**日志 ✓ —— 出事后一眼能看出扫了多少、花了多久。 */
+    log.info(
+      `[Scan] 扫描结束${scanToken.cancelled ? "（已取消）" : ""}: ${resolvedPath} 用时 ${((Date.now() - scanStartedAt) / 1000).toFixed(1)}s，磁盘上 ${files.length} 个受支持文件，新增 ${newPhotoIds.length}，跳过 ${skipped}，失败 ${failed}，本次涉及 ${photoIds.length}，清理失效记录 ${stalePhotoIds.length}`
+    );
 
     // Auto-tagging now runs after embedAllPhotos() completes, when all CLIP
     // vectors are available in LanceDB. This avoids expensive per-photo worker
@@ -1492,6 +1330,10 @@ export async function scanFolder(
       folderExisted,
     };
   } catch (error) {
+    /* 自用（2026-10-16）：扫描失败也写日志 ✓（原来只有界面能看到，出事时日志为空 ✗）。 */
+    log.error(
+      `[Scan] 扫描失败（已回滚）: ${folderPath} 用时 ${((Date.now() - scanStartedAt) / 1000).toFixed(1)}s — ${error instanceof Error ? error.message : String(error)}`
+    );
     const inserted =
       newPhotoIds.length > 0
         ? db
@@ -1661,6 +1503,11 @@ export function startWatching(
       if (!shouldIndex(filePath)) {
         return;
       }
+      // 自用：软件自己重命名文件夹时，这批事件由 renameFolder 负责迁移，监听这边忽略
+      if (isWatcherPathSuppressed(filePath)) {
+        watcherStats.skipped++;
+        return;
+      }
       watcherStats.addEvents++;
 
       watcherQueue.add(async () => {
@@ -1708,6 +1555,14 @@ export function startWatching(
 
     watcher.on("unlink", (filePath) => {
       if (!isCurrentWatcher(context)) {
+        return;
+      }
+      /*
+       * 自用（关键）：软件自己重命名文件夹期间，**绝不能**走下面的 db.delete(photos) ✗ ——
+       * 那会把照片的标签 / 相册 / 收藏关联一起级联删掉。迁移由 renameFolder 负责 ✓。
+       */
+      if (isWatcherPathSuppressed(filePath)) {
+        watcherStats.skipped++;
         return;
       }
       watcherStats.unlinkEvents++;
@@ -1793,6 +1648,11 @@ export function watchFolder(
     if (!shouldIndex(filePath)) {
       return;
     }
+    // 自用：软件自己重命名文件夹时忽略（见 suppressWatcherPaths）
+    if (isWatcherPathSuppressed(filePath)) {
+      watcherStats.skipped++;
+      return;
+    }
     watcherStats.addEvents++;
 
     watcherQueue.add(async () => {
@@ -1839,6 +1699,11 @@ export function watchFolder(
 
   watcher.on("unlink", (filePath) => {
     if (!isCurrentWatcher(context)) {
+      return;
+    }
+    // 自用（关键）：软件自己重命名文件夹时，不能把照片硬删（会连标签/相册关联一起丢）
+    if (isWatcherPathSuppressed(filePath)) {
+      watcherStats.skipped++;
       return;
     }
     watcherStats.unlinkEvents++;

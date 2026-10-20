@@ -13,6 +13,7 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { AiProgressBar } from "@/components/AiProgressBar";
 import { toast } from "sonner";
 import {
   getDiagnosticsOverview,
@@ -104,9 +105,29 @@ function Root() {
     };
     window.addEventListener("error", handleError);
     window.addEventListener("unhandledrejection", handleRejection);
+
+  /*
+   * 自用（2026-10）：**补 window.onerror 上报**。
+   * 原来只有 unhandledrejection（异步）和 ErrorBoundary（React 内部）✗ ——
+   * "一打开就白屏"这类**加载阶段/React 之外的同步错误**两边都抓不到 ✗，
+   * 而用户也没法看控制台（这个私有构建把 F12 快捷键精简掉了 ✗）。
+   * 现在一并上报到主进程 → 会写进 app.log ✓。
+   */
+  const handleWindowError = (event: ErrorEvent) => {
+    recordRendererIncident({
+      action: "window.onerror",
+      message: event.message ?? String(event.error ?? "unknown error"),
+      route: event.filename
+        ? `${event.filename}:${event.lineno}:${event.colno}`
+        : undefined,
+      stack: event.error instanceof Error ? event.error.stack : undefined,
+    });
+  };
+  window.addEventListener("error", handleWindowError);
     return () => {
       window.removeEventListener("error", handleError);
       window.removeEventListener("unhandledrejection", handleRejection);
+    window.removeEventListener("error", handleWindowError);
     };
   }, [location.pathname]);
 

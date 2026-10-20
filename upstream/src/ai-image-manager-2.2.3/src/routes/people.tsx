@@ -1,4 +1,4 @@
-﻿import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createFileRoute,
   Outlet,
@@ -343,7 +343,11 @@ export function PeoplePage() {
           className="rounded-[6px] border border-border bg-card px-3 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
           disabled={!taggingReady || featureUnavailable}
           onClick={() => setDiscoveryOpen(true)}
-          title={featureGateHint ?? taggingGateHint ?? t("characterDiscoveryHint")}
+          title={
+            (!taggingReady && taggingGateHint) ||
+            featureGateHint ||
+            t("characterDiscoveryHint")
+          }
           type="button"
         >
           {t("characterDiscoveryTitle")}
@@ -352,13 +356,27 @@ export function PeoplePage() {
           className="rounded-[6px] border border-border bg-card px-3 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
           disabled={missingBusy || !taggingReady || featureUnavailable}
           onClick={() => void handleDetectMissing()}
-          title={featureGateHint ?? taggingGateHint ?? t("peopleFindUnnamedCharactersHint")}
+          title={
+            (!taggingReady && taggingGateHint) ||
+            featureGateHint ||
+            t("peopleFindUnnamedCharactersHint")
+          }
           type="button"
         >
           {missingBusy
             ? t("peopleFindUnnamedCharactersBusy")
             : t("peopleFindUnnamedCharacters")}
         </button>
+        {/*
+          自用（2026-10-20 · 会话#10）：**打标门禁提示要一直显示**。
+          它原来被 `!featureGateHint` 挡在后面 —— 只要"角色特征还没算"，
+          "全库打标完成才能用（还剩 N 张）"这句就消失了，用户以为门禁被取消了
+          （实测反馈：「角色识别的守卫提示怎么直接给改没了」）。
+          门禁有两道，两道都摆出来：先打完标，再算特征。
+        */}
+        {!taggingReady && taggingGateHint && (
+          <span className="text-[11px] text-warning">{taggingGateHint}</span>
+        )}
         {featureGateHint && (
           <>
             <span
@@ -397,11 +415,6 @@ export function PeoplePage() {
               </button>
             )}
           </>
-        )}
-        {!featureGateHint && taggingGateHint && (
-          <span className="text-[11px] text-muted-foreground">
-            {taggingGateHint}
-          </span>
         )}
       </div>
 

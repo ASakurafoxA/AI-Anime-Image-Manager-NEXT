@@ -695,13 +695,13 @@ async function handleLanSearchByImage(
     usage.count += 1;
   }
 
-  const { isAiSearchReady, searchByImage } = await import(
-    "@/services/ai/search"
-  );
+  const { isAiSearchReady } = await import("@/services/ai/search");
   if (!isAiSearchReady()) {
     sendJson(res, 503, { error: "ai_not_ready" });
     return;
   }
+  // 与桌面端保持一致：先指纹判「是不是同一张图」，再语义找「像的」
+  const { searchByImageWithPhash } = await import("@/services/image-search");
 
   const tmpDir = path.join(getDataPath(), "lan-upload-tmp");
   const tmpFile = path.join(
@@ -712,7 +712,7 @@ async function handleLanSearchByImage(
   try {
     await fs.promises.mkdir(tmpDir, { recursive: true });
     await fs.promises.writeFile(tmpFile, body);
-    const hits = await searchByImage(tmpFile, LAN_UPLOAD_RESULT_LIMIT);
+    const hits = await searchByImageWithPhash(tmpFile, LAN_UPLOAD_RESULT_LIMIT);
     const items = listLanPhotosByIds(
       hits.map((hit) => hit.photoId),
       LAN_UPLOAD_RESULT_LIMIT
@@ -1642,6 +1642,11 @@ function handleLanApi(
     if (pathname === "/api/photos") {
       // 搜索走语义链路（和桌面一致），所以这里是异步的。
       listLanPhotos({
+        // 隐藏文件夹开关（与桌面端同名同义）：缺省 = 不过滤（老客户端行为不变）
+        excludeHiddenFolders: readBoolParam(
+          searchParams,
+          "excludeHiddenFolders"
+        ),
         favoriteOnly: readBoolParam(searchParams, "favorite"),
         folderId: readIntParam(searchParams, "folderId"),
         limit: readIntParam(searchParams, "limit"),

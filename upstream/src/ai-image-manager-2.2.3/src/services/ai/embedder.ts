@@ -47,9 +47,9 @@ import {
 } from "./state";
 import { batchSuggestTags } from "./tag-suggester";
 import { resolveEmbeddingImagePath } from "./search-image-source";
-import { getActiveTagger, PRIVATE_BUILD } from "@/config/private-build";
-import { runWd14Tagging } from "./wd14-tagger";
-import { runPixaiTagging } from "./pixai-tagger";
+import { getActiveTagger } from "@/config/private-build";
+import { runWd14Tagging, isWd14TaggingSuspended } from "./wd14-tagger";
+import { runPixaiTagging, isPixaiTaggingSuspended } from "./pixai-tagger";
 import {
   buildPhotoIdFilter,
   cleanupOrphanVectors,
@@ -57,8 +57,7 @@ import {
   ensureVectorIndex,
   initVectorDB,
   persistActiveVectorFingerprint,
-  withVectorDbOperation,
-} from "./vector-db";
+  withVectorDbOperation, requestVectorMaintenance } from "./vector-db";
 
 function appendAiWorkerLog(message: string): void {
   try {
@@ -362,8 +361,18 @@ export async function cleanupPartialEmbedding(
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Embedding orchestration preserves cancellation, recovery, persistence, and auto-tagging lifecycle in one transaction-like flow.
 export async function embedAllPhotos(
-  onProgress?: EmbedProgressCallback
+  onProgress?: EmbedProgressCallback,
+  /*
+   * 自用（2026-10-17，用户口径）：**功能区分** —— 语义检索用的"特征提取"与
+   * 角色识别用的"CLIP 特征"是同一次计算，但**用途不同** ✓
+   * 所以这里允许关掉"算完顺带自动打标"这一步：
+   *   · 语义检索/导入那条老路 → 保持 `autoTag` 打开（原行为不变 ✓）
+   *   · 角色识别借 CLIP 特征 → 传 `{ autoTag: false }`，
+   *     **不触发打标、也不去动语义检索的进度/状态**（避免"点角色识别却跑成语义检索"✗）
+   */
+  options?: { autoTag?: boolean }
 ): Promise<number> {
+  const shouldAutoTag = options?.autoTag !== false;
   // Atomically guard against concurrent calls
   if (getAiControlState() !== "idle" || isEmbedding) {
     console.warn(
@@ -678,6 +687,7 @@ export async function embedAllPhotos(
       const writtenIds = new Set<number>();
       try {
         await photoTable.add(records);
+      requestVectorMaintenance();
         for (const id of batchIds) {
           writtenIds.add(id);
         }
@@ -688,6 +698,7 @@ export async function embedAllPhotos(
         for (const record of records) {
           try {
             await photoTable.add([record]);
+      requestVectorMaintenance();
             writtenIds.add(record.photo_id);
           } catch (individualErr: unknown) {
             console.warn(
@@ -854,6 +865,7 @@ export async function embedAllPhotos(
         }));
         try {
           await photoTable.add(records);
+      requestVectorMaintenance();
         } catch (lanceErr: unknown) {
           console.warn(
             `[AI] Batch add failed (${getErrorMessage(lanceErr)}), falling back to individual writes`
@@ -861,6 +873,7 @@ export async function embedAllPhotos(
           for (const record of records) {
             try {
               await photoTable.add([record]);
+      requestVectorMaintenance();
             } catch {
               /* skip */
             }
@@ -909,6 +922,10 @@ export async function embedAllPhotos(
           currentFile: `paused at ${processed}/${total}`,
           downloadPercent: undefined,
           loadingStartedAt: null,
+          // 2026-10-20（会话#10）：**必须带上"已暂停"**，否则这条进度会盖掉
+          // `pauseAiIndexing` 刚推的那条 → 界面又从"已暂停"变回"正在索引"，
+          // 而且「继续」键跟着消失。
+          isPaused: true,
         });
         onProgress?.(currentProgress);
         finishRun("paused");
@@ -1177,7 +1194,15 @@ export async function embedAllPhotos(
       };
     }
 
-    const autoTagIds = drainPendingAutoTagPhotoIds();
+    /*
+     * 自用（2026-10-17）：角色识别借 CLIP 特征时 `shouldAutoTag === false` ——
+     * 此时**不把照片排进自动打标队列**（那是语义检索/导入那条链的收尾动作）✓
+     * 注意仍要 drain 掉队列，避免这些 id 留到下一次无关的建向量里被打标 ✗
+     */
+    const autoTagIds = shouldAutoTag ? drainPendingAutoTagPhotoIds() : [];
+    if (!shouldAutoTag) {
+      drainPendingAutoTagPhotoIds();
+    }
     let tagError: string | undefined;
     if (finalProgress.phase !== "error" && autoTagIds.length > 0) {
       diagnosticStage = "tagging";
@@ -1205,7 +1230,15 @@ export async function embedAllPhotos(
               setCurrentProgress({
                 processed: p.done,
                 total: p.total,
-                phase: "tagging",
+                /*
+                 * 2026-10-20（会话#10）：**自动打标也要尊重"暂停"**。
+                 * 原来这里无条件写 `phase: "tagging"` —— 用户在导入后的自动打标期间
+                 * 点暂停，紧接着一条进度回调就把"已暂停"翻回"进行中"，顶栏看起来
+                 * 就是"暂停了又继续"。现在按挂起标志写相位。
+                 */
+                phase: isPixaiTaggingSuspended()
+                  ? "tagging-paused"
+                  : "tagging",
                 currentFile: "",
                 downloadPercent: undefined,
               });
@@ -1229,7 +1262,10 @@ export async function embedAllPhotos(
               setCurrentProgress({
                 processed: p.done,
                 total: p.total,
-                phase: "tagging",
+                // 同 PixAI：自动打标期间被暂停时，相位要停在"已暂停"（会话#10）
+                phase: isWd14TaggingSuspended()
+                  ? "tagging-paused"
+                  : "tagging",
                 currentFile: "",
                 downloadPercent: undefined,
               });

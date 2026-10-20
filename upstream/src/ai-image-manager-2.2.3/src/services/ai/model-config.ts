@@ -16,7 +16,7 @@ import {
 
 const PATH_SPLIT_RE = /[\\/]/u;
 
-export type EmbeddingModelKind = "siglip";
+export type EmbeddingModelKind = "siglip" | "chinese-clip";
 
 export interface EmbeddingScoringPolicy {
   duplicateConfirmationSimilarity: number;
@@ -99,7 +99,11 @@ function toLegacyModel(
     imageOutputName: image.outputName,
     imageSize: image.imageSize,
     imageStd: image.std,
-    kind: adapter.legacyKind ?? "siglip",
+    // 自用：新模型的 family 是 chinese-clip，legacyKind 为空 → 不能再用 legacyKind 兜底
+    kind:
+      adapter.family === "chinese-clip"
+        ? "chinese-clip"
+        : (adapter.legacyKind ?? "siglip"),
     modelId: adapter.modelId,
     revision: adapter.revision,
     scoring: toLegacyScoring(),
@@ -162,7 +166,7 @@ export function getTextSearchMaxCosineDistance(
 
 export function getEmbeddingModelFile(
   modelsRoot: string,
-  fileName: "text_model_quantized.onnx" | "vision_model_quantized.onnx"
+  fileName: "text_model_quantized.onnx" | "vision_model_quantized.onnx" | "model_quantized.onnx"
 ): string {
   const adapter = getActiveEmbeddingAdapter();
   const relativePath =

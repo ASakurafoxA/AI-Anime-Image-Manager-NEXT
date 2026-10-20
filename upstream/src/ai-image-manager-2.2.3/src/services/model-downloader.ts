@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+﻿import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import http from "node:http";
@@ -59,6 +59,71 @@ export interface ModelDownloadOptions {
 // ── Model Manifest ──────────────────────────────────────────────────────
 
 export const MODEL_MANIFEST: ModelManifestEntry[] = [
+  // 自用（2026-10 换模型）：中文 CLIP（两塔合并在一个 ONNX 里）
+  {
+    name: "Chinese-CLIP 合并模型（文本塔+视觉塔）",
+    fileName: "model_quantized.onnx",
+    subPath: "Xenova/chinese-clip-vit-base-patch16/onnx",
+    urls: ["{mirror}/Xenova/chinese-clip-vit-base-patch16/resolve/main/onnx/model_quantized.onnx"],
+    sha256: "a2c2849329eafb24100acec5a9421a39f8cb445296444c5c98855b69e5e7a751",
+    sizeBytes: 190_842_404,
+    required: true,
+  },
+  {
+    name: "Chinese-CLIP 模型配置",
+    fileName: "config.json",
+    subPath: "Xenova/chinese-clip-vit-base-patch16",
+    urls: ["{mirror}/Xenova/chinese-clip-vit-base-patch16/resolve/main/config.json"],
+    sha256: "19447ad8c20d274f0644a6663af56286be98bd2d0e5f9472fcb318e04fcd6961",
+    sizeBytes: 844,
+    required: true,
+  },
+  {
+    name: "Chinese-CLIP 图像处理配置",
+    fileName: "preprocessor_config.json",
+    subPath: "Xenova/chinese-clip-vit-base-patch16",
+    urls: ["{mirror}/Xenova/chinese-clip-vit-base-patch16/resolve/main/preprocessor_config.json"],
+    sha256: "61a78fdd2c7ac17b54b6190c0f4cb23423192c535003d52528d01e318a47608b",
+    sizeBytes: 546,
+    required: true,
+  },
+  {
+    name: "Chinese-CLIP 特殊词元配置",
+    fileName: "special_tokens_map.json",
+    subPath: "Xenova/chinese-clip-vit-base-patch16",
+    urls: ["{mirror}/Xenova/chinese-clip-vit-base-patch16/resolve/main/special_tokens_map.json"],
+    sha256: "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    sizeBytes: 125,
+    required: true,
+  },
+  {
+    name: "Chinese-CLIP 分词器",
+    fileName: "tokenizer.json",
+    subPath: "Xenova/chinese-clip-vit-base-patch16",
+    urls: ["{mirror}/Xenova/chinese-clip-vit-base-patch16/resolve/main/tokenizer.json"],
+    sha256: "7dfbf1966ebf99d471c3796e9b457329d2b2182b817e144f1e904b957745c839",
+    sizeBytes: 439_124,
+    required: true,
+  },
+  {
+    name: "Chinese-CLIP 分词器配置",
+    fileName: "tokenizer_config.json",
+    subPath: "Xenova/chinese-clip-vit-base-patch16",
+    urls: ["{mirror}/Xenova/chinese-clip-vit-base-patch16/resolve/main/tokenizer_config.json"],
+    sha256: "38fbc894183595cc1168e36150251b2fb658197b3a49f6908cce88ae22acd52a",
+    sizeBytes: 1_315,
+    required: true,
+  },
+  {
+    name: "Chinese-CLIP BERT 词表",
+    fileName: "vocab.txt",
+    subPath: "Xenova/chinese-clip-vit-base-patch16",
+    urls: ["{mirror}/Xenova/chinese-clip-vit-base-patch16/resolve/main/vocab.txt"],
+    sha256: "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+    sizeBytes: 109_540,
+    required: true,
+  },
+
   {
     name: "SigLIP 视觉编码器",
     fileName: "vision_model_quantized.onnx",
@@ -253,28 +318,11 @@ export const MODEL_MANIFEST: ModelManifestEntry[] = [
     sizeBytes: 1_747_906,
     required: true,
   },
-  {
-    name: "YuNet 人脸检测",
-    fileName: "face_detection_yunet_2023mar.onnx",
-    subPath: "face",
-    urls: [
-      "{mirror}/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",
-    ],
-    sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
-    sizeBytes: 232_589,
-    required: true,
-  },
-  {
-    name: "SFace 人脸识别",
-    fileName: "face_recognition_sface_2021dec.onnx",
-    subPath: "face",
-    urls: [
-      "{mirror}/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx",
-    ],
-    sha256: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
-    sizeBytes: 38_696_353,
-    required: true,
-  },
+  /*
+   * 自用（2026-10-18 · 会话#9）：**SFace 人脸链路的 3 个模型已整体剔除** ✓
+   * 原来这里是 YuNet 检测 / 动漫检测 v1.4_s / SFace 识别三条清单。
+   * 角色识别现在用外部可选的 CCIP 模型（放 `<图库>\models\ccip\`，不进安装包）✓
+   */
   // ── 自用新增：WD14 动漫 tagger（带 768 维特征输出）────────────────────
   // 用途：替代原本基于 SigLIP 的 153 个英文概念标签，改为动漫原生标签
   //（角色名 + 通用标签），并额外产出 768 维动漫特征用于升级「以图搜图」。
@@ -305,6 +353,29 @@ export const MODEL_MANIFEST: ModelManifestEntry[] = [
     required: false,
   },
 ];
+
+/*
+ * 自用（NEXT，2026-10，用户要求）：**SigLIP 与 opus-mt 已彻底移除**。
+ *
+ * 用户口径："旧的不好用甚至不可用，没有留着的必要" → 连回退都不留 ✓。
+ * 于是在清单上把这两族条目统一标记为「不进安装包 + 非必需」：
+ *   · `bundled: false`  → 打包阶段直接跳过（与 forge.config.ts 里的规则互为双保险）；
+ *   · `required: false` → 启动期的模型完整性检查**不再把它们算作缺失项** ✗→✓，
+ *     否则程序会判定"模型不完整"，进而**自动把刚删掉的模型重新下载回来**（删了白删 ✗）。
+ *
+ * 将来若要恢复旧模型：删掉下面这段循环即可，清单条目本身一条都没动 ✓。
+ */
+const REMOVED_LEGACY_MODEL_SUBPATHS = ["Xenova/siglip", "Xenova/opus-mt"];
+for (const entry of MODEL_MANIFEST) {
+  if (
+    REMOVED_LEGACY_MODEL_SUBPATHS.some((prefix) =>
+      entry.subPath.startsWith(prefix)
+    )
+  ) {
+    entry.bundled = false;
+    entry.required = false;
+  }
+}
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/i;
 
@@ -1254,7 +1325,7 @@ export async function downloadAllModels(
 
   // ── Concurrent worker pool (问题 3: sorted by size ascending) ─────
   // Smallest files first — metadata completes immediately
-  // instead of waiting behind 166 MB face recognition model.
+  // instead of waiting behind the big (166 MB) vision model.
   const queue = [...missing].sort((a, b) => a.sizeBytes - b.sizeBytes);
 
   async function worker(): Promise<void> {

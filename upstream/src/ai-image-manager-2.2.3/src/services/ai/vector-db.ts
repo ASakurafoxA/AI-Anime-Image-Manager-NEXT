@@ -1,4 +1,7 @@
+import { fork } from "node:child_process";
+import { app } from "electron";
 import fs from "node:fs";
+import { createLogger } from "@/utils/logger";
 import path from "node:path";
 import type {
   Connection as LanceConnection,
@@ -18,6 +21,7 @@ import { appSettings, photos } from "@/db/schema";
 import { getDataPath } from "@/utils/data-path";
 import { APP_DISPLAY_NAME } from "@/config/private-build";
 import { MIN_VECTORS_FOR_INDEX } from "./constants";
+import { getAiControlState } from "./state";
 import { getActiveEmbeddingAdapter } from "./model-adapter";
 import {
   getActiveEmbeddingModel,
@@ -40,6 +44,8 @@ import {
   photoTable,
   setActiveEmbeddingRuntime,
   setColorTable,
+  setCcipTable,
+  ccipTable,
   setPixaiTable,
   setWd14Table,
   wd14Table,
@@ -52,15 +58,13 @@ import {
   vectordb,
 } from "./state";
 import { getActiveThresholdProfile } from "./threshold-profile";
+
+/** 自用：维护与索引构建的日志统一走 pino（原来 console.log 只到终端 ✗）。 */
+const log = createLogger("ai-vector-db");
 import {
   getUnreconciledVectorIds,
   planVectorReconciliation,
 } from "./vector-reconciliation";
-
-type MaintenanceTable = LanceTable & {
-  cleanupOldVersions?: () => Promise<void>;
-  compactFiles?: () => Promise<void>;
-};
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -107,61 +111,355 @@ function isNumberIterable(value: unknown): value is Iterable<number> {
 
 // ── 向量数据库定期维护 ──────────────────────────────────────────────
 // 数据追加后 LanceDB 产生碎片和旧版本文件，定期压缩清理释放磁盘空间。
-// 首次延迟 30s 避开启动 I/O 高峰，后续每 24h 静默执行一次。
+//
+// 自用（2026-10-16 修正）：**清理动作一律在 worker 进程里跑** ✓（见 runMaintenanceInWorker），
+// 主进程只负责"什么时候清"。原来在主进程里直接调维护 API 的那段代码已删除 ✗ ——
+// 它调的 `compactFiles()` / `cleanupOldVersions()` 在 @lancedb/lancedb 0.18 里**根本不存在** ✗，
+// 外面又有 `if (typeof … === "function")` 守卫 → 一直**静默空转**，
+// 碎片/旧版本从未被清理过（实测 vectors 目录涨到 19,409 个文件、1.42 GB ✗）。
+//
+// 正确的 API 是 `table.optimize({ cleanupOlderThan: 刚刚, deleteUnverified: true })` ✓
+// 注意 `cleanupOlderThan` 会被 JS 封装换算成"年龄"（= Date.now() − 该日期），
+// 语义是"清掉比 (现在 − 年龄) 更早的版本"，所以**必须传"刚刚"才清得干净** ✓；
+// 传 `new Date(0)`（年龄 56 年）实测**一个都清不掉** ✗，传 1 秒前也清不掉（版本还没那么老）✗。
+// worker 里固定用"1 分钟前"，既有清理效果又留一点时间旅行窗口 ✓。
 
-let maintenanceTimer: ReturnType<typeof setTimeout> | null = null;
+let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+let firstMaintenanceTimer: ReturnType<typeof setTimeout> | null = null;
+/** 首次维护延迟：避开启动 I/O 高峰，也给用户一点先动手的时间 ✓。 */
+const FIRST_MAINTENANCE_DELAY_MS = 2 * 60 * 1000;
 let maintenanceRunning = false;
 
-async function runVectorMaintenance(): Promise<void> {
-  if (!photoTable || maintenanceRunning) {
+/*
+ * 自用（2026-10）：把"维护 / 建索引"这类**不可中断的同步原生调用** ✗ 放到独立进程里跑 ✓。
+ *
+ * 为什么：createIndex 在 2.2 万行要 30 秒、7.7 万行要 1~2 分钟；optimize（compaction）要数分钟 ✗
+ * —— 在主进程里跑会把界面卡到「未响应」（Windows 甚至判 AppHang 关掉应用 ✗）。
+ * 放到 worker 后，主进程只是 await 子进程（事件循环自由 ✓），界面全程流畅 ✓。
+ */
+function findVectorMaintenanceWorkerScript(): string {
+  const candidates = [
+    path.join(app.getAppPath(), "scripts", "vector-maintenance-worker.mjs"),
+    path.join(
+      app.getAppPath(),
+      "app.asar.unpacked",
+      "scripts",
+      "vector-maintenance-worker.mjs"
+    ),
+    path.join(process.cwd(), "scripts", "vector-maintenance-worker.mjs"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error("vector-maintenance-worker.mjs not found");
+}
+
+interface MaintenanceTableResult {
+  name: string;
+  rows: number | null;
+  filesBefore: number | null;
+  filesAfter: number | null;
+  bytesBefore: number | null;
+  bytesAfter: number | null;
+  versionsBefore: number | null;
+  versionsAfter: number | null;
+  optimizeMs: number;
+  fragmentsRemoved: number;
+  filesRemoved: number;
+  filesAdded: number;
+  oldVersionsRemoved: number;
+  bytesRemoved: number;
+  /** 非 null 表示这张表清理失败（必须记日志，不能像旧代码那样静默跳过 ✗）。 */
+  error: string | null;
+}
+
+interface MaintenanceWorkerResult {
+  optimizeMs: number;
+  indexMs: number;
+  rows: number | null;
+  skipped: string[];
+  filesBefore: number;
+  filesAfter: number;
+  tables: MaintenanceTableResult[];
+  indexErrors: string[];
+}
+
+/** 把一次维护的结果写成一行可读日志（碎片数看得见 ✓）。 */
+function describeMaintenanceResult(result: MaintenanceWorkerResult): string {
+  const parts = result.tables.map((table) => {
+    const delta =
+      table.filesBefore === null || table.filesAfter === null
+        ? "?"
+        : `${table.filesBefore}→${table.filesAfter}`;
+    const versions =
+      table.versionsBefore === null
+        ? "?"
+        : `${table.versionsBefore}→${table.versionsAfter ?? "?"}`;
+    const failed = table.error ? ` 失败:${table.error}` : "";
+    return `${table.name}: ${table.optimizeMs}ms 文件${delta} 版本${versions} 合并${table.fragmentsRemoved}片 清旧版本${table.oldVersionsRemoved} 释放${(
+      table.bytesRemoved /
+      (1024 * 1024)
+    ).toFixed(1)}MB${failed}`;
+  });
+  return parts.join(" ｜ ");
+}
+
+function runVectorMaintenanceWorker(
+  tasks: {
+    /** 清理（compaction + 清旧版本）。 */
+    optimize?: boolean;
+    /** @deprecated 旧字段，等价于 optimize。 */
+    compact?: boolean;
+    /** @deprecated 旧字段，等价于 optimize。 */
+    cleanup?: boolean;
+    index?: boolean;
+    /** 建索引用：分区数（主进程算好传进来，worker 里不再依赖主进程状态 ✓）。 */
+    numPartitions?: number;
+    /** 只清这几张表（不传 = worker 默认四张表）。 */
+    tables?: string[];
+  },
+  timeoutMs = 30 * 60 * 1000
+): Promise<MaintenanceWorkerResult> {
+  return new Promise((resolve, reject) => {
+    let child: ReturnType<typeof fork>;
+    try {
+      child = fork(findVectorMaintenanceWorkerScript(), [], {
+        stdio: ["ignore", "ignore", "pipe", "ipc"],
+      });
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    // worker 的 stderr 收着（只留末尾一段）—— 失败时能直接给出原因 ✓。
+    let stderrTail = "";
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderrTail = `${stderrTail}${String(chunk)}`.slice(-2000);
+    });
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.kill();
+      reject(new Error(`维护 worker 超时（${timeoutMs}ms）`));
+    }, timeoutMs);
+
+    child.on("message", (message: { type?: string; ok?: boolean; result?: MaintenanceWorkerResult; error?: string }) => {
+      if (message?.type !== "result" || settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      child.kill();
+      if (message.ok && message.result) {
+        resolve(message.result);
+      } else {
+        reject(
+          new Error(
+            `${message.error ?? "维护 worker 失败"}${stderrTail ? ` :: ${stderrTail.trim()}` : ""}`
+          )
+        );
+      }
+    });
+    child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    /*
+     * 自用（2026-10-16，**修"worker 崩了以后维护静默卡死 30 分钟"** ✗→✓）：
+     * 原来只监听 `message` 与 `error` ✗ —— 而子进程在原生代码（optimize / createIndex，
+     * 几分钟级）里**崩溃或被系统杀掉**时，这两条都可能不触发 ✗ →
+     * `resolve/reject` 都不会发生 ✗ → `maintenanceRunning` 一直为 true ✓
+     * → 这期间所有维护请求（写向量/打标每批后都会调 ✓）**静默返回、连日志都没有** ✗，
+     * 碎片治理等于停了最长 30 分钟（要等超时 ✓）。
+     * 补一条 `close`：进程真的退出就立刻带 stderr 收尾 ✓。
+     */
+    child.on("close", (code, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(
+        new Error(
+          `维护 worker 意外退出（code=${code ?? "null"}, signal=${signal ?? "null"}）${stderrTail ? ` :: ${stderrTail.trim()}` : ""}`
+        )
+      );
+    });
+    child.send({
+      type: "run",
+      vectorsPath: path.join(getDataPath(), "vectors"),
+      tasks,
+    });
+  });
+}
+
+/**
+ * 自用（2026-10-16）：**库已经很干净就别折腾** ✓。
+ *
+ * 每次维护都要 fork 一个子进程 + 打开向量库；而「版本数」就是"自上次清理以来
+ * 写了几次"（LanceDB 每写一次就多一个版本 ✓）。
+ * 官方建议是「改了 20 次以上再 optimize」，所以版本数很少时直接跳过：
+ *   · 省掉一次没必要的子进程与磁盘往返 ✓
+ *   · 也避免维护在用户刚启动时无意义地"碰"向量库 ✓
+ * 有异常（查不出数据）时**照旧清一次**，不影响正确性 ✓。
+ */
+const NEGLIGIBLE_MAINTENANCE_VERSIONS = 8;
+
+/**
+ * 自用：跑一次 worker 维护并记日志（耗时与碎片数都来自 worker ✓）。
+ *
+ * 四道守卫，缺一不可：
+ *  ① 正在建向量 / 打标 → 不跑（两条链都在写同一张表，实测会把速度从 40+ 拖到 16 张/秒 ✗）。
+ *  ② 上一次还没跑完 → 不重入。
+ *  ③ 向量库没就绪 → 不跑。
+ *  ④ 版本数太少（没什么可清）→ 不跑（省一次子进程 ✓）。
+ */
+async function runMaintenanceInWorker(reason: string): Promise<void> {
+  if (maintenanceRunning) {
     return;
   }
-  maintenanceRunning = true;
+  if (!(isVectorDBReady && photoTable)) {
+    return;
+  }
+  if (getAiControlState() !== "idle") {
+    log.info(
+      `[AI] Maintenance deferred while AI is busy (${getAiControlState()}) — ${reason}`
+    );
+    return;
+  }
   try {
-    // Phase 1: compact files — merges fragmented data shards
-    try {
-      const maintenanceTable = photoTable as MaintenanceTable;
-      if (maintenanceTable.compactFiles) {
-        await maintenanceTable.compactFiles();
-        console.log("[AI] Maintenance: compactFiles OK");
-      }
-    } catch (err: unknown) {
-      console.warn(
-        "[AI] Maintenance: compactFiles skipped:",
-        getErrorMessage(err)
+    const versions = (await photoTable.listVersions()).length;
+    if (versions <= NEGLIGIBLE_MAINTENANCE_VERSIONS) {
+      log.info(
+        `[AI] Maintenance: skipped (only ${versions} version(s), nothing to clean) — ${reason}`
       );
+      return;
     }
-
-    // Phase 2: cleanup old versions — removes stale version history
-    try {
-      const maintenanceTable = photoTable as MaintenanceTable;
-      if (maintenanceTable.cleanupOldVersions) {
-        await maintenanceTable.cleanupOldVersions();
-        console.log("[AI] Maintenance: cleanupOldVersions OK");
+  } catch {
+    /* 查不出就照旧清一次 */
+  }
+  maintenanceRunning = true;
+  const startedAt = Date.now();
+  try {
+    log.info(`[AI] Maintenance: start in worker (${reason})`);
+    const result = await runVectorMaintenanceWorker({ optimize: true });
+    log.info(
+      `[AI] Maintenance: done in ${Date.now() - startedAt}ms (worker ${result.optimizeMs}ms) 文件总数 ${result.filesBefore}→${result.filesAfter} ｜ ${describeMaintenanceResult(result)}`
+    );
+    for (const table of result.tables) {
+      if (table.error) {
+        log.warn(`[AI] Maintenance: ${table.name} 清理失败 — ${table.error}`);
       }
-    } catch (err: unknown) {
-      console.warn(
-        "[AI] Maintenance: cleanupOldVersions skipped:",
-        getErrorMessage(err)
-      );
     }
+    if (result.skipped.length > 0) {
+      log.info(`[AI] Maintenance: skipped → ${result.skipped.join(", ")}`);
+    }
+  } catch (error) {
+    log.warn(`[AI] Maintenance: worker failed: ${getErrorMessage(error)}`);
   } finally {
     maintenanceRunning = false;
   }
 }
 
+/**
+ * 自用新增：**立刻**跑一次维护（供"大批量写入刚结束"时调用）。
+ *
+ * 为什么需要：全库 CCIP 特征会分几千批写入，LanceDB 每写一次就多一个版本
+ * —— 正是之前"1.9 万个文件 / 1.4 GB"那类碎片事故的成因。
+ * 自动维护虽然每 10 分钟一次，但用户可能写完就关软件了，所以**收尾时主动清一次** ✓。
+ */
+export async function runVectorMaintenanceNow(reason: string): Promise<void> {
+  await runMaintenanceInWorker(reason);
+}
+
+/**
+ * 自用（2026-10-16 重新开启自动维护）：
+ *
+ * 之前**默认关闭**的唯一理由是"清理动作占主线程 → 界面未响应"✗；
+ * 现在清理已经在 worker 进程里跑 ✓（主进程只 await 子进程，事件循环自由 ✓），
+ * 所以恢复为**默认开启**：
+ *   · 启动后 FIRST_MAINTENANCE_DELAY_MS（2 分钟）先补一次（把之前堆的碎片清掉 ✓）
+ *   · 之后每 10 分钟一次（AI 忙时自动让路 ✓）
+ *   · `AI_VECTOR_MAINTENANCE_MINUTES=0` 关闭；=任意正数 改间隔
+ */
 function scheduleVectorMaintenance(): void {
-  if (maintenanceTimer) {
+  const intervalMs = periodicMaintenanceIntervalMs();
+  if (!Number.isFinite(intervalMs)) {
+    log.info(
+      "[AI] Maintenance: 自动维护已关闭（AI_VECTOR_MAINTENANCE_MINUTES=0）"
+    );
     return;
   }
-  maintenanceTimer = setTimeout(() => {
-    runVectorMaintenance();
-    // 首次完成后切换为每日定时（24h）
-    maintenanceTimer = setInterval(runVectorMaintenance, 24 * 60 * 60 * 1000);
-  }, 30_000);
+  if (maintenanceTimer || firstMaintenanceTimer) {
+    return;
+  }
+  log.info(
+    `[AI] Maintenance: scheduled (first in ${Math.round(FIRST_MAINTENANCE_DELAY_MS / 1000)}s, then every ${Math.round(intervalMs / 60000)}min)`
+  );
+  firstMaintenanceTimer = setTimeout(() => {
+    firstMaintenanceTimer = null;
+    void runMaintenanceInWorker("startup catch-up");
+  }, FIRST_MAINTENANCE_DELAY_MS);
+  maintenanceTimer = setInterval(() => {
+    void runMaintenanceInWorker("periodic");
+  }, intervalMs);
+}
+
+/*
+ * 自用：定期维护的间隔。默认 **10 分钟** ✓
+ * （实测 2 分钟太勤：一次清理还没跑完下一次又该开始 ✗；
+ *   而现在清理在 worker 里、不再占主线程，10 分钟不会拖慢建向量 ✓）。
+ * 环境变量覆盖：`AI_VECTOR_MAINTENANCE_MINUTES=0` 表示**关闭**（方便对比验证）。
+ */
+function periodicMaintenanceIntervalMs(): number {
+  const raw = process.env.AI_VECTOR_MAINTENANCE_MINUTES;
+  if (raw === undefined || raw.trim() === "") {
+    return 10 * 60 * 1000;
+  }
+  const minutes = Number.parseFloat(raw);
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return minutes * 60 * 1000;
+}
+let lastPeriodicMaintenanceAt = 0;
+
+/**
+ * 自用（2026-10，**修"越跑越慢"**）：
+ * 建向量/打标都是往 LanceDB **追加**，每批都会产生新的数据碎片 ✗，
+ * 碎片越多、每次写入越慢（实测 47 张/秒 → 33 张/秒，且打标也一样）✓。
+ *
+ * 这个函数给"写入过程中"用的：每批写入后调用，最多每 10 分钟真正清一次 ✓。
+ * **AI 忙时直接返回、也不消耗配额** ✓ —— 否则清理会和写入抢同一张表。
+ */
+export function requestVectorMaintenance(): void {
+  if (maintenanceRunning) {
+    return;
+  }
+  if (getAiControlState() !== "idle") {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastPeriodicMaintenanceAt < periodicMaintenanceIntervalMs()) {
+    return;
+  }
+  lastPeriodicMaintenanceAt = now;
+  void runMaintenanceInWorker("after writes");
 }
 
 function clearVectorMaintenance(): void {
+  if (firstMaintenanceTimer) {
+    clearTimeout(firstMaintenanceTimer);
+    firstMaintenanceTimer = null;
+  }
   if (maintenanceTimer) {
     clearInterval(maintenanceTimer);
     maintenanceTimer = null;
@@ -408,11 +706,46 @@ async function initializeVectorDB(): Promise<void> {
             markIndexReady();
           }
 
-          const indexOk = await ensureVectorIndex();
-          if (!indexOk) {
-            console.warn(
-              "[AI] Proceeding without vector index — search may be slower"
-            );
+          /*
+           * 自用（2026-10，方案 A）：索引构建**不能在启动链上 await** ✗。
+           *
+           * IVF_PQ 在 2.2 万行要 30 秒、7.7 万行要 1~2 分钟（实测同步构建
+           * 卡住整个启动 → 界面白屏 ✗）；而且它在建之前会写"脏标记"，
+           * 中途被强杀（白屏时用户很可能这么做）→ 下次启动再建一遍 ✗。
+           *
+           * 现在改成后台建：数据库先就绪、界面立刻可用 ✓，
+           * 索引在后台慢慢建 ✓（没索引时搜索本来就有暴力兜底 ✓）。
+           * 这里的结果只用于打一条警告，没有任何逻辑依赖它，所以不 await 是安全的。
+           */
+          /*
+           * 自用（2026-10-16 恢复默认建索引）：
+           *
+           * 之前默认不建的唯一理由是"建索引是 30 秒~2 分钟的不可中断同步原生调用 ✗，
+           * 占住主线程 → 界面未响应"✗。现在这个调用已经在 **worker 进程**里跑 ✓
+           *（见 ensureVectorIndex → runVectorMaintenanceWorker({index:true})），
+           * 主进程只 await 子进程，界面全程流畅 ✓，所以恢复为**默认开启** ✓。
+           *
+           * 另外 ensureVectorIndex 里还有两道守卫，不会白建：
+           *   · AI 忙（正在建向量/打标）→ 不建 ✓
+           *   · 全库还有没处理完的照片（pending > 0）→ 不建 ✓
+           * 想手动关掉：设 `AI_VECTOR_INDEX=0` ✓
+           */
+          if (process.env.AI_VECTOR_INDEX === "0") {
+            log.info("[AI] Vector index build disabled by AI_VECTOR_INDEX=0");
+          } else {
+            ensureVectorIndex()
+              .then((indexOk) => {
+                log.info(
+                  indexOk
+                    ? "[AI] Vector index ensured in background"
+                    : "[AI] Proceeding without vector index — search may be slower"
+                );
+              })
+              .catch((err: unknown) => {
+                log.warn(
+                  `[AI] Background index build failed: ${getErrorMessage(err)}`
+                );
+              });
           }
 
           // ── 初始化颜色向量表（如不存在则创建） ───────────────
@@ -423,6 +756,9 @@ async function initializeVectorDB(): Promise<void> {
 
           // ── 自用新增：初始化 PixAI Tagger v1.0 特征表（1024 维）──
           await initPixaiTable(db);
+
+          // ── 自用新增：初始化 CCIP 角色特征表（768 维）──
+          await initCcipTable(db);
 
           // 后台回填已有的 dominant_colors 到 LanceDB 颜色表
           backfillColorVectors().catch((err) =>
@@ -630,6 +966,19 @@ export async function deletePhotoVectors(photoIds: number[]): Promise<void> {
     console.log(
       `[AI] Deleted vectors for ${uniqueIds.length} photos from LanceDB`
     );
+
+    /*
+     * 自用（2026-10-17，待办「deleteCcipVectors 未接线」）：**连带清另外两张表的特征** ✓
+     *
+     * 原来这里只删 `photo_embeddings` —— 照片删了，PixAI(1024 维) 与 CCIP(768 维) 的特征
+     * **永久留在库里** ✗（越积越多；角色识别的近邻检索还可能拿到"已经不存在的照片"）。
+     * 两个函数自身都是"表不存在就跳过、出错只记日志"✓，所以在这里直接调用，
+     * 不会影响删除主流程，也不需要每个调用方各改一遍 ✓（它们都走这个函数）。
+     */
+    await Promise.all([
+      deletePixaiVectors(uniqueIds),
+      deleteCcipVectors(uniqueIds),
+    ]);
   } catch (err: unknown) {
     console.error("[AI] Failed to delete vectors:", getErrorMessage(err));
     throw err;
@@ -696,13 +1045,101 @@ export async function ensureVectorIndex(force = false): Promise<boolean> {
     );
 
     if (hasIndex && !force) {
-      return true;
+      /*
+       * 自用（2026-10-16，**修"排序不准"**）：**旧的有损 PQ 索引自动换掉** ✗→✓。
+       *
+       * IVF_PQ 用乘积量化把向量**压缩**存储（省空间，但距离是近似值 ✗）：
+       * 分数会失真、真正的最近邻可能压根取不回来 ✗。
+       * 用户对比同类工具（同模型、同图库）发现排序明显不如对方 ✓ —— 对方用的是精确检索 ✓。
+       *
+       * 改成 IVF_FLAT（不压缩、精确距离）✓；**只重建索引，向量一个字节都不用动** ✓，
+       * 在 7.7 万行上建一次大约几十秒，只在第一次启动时发生 ✓。
+       */
+      const existing = indices.find(
+        (idx) => idx.columns.includes("vector") || idx.name === "vector_idx"
+      );
+      const isLossyPq = String(existing?.indexType ?? "")
+        .toUpperCase()
+        .includes("PQ");
+      if (!isLossyPq) {
+        return true;
+      }
+      log.info(
+        `[AI] 检测到有损索引 ${existing?.indexType}（排序会失真）→ 删除后改用 ivfFlat ✓`
+      );
+      try {
+        if (existing?.name) {
+          await photoTable.dropIndex(existing.name);
+        }
+      } catch (err: unknown) {
+        log.warn(`[AI] 删除旧索引失败：${getErrorMessage(err)}`);
+        return true;
+      }
+      // 落到下面继续重建 ✓
+    } else if (hasIndex && force) {
+      // 强制重建：直接把旧索引删掉再建 ✓
+      const existing = indices.find(
+        (idx) => idx.columns.includes("vector") || idx.name === "vector_idx"
+      );
+      try {
+        if (existing?.name) {
+          await photoTable.dropIndex(existing.name);
+        }
+      } catch {
+        /* 删不掉就交给 createIndex 覆盖 */
+      }
     }
 
     const rowCount = await photoTable.countRows();
     if (rowCount < MIN_VECTORS_FOR_INDEX) {
       console.log(
         `[AI] Index not needed: ${rowCount} < ${MIN_VECTORS_FOR_INDEX} threshold`
+      );
+      return true;
+    }
+
+    /*
+     * 自用（2026-10，方案 B）：**正在批量建向量时不要建索引**。
+     *
+     * 为什么：IVF_PQ 建索引是**同步长任务** —— 2.2 万行就要 30 秒，
+     * 7.7 万行会到 1~2 分钟，期间界面直接白屏/未响应。
+     * 而且建之前会写"脏标记"，中途被强杀（白屏时用户很可能这么做）
+     * 下次启动又会重建一遍 —— 于是"每次启动都要等好久"。
+     *
+     * 批量建向量期间搜索用暴力检索兜底（代码本来就有，5 万行以内够快），
+     * 等空闲了再建索引。
+     */
+    if (getAiControlState() !== "idle") {
+      log.info(
+        `[AI] Index build skipped while embedding is active (${getAiControlState()})`
+      );
+      return true;
+    }
+
+    /*
+     * 自用（2026-10，**对症修"卡死被 Windows 关掉"**）：
+     * 只要整库还有没处理的照片，就**不建索引**。
+     *
+     * 为什么：IVF_PQ 建索引是一次 30 秒~2 分钟的**不可中断同步原生调用** ✗，
+     * 期间主线程完全不响应 → Windows 判定 AppHang 并把应用关掉 ✗
+     *（实测事件日志 AppHangTransient / Application Hang）。
+     * 而整库没建完之前这个索引也没多大意义 —— 搜索本来就有暴力兜底 ✓。
+     * 等全部照片都处理完（pending === 0）再建一次即可 ✓。
+     */
+    const { getDatabase } = await import("@/db");
+    const { photos: photosTable } = await import("@/db/schema");
+    const { sql: sqlTag } = await import("drizzle-orm");
+    const pendingRows = getDatabase()
+      .select({ value: sqlTag<number>`count(*)` })
+      .from(photosTable)
+      .where(
+        sqlTag`${photosTable.isAiProcessed} = 0 AND ${photosTable.deletedAt} IS NULL`
+      )
+      .get();
+    const pendingCount = pendingRows?.value ?? 0;
+    if (pendingCount > 0) {
+      log.info(
+        `[AI] Index build skipped while ${pendingCount} photos are still pending`
       );
       return true;
     }
@@ -714,12 +1151,19 @@ export async function ensureVectorIndex(force = false): Promise<boolean> {
     // Crash-safety: mark dirty before the potentially-long index build,
     // so unclean shutdown during ANY index creation is detected on next startup.
     markIndexDirty();
-    await photoTable.createIndex("vector", {
-      config: LIdx.ivfPq({
-        numPartitions: Math.max(2, Math.floor(Math.sqrt(rowCount))),
-        distanceType: "cosine",
-      }),
+    /* 自用（2026-10）：建索引交给 worker（不可中断的同步原生调用 ✗ → 会卡界面 ✓）。 */
+    const indexResult = await runVectorMaintenanceWorker({
+      index: true,
+      numPartitions: rowCount,
     });
+    if (indexResult.skipped.includes("index-unavailable")) {
+      throw new Error("worker could not build index");
+    }
+    if (indexResult.skipped.includes("photo_embeddings-index-failed")) {
+      throw new Error(
+        `worker index build failed: ${indexResult.indexErrors.join("; ")}`
+      );
+    }
     console.log("[AI] Vector index ready");
     markIndexReady();
     return true;
@@ -1123,9 +1567,40 @@ export async function searchByWd14Vector(
   }
 }
 
+/**
+ * 主特征表（Chinese-CLIP 整图向量）的最近邻检索。
+ *
+ * 自用新增：人物识别需要「拿一个角色特征中心去找最像的图」，
+ * 原先只导出了 WD14 / PixAI / 颜色的检索，主特征只能按 id 批量取。
+ * 向量已归一化，故 l2 距离平方 d 对应余弦 1 - d/2。
+ */
+export async function searchByPhotoVector(
+  vector: number[] | Float64Array,
+  limit: number
+): Promise<Array<{ photoId: number; similarity: number }> | null> {
+  if (!photoTable) {
+    return null;
+  }
+  try {
+    const rawResults = (await photoTable
+      .vectorSearch(Array.from(vector))
+      .distanceType("l2")
+      .limit(limit)
+      .toArray()) as Record<string, unknown>[];
+    return rawResults
+      .map((row) => ({
+        photoId: row.photo_id as number,
+        similarity: Math.max(0, 1 - Number(row._distance ?? 0) / 2),
+      }))
+      .filter((hit) => Number.isFinite(hit.photoId));
+  } catch (err: unknown) {
+    console.warn("[AI] photo vector search failed:", getErrorMessage(err));
+    return null;
+  }
+}
+
 /** WD14 特征表里已有多少条（用于判断"以图搜图"该走哪条路）。 */
-export async function getWd14VectorCount(): Promise<number> {
-  if (!wd14Table) {
+export async function getWd14VectorCount(): Promise<number> {  if (!wd14Table) {
     return 0;
   }
   try {
@@ -1201,8 +1676,12 @@ async function ensurePixaiIndex(): Promise<boolean> {
       return true;
     }
     const { Index: LIdx } = await import("@lancedb/lancedb");
+    /*
+     * 自用（2026-10-16）：与 photo_embeddings 同样改用 **ivfFlat**（不压缩、精确距离 ✓），
+     * 理由见 ensureVectorIndex 里的说明 ✓（只重建索引，向量不动 ✓）。
+     */
     await pixaiTable.createIndex("vector", {
-      config: LIdx.ivfPq({
+      config: LIdx.ivfFlat({
         numPartitions: Math.max(2, Math.floor(Math.sqrt(rowCount))),
         distanceType: "cosine",
       }),
@@ -1336,6 +1815,320 @@ export async function deletePixaiVectors(photoIds: number[]): Promise<void> {
     }
   } catch (err: unknown) {
     console.warn("[AI] Delete PixAI vectors failed:", getErrorMessage(err));
+  }
+}
+
+// ── 自用新增：CCIP 角色特征表（768 维）────────────────────────────────
+//
+// 为什么也是**新表**：CCIP（deepghs/ccip-caformer_b36-24）是**角色专用**特征，
+// 实测输出 768 维（输入 1×3×384×384，ImageNet 归一化），与现有
+// photo_embeddings(512) / pixai_embeddings(1024) 都不同；同样只**新增**一张表，
+// 旧表一个都不动，便于实现「首选 CCIP、缺模型/关开关回退 CLIP」。
+// 向量在 worker 里已做 L2 归一化，故余弦相似度可用 `1 - d²/2` 近似。
+
+export const CCIP_TABLE_NAME = "ccip_embeddings";
+export const CCIP_VECTOR_DIM = 768;
+
+/** 向量维度必须是 768，否则抛错并说明实际维度（不静默丢弃）。 */
+function assertCcipVector(vector: number[], context: string): void {
+  if (vector.length !== CCIP_VECTOR_DIM) {
+    throw new Error(
+      `[AI] ${context}: expected vector dimension ${CCIP_VECTOR_DIM}, got ${vector.length}`
+    );
+  }
+}
+
+/** 为新表建 ANN 索引（与其它表同样的阈值 + cosine 配置）。行数不足或失败都不致命。 */
+async function ensureCcipIndex(): Promise<boolean> {
+  if (!ccipTable) {
+    return false;
+  }
+  try {
+    const indices = await ccipTable.listIndices();
+    const hasIndex = indices.some(
+      (idx) => idx.columns.includes("vector") || idx.name === "vector_idx"
+    );
+    if (hasIndex) {
+      return true;
+    }
+    const rowCount = await ccipTable.countRows();
+    if (rowCount < MIN_VECTORS_FOR_INDEX) {
+      console.log(
+        `[AI] CCIP index not needed: ${rowCount} < ${MIN_VECTORS_FOR_INDEX} threshold`
+      );
+      return true;
+    }
+    const { Index: LIdx } = await import("@lancedb/lancedb");
+    await ccipTable.createIndex("vector", {
+      config: LIdx.ivfFlat({
+        numPartitions: Math.max(2, Math.floor(Math.sqrt(rowCount))),
+        distanceType: "cosine",
+      }),
+    });
+    console.log(`[AI] CCIP vector index ready (${rowCount} rows)`);
+    return true;
+  } catch (err: unknown) {
+    console.warn("[AI] CCIP index creation skipped:", getErrorMessage(err));
+    return false;
+  }
+}
+
+/**
+ * 自用新增：**强制重建** CCIP 表的近邻索引。
+ *
+ * 为什么需要：LanceDB 的索引只覆盖"建索引那一刻已有的行"。全库特征生成会分几千批
+ * 写入，若跑完不重建，聚类要逐张查 7.7 万次近邻时就会**退化成暴力扫描**（慢上百倍 ✗）。
+ * 所以特征生成结束后必须重建一次。
+ */
+export async function rebuildCcipIndex(): Promise<boolean> {
+  if (!ccipTable) {
+    return false;
+  }
+  try {
+    const rowCount = await ccipTable.countRows();
+    if (rowCount < MIN_VECTORS_FOR_INDEX) {
+      console.log(
+        `[AI] CCIP index rebuild skipped: ${rowCount} < ${MIN_VECTORS_FOR_INDEX}`
+      );
+      return true;
+    }
+    const { Index: LIdx } = await import("@lancedb/lancedb");
+    await ccipTable.createIndex("vector", {
+      config: LIdx.ivfFlat({
+        numPartitions: Math.max(2, Math.floor(Math.sqrt(rowCount))),
+        distanceType: "cosine",
+      }),
+    });
+    console.log(`[AI] CCIP vector index rebuilt (${rowCount} rows)`);
+    return true;
+  } catch (err: unknown) {
+    console.warn("[AI] CCIP index rebuild failed:", getErrorMessage(err));
+    return false;
+  }
+}
+
+async function initCcipTable(db: LanceConnection): Promise<void> {
+  try {
+    const tableNames = await db.tableNames();
+    if (tableNames.includes(CCIP_TABLE_NAME)) {
+      setCcipTable(await db.openTable(CCIP_TABLE_NAME));
+      console.log("[AI] Opened existing ccip_embeddings table");
+      await ensureCcipIndex();
+      return;
+    }
+    const schema = new Schema([
+      new Field("photo_id", new Int32()),
+      new Field(
+        "vector",
+        new FixedSizeList(CCIP_VECTOR_DIM, new Field("item", new Float32()))
+      ),
+    ]);
+    setCcipTable(await db.createEmptyTable(CCIP_TABLE_NAME, schema));
+    console.log(
+      "[AI] Created ccip_embeddings table (FixedSizeList<Float32>[768])"
+    );
+    await ensureCcipIndex();
+  } catch (err: unknown) {
+    // 非关键路径：CCIP 表初始化失败只影响「角色识别」，不影响其它链路。
+    console.warn("[AI] CCIP table init skipped:", getErrorMessage(err));
+  }
+}
+
+/**
+ * 自用（2026-10-18 · 会话#9）：**纯新增**的 CCIP 特征写入（不先删）。
+ *
+ * 为什么需要：全库构建时，进到这里的照片都是"库里还没有特征"的（调用方已按 id 过滤），
+ * 再来一次 `delete ... IN (...)` 等于**每次全表扫描 + 一个多余事务**，纯浪费 ✗
+ * 实测这条 DELETE 是"算得挺快、但整体只有 20 张/秒"的重要一环 ✓
+ *
+ * ⚠️ 只用于"确认这些 id 一定没有旧特征"的场合（全库续算）；其它场合请用
+ * `upsertCcipVectors`（先删后插，幂等）。
+ */
+export async function addCcipVectors(
+  entries: Array<{ photoId: number; vector: number[] }>
+): Promise<void> {
+  if (entries.length === 0) {
+    return;
+  }
+  if (!ccipTable) {
+    throw new Error("ccip vector table is not initialized");
+  }
+  const CHUNK = 500;
+  for (let i = 0; i < entries.length; i += CHUNK) {
+    const chunk = entries.slice(i, i + CHUNK);
+    for (const entry of chunk) {
+      assertCcipVector(entry.vector, `addCcipVectors(photo ${entry.photoId})`);
+    }
+    await ccipTable.add(
+      chunk.map((entry) => ({
+        photo_id: entry.photoId,
+        vector: entry.vector,
+      }))
+    );
+  }
+}
+
+/** 批量写入 / 更新 CCIP 特征（先删后插，保证幂等）。 */
+export async function upsertCcipVectors(
+  entries: Array<{ photoId: number; vector: number[] }>
+): Promise<void> {
+  if (entries.length === 0) {
+    return;
+  }
+  if (!ccipTable) {
+    throw new Error("ccip vector table is not initialized");
+  }
+  const CHUNK = 500;
+  for (let i = 0; i < entries.length; i += CHUNK) {
+    const chunk = entries.slice(i, i + CHUNK);
+    for (const entry of chunk) {
+      assertCcipVector(entry.vector, `upsertCcipVectors(photo ${entry.photoId})`);
+    }
+    await ccipTable.delete(
+      `photo_id IN (${chunk.map((entry) => entry.photoId).join(",")})`
+    );
+    await ccipTable.add(
+      chunk.map((entry) => ({
+        photo_id: entry.photoId,
+        vector: entry.vector,
+      }))
+    );
+  }
+}
+
+/** 批量读取指定照片的 CCIP 特征（角色识别用；表不可用返回空 map）。 */
+export async function getCcipVectors(
+  photoIds: number[],
+  strict = false
+): Promise<Map<number, number[]>> {
+  const map = new Map<number, number[]>();
+  if (!(ccipTable && photoIds.length > 0)) {
+    return map;
+  }
+  try {
+    const uniqueIds = [...new Set(photoIds)];
+    const CHUNK = 2000;
+    for (let i = 0; i < uniqueIds.length; i += CHUNK) {
+      const slice = uniqueIds.slice(i, i + CHUNK);
+      const rows = (await ccipTable
+        .query()
+        .where(`photo_id IN (${slice.join(",")})`)
+        .toArray()) as Record<string, unknown>[];
+      for (const row of rows) {
+        const pid = row.photo_id as number;
+        const rawVec = row.vector;
+        if (pid == null || !rawVec) {
+          continue;
+        }
+        let vec: number[];
+        if (Array.isArray(rawVec)) {
+          vec = rawVec as number[];
+        } else if (isArrayLikeVector(rawVec)) {
+          vec = Array.from(rawVec.toArray());
+        } else if (ArrayBuffer.isView(rawVec)) {
+          vec = Array.from(rawVec as Float32Array);
+        } else if (isNumberIterable(rawVec)) {
+          vec = Array.from(rawVec);
+        } else {
+          continue;
+        }
+        if (vec.length > 0) {
+          map.set(pid, vec);
+        }
+      }
+    }
+  } catch (err: unknown) {
+    console.error("[AI] getCcipVectors failed:", getErrorMessage(err));
+    if (strict) {
+      throw err;
+    }
+  }
+  return map;
+}
+
+/** CCIP 特征 ANN 搜索（角色识别走 CCIP 时用）。表不可用返回 null。 */
+export async function searchByCcipVector(
+  vector: number[],
+  limit: number
+): Promise<Array<{ photoId: number; similarity: number }> | null> {
+  if (!ccipTable) {
+    return null;
+  }
+  try {
+    assertCcipVector(vector, "searchByCcipVector");
+    const rawResults = (await ccipTable
+      .vectorSearch(Array.from(vector))
+      .distanceType("l2")
+      .limit(limit)
+      .toArray()) as Record<string, unknown>[];
+    return rawResults
+      .map((row) => {
+        const distanceSquared = Number(row._distance ?? 0);
+        return {
+          photoId: row.photo_id as number,
+          similarity: Math.max(0, 1 - distanceSquared / 2),
+        };
+      })
+      .filter((hit) => Number.isFinite(hit.photoId));
+  } catch (err: unknown) {
+    console.warn("[AI] CCIP vector search failed:", getErrorMessage(err));
+    return null;
+  }
+}
+
+/** CCIP 特征表里已有多少条（用于判断角色识别能否走 CCIP）。 */
+export async function getCcipVectorCount(): Promise<number> {
+  if (!ccipTable) {
+    return 0;
+  }
+  try {
+    return await ccipTable.countRows();
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 列出已经有 CCIP 特征的照片 id（全库重算时用来**跳过算过的**，实现断点续跑）。
+ *
+ * 只取 `photo_id` 一列，7 万行量级下开销可接受。
+ */
+export async function listCcipVectorIds(): Promise<number[]> {
+  if (!ccipTable) {
+    return [];
+  }
+  try {
+    const rows = (await ccipTable
+      .query()
+      .select(["photo_id"])
+      .toArray()) as Array<{ photo_id?: number }>;
+    const ids: number[] = [];
+    for (const row of rows) {
+      if (typeof row.photo_id === "number") {
+        ids.push(row.photo_id);
+      }
+    }
+    return ids;
+  } catch (err: unknown) {
+    console.warn("[AI] listCcipVectorIds failed:", getErrorMessage(err));
+    return [];
+  }
+}
+
+/** 删除指定照片的 CCIP 特征（照片被删除时调用）。 */
+export async function deleteCcipVectors(photoIds: number[]): Promise<void> {
+  if (!(ccipTable && photoIds.length > 0)) {
+    return;
+  }
+  try {
+    const CHUNK = 500;
+    for (let i = 0; i < photoIds.length; i += CHUNK) {
+      await ccipTable.delete(
+        `photo_id IN (${photoIds.slice(i, i + CHUNK).join(",")})`
+      );
+    }
+  } catch (err: unknown) {
+    console.warn("[AI] Delete CCIP vectors failed:", getErrorMessage(err));
   }
 }
 
