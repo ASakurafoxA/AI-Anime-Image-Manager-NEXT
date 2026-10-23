@@ -108,7 +108,7 @@ zip 的 SHA256 开头：`8681DB576D6096C8`（完整值见 Release 说明 / 归�
 
 | 渠道 | 地址 |
 |---|---|
-| **GitHub Releases**（推荐） | NEXT 仓库的 `v2.2.3-20261018` 版本页 → `CCIP-Model-20261018.zip` |
+| **GitHub Releases**（推荐） | NEXT 仓库的 `v2.2.3-20261024` 版本页 → `CCIP-Model-20261018.zip` |
 | **网盘** | <https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>　提取码：`6666`（和安装包不是同一个链接，别拿错）|
 | **归档目录** | `F:\DSH工作区\收纳\CCIP模型-20261018.zip` |
 
