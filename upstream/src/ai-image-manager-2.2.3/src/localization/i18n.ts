@@ -1,4 +1,4 @@
-import i18n from "i18next";
+﻿import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import { LOCAL_STORAGE_KEYS } from "@/constants";
 
@@ -1038,6 +1038,14 @@ i18n.use(initReactI18next).init({
         manualRolesRenameSave: "保存",
         manualRolesRenameCancel: "取消",
         manualRolesRenamed: "已改名为「{{name}}」",
+        manualRolesSelectAll: "全选",
+        manualRolesDeselectAll: "全不选",
+        manualRolesDelete: "删除",
+        manualRolesDeleteTitle: "删除这个角色？",
+        manualRolesDeleteBody:
+          "会把「{{name}}」这个标签从所有照片上摘掉，并从「我创建的角色」里删除；照片本身不受影响，其它标签也不动。",
+        manualRolesDeleteConfirm: "删除",
+        manualRolesDeleted: "已删除「{{name}}」（摘掉 {{count}} 张图的标签）",
         manualRolesReturning: "退回中…",
         manualRolesReturnButton: "退回未命名（{{count}} 张）",
         manualRolesReturnTitle: "退回未命名？",
@@ -1890,6 +1898,7 @@ i18n.use(initReactI18next).init({
         duplicate: "复制",
         convertFormat: "格式转换",
         delete: "删除",
+        clearSelection: "取消选择",
         clearSelectionTitle: "取消选择 (Esc)",
         totalPhotosStatus: "共 {{count}} 张",
         sortDateDesc: "日期 新→旧",
@@ -3609,6 +3618,15 @@ i18n.use(initReactI18next).init({
         manualRolesRenameSave: "Save",
         manualRolesRenameCancel: "Cancel",
         manualRolesRenamed: 'Renamed to "{{name}}"',
+        manualRolesSelectAll: "Select all",
+        manualRolesDeselectAll: "Deselect all",
+        manualRolesDelete: "Delete",
+        manualRolesDeleteTitle: "Delete this character?",
+        manualRolesDeleteBody:
+          "The tag 「{{name}}」 will be removed from every photo and from 「Characters I created」. The photos themselves are not touched, and other tags stay.",
+        manualRolesDeleteConfirm: "Delete",
+        manualRolesDeleted:
+          'Deleted "{{name}}" (tag removed from {{count}} photos)',
         manualRolesReturning: "Returning…",
         manualRolesReturnButton: "Return {{count}} to unnamed",
         manualRolesReturnTitle: "Return to unnamed?",
@@ -4525,6 +4543,7 @@ i18n.use(initReactI18next).init({
         duplicate: "Duplicate",
         convertFormat: "Convert Format",
         delete: "Delete",
+        clearSelection: "Clear selection",
         clearSelectionTitle: "Clear selection (Esc)",
         totalPhotosStatus: "{{count}} total",
         sortDateDesc: "Date New→Old",

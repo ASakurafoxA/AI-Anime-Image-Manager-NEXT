@@ -76,6 +76,9 @@ export const faceActions = {
   /** 给手动创建的角色改名（标签名一起改） */
   renameManualCharacterRole: (input: { tagId: number; name: string }) =>
     ipc.client.photos.renameManualCharacterRole(input),
+  /** 删除「我创建的角色」（标签从所有照片上摘掉 + 删标签 + 删记录；照片本身不动） */
+  deleteManualCharacterRole: (input: { tagId: number }) =>
+    ipc.client.photos.deleteManualCharacterRole(input),
   /** 把某张图设为「我创建的角色」的图集封面 */
   setManualRoleCover: (input: {
     tagId: number;

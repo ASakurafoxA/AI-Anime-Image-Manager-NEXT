@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 人物识别页面里的「我创建的角色」区块（NEXT 版新增）。
  *
  * 用户口径（第三、四批实测反馈）：
@@ -10,7 +10,7 @@
  *     名字/张数/按钮**一行内垂直居中**、位置规整 ✓。
  */
 import { useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Check, Image as ImageIcon } from "lucide-react";
+import { ArrowLeft, Check, Image as ImageIcon, Pencil, X } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
@@ -70,6 +70,12 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
     count: number;
     role: ManualRole;
   } | null>(null);
+  /*
+   * 自用（2026-10-24 · 会话#10）：用户口径「创建的角色列表不能删除」→ 补删除。
+   * 删的是**标签本身**（从所有照片上摘掉）+「我创建的角色」记录；照片文件不动。
+   */
+  const [confirmDelete, setConfirmDelete] = useState<ManualRole | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [lightbox, setLightbox] = useState<{
     index: number;
     photos: RolePhoto[];
@@ -213,6 +219,35 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
     }
   }
 
+  /** 删除「我创建的角色」：标签从所有照片上摘掉 + 删标签 + 删记录。 */
+  async function doDelete(role: ManualRole) {
+    if (deleting) {
+      return;
+    }
+    setDeleting(true);
+    try {
+      const result = (await faceActions.deleteManualCharacterRole({
+        tagId: role.tagId,
+      })) as { removedPhotoLinks?: number; tagName?: string | null };
+      toast.success(
+        t("manualRolesDeleted", {
+          count: result.removedPhotoLinks ?? 0,
+          name: result.tagName ?? role.tagName,
+        })
+      );
+      if (expandedTagId === role.tagId) {
+        setExpandedTagId(null);
+      }
+      notifyTagChange();
+      onRenamed?.();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeleting(false);
+      setConfirmDelete(null);
+    }
+  }
+
   if (roles.length === 0) {
     return null;
   }
@@ -259,23 +294,31 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
           <span className="text-[11px] text-muted-foreground">
             {t("characterDiscoverySelectHint")}
           </span>
+          {/* 全选 / 全不选：同一个按钮按状态切换（2026-10-24 用户口径） */}
+          {list.length > 0 && (
+            <button
+              className="rounded-[4px] border border-border px-2 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+              onClick={() =>
+                setSelection((prev) => ({
+                  ...prev,
+                  [expandedRole.tagId]:
+                    chosen.size >= list.length
+                      ? new Set<number>()
+                      : new Set(list.map((photo) => photo.id)),
+                }))
+              }
+              type="button"
+            >
+              {chosen.size >= list.length
+                ? t("manualRolesDeselectAll")
+                : t("manualRolesSelectAll")}
+            </button>
+          )}
           {chosen.size > 0 && (
             <>
               <span className="text-[11px] text-foreground">
                 {t("characterDiscoverySelected", { count: chosen.size })}
               </span>
-              <button
-                className="text-[11px] text-muted-foreground underline transition-colors hover:text-foreground"
-                onClick={() =>
-                  setSelection((prev) => ({
-                    ...prev,
-                    [expandedRole.tagId]: new Set(),
-                  }))
-                }
-                type="button"
-              >
-                {t("characterDiscoveryClearSelection")}
-              </button>
               <button
                 className="rounded-[4px] border border-destructive/60 px-2 py-0.5 text-[11px] text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
                 disabled={returning}
@@ -302,7 +345,7 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
             {t("manualRolesNoPhotos")}
           </p>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,190px),1fr))] gap-4">
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,200px),1fr))] gap-4">
             {list.map((photo, photoIndex) => {
               const isPicked = chosen.has(photo.id);
               return (
@@ -421,7 +464,7 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
         </span>
       </div>
 
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,190px),1fr))] gap-4">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,210px),1fr))] gap-4">
         {roles.map((role) => {
           const list = photos[role.tagId] ?? [];
           const chosen = selection[role.tagId] ?? new Set<number>();
@@ -471,19 +514,23 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
                       value={draft}
                     />
                     <button
-                      className={BUTTON_CLASS}
+                      aria-label={t("manualRolesRenameSave")}
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[6px] text-success transition-colors hover:bg-success/10 disabled:opacity-50"
                       disabled={saving || draft.trim().length === 0}
                       onClick={() => void save(role.tagId)}
+                      title={t("manualRolesRenameSave")}
                       type="button"
                     >
-                      {t("manualRolesRenameSave")}
+                      <Check className="h-4 w-4" />
                     </button>
                     <button
-                      className="shrink-0 rounded-[6px] px-2 py-1 text-[12px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+                      aria-label={t("manualRolesRenameCancel")}
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[6px] text-destructive transition-colors hover:bg-destructive/10"
                       onClick={() => setEditingId(null)}
+                      title={t("manualRolesRenameCancel")}
                       type="button"
                     >
-                      {t("manualRolesRenameCancel")}
+                      <X className="h-4 w-4" />
                     </button>
                   </>
                 ) : (
@@ -497,14 +544,26 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
                       </span>
                     </div>
                     <button
-                      className={BUTTON_CLASS}
+                      aria-label={t("manualRolesRename")}
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[6px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
                       onClick={() => {
                         setEditingId(role.tagId);
                         setDraft(role.tagName);
                       }}
+                      title={t("manualRolesRename")}
                       type="button"
                     >
-                      {t("manualRolesRename")}
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      aria-label={t("manualRolesDelete")}
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[6px] text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                      disabled={deleting}
+                      onClick={() => setConfirmDelete(role)}
+                      title={t("manualRolesDelete")}
+                      type="button"
+                    >
+                      <X className="h-4 w-4" />
                     </button>
                   </>
                 )}
@@ -540,6 +599,23 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
           }}
           open
           title={t("manualRolesReturnTitle")}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          confirmText={t("manualRolesDeleteConfirm")}
+          description={t("manualRolesDeleteBody", {
+            name: confirmDelete.tagName,
+          })}
+          destructive
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => {
+            const role = confirmDelete;
+            setConfirmDelete(null);
+            void doDelete(role);
+          }}
+          open
+          title={t("manualRolesDeleteTitle")}
         />
       )}
     </section>

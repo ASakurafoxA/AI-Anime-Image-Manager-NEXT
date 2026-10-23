@@ -13,6 +13,7 @@ import {
 import { suggestTags as aiSuggestTags } from "@/services/ai-embedder";
 import {
   analyzeUnnamedCharacters as analyzeCharactersService,
+  collectDescendantTagIds,
   describeCharacterFeatureUnavailable,
   resolveCharacterFeatureAccess,
 } from "@/services/character-suggest";
@@ -35,6 +36,7 @@ import {
   markGroupNamed,
   pruneManualRoles,
   readCharacterGroups,
+  removeManualRole,
   renameManualRole,
   writeCharacterGroups,
 } from "@/services/character-group-store";
@@ -1017,8 +1019,18 @@ export const searchCharacterTags = os
       return current?.name ?? "";
     };
     const limit = input.limit ?? 20;
+    /*
+     * 自用（2026-10-24 · 会话#10）：用户反馈「命名的列表应该只检索角色名的 tag」——
+     * 命名框下面原来会把「通用」「作品系列」等分类里的同名标签也列出来（截图里
+     * `铃兰 (lily_of_the_valley) 通用` 就混在角色标签里）。
+     * 这里只保留「角色」分类子树下的标签。
+     */
+    const characterTagIds = new Set(collectDescendantTagIds(rows).ids);
     const matches = rows
       .filter((row) => {
+        if (!characterTagIds.has(row.id)) {
+          return false;
+        }
         const name = row.name.toLowerCase();
         return name.includes(query);
       })
@@ -1314,6 +1326,47 @@ export const renameManualCharacterRole = os
     invalidateTagSearch();
     return { ok: true, tagId: input.tagId, tagName: input.name };
   });
+
+/**
+ * 自用（2026-10-24 · 会话#10）：**删除「我创建的角色」**。
+ *
+ * 用户口径：这个列表要能删（截图里有个 0 张的角色删不掉）。
+ * 删除 = 把该标签从所有照片上摘掉 + 删标签 + 删「我创建的角色」记录；
+ * **照片本身不动**，其它标签也不动。子标签按 deleteTag 的口径挂回根级。
+ */
+export const deleteManualCharacterRole = os
+  .input(z.object({ tagId: z.number().int().positive() }))
+  .handler(({ input }) =>
+    withUserFacingError(async () => {
+      const db = getDatabase();
+      const tag = db
+        .select({ id: tags.id, name: tags.name })
+        .from(tags)
+        .where(eq(tags.id, input.tagId))
+        .get();
+      if (!tag) {
+        // 标签已经不存在了 → 只清掉记录（自愈）
+        removeManualRole(input.tagId);
+        return { ok: true, removedPhotoLinks: 0, tagId: input.tagId, tagName: null };
+      }
+      const links = db
+        .select({ id: photoTags.id })
+        .from(photoTags)
+        .where(eq(photoTags.tagId, input.tagId))
+        .all();
+      db.update(tags).set({ parentId: null }).where(eq(tags.parentId, input.tagId)).run();
+      db.delete(photoTags).where(eq(photoTags.tagId, input.tagId)).run();
+      db.delete(tags).where(eq(tags.id, input.tagId)).run();
+      removeManualRole(input.tagId);
+      invalidateTagSearch();
+      return {
+        ok: true,
+        removedPhotoLinks: links.length,
+        tagId: input.tagId,
+        tagName: tag.name,
+      };
+    })
+  );
 
 export const addTag = os
   .input(

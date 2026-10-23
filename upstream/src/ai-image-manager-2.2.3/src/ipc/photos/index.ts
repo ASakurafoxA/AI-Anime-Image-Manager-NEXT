@@ -1,4 +1,4 @@
-import {
+﻿import {
   getAdvancedExifStatus,
   pauseAdvancedExif,
   resumeAdvancedExif,
@@ -153,6 +153,7 @@ import {
   nameCharacterGroup,
   listManualCharacterRoles,
   renameManualCharacterRole,
+  deleteManualCharacterRole,
   setManualRoleCover,
 } from "./handlers/tags";
 
@@ -177,6 +178,7 @@ export const photos = {
   nameCharacterGroup,
   listManualCharacterRoles,
   renameManualCharacterRole,
+  deleteManualCharacterRole,
   setManualRoleCover,
   backfillMissingThumbnails,
   batchGenerateTags,
