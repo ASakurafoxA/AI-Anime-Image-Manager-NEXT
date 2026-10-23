@@ -1,4 +1,4 @@
-import { os } from "@orpc/server";
+import { ORPCError, os } from "@orpc/server";
 import { PRIVATE_BUILD } from "@/config/private-build";
 import { createLogger } from "@/utils/logger";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -1061,8 +1061,15 @@ export const nameCharacterGroup = os
     })
   )
   .handler(({ input }) => {
+    /*
+     * 自用（2026-10-23 · 会话#10）：这里的报错以前全是普通 Error，
+     * 经 oRPC 之后界面只显示 "Internal server error"（用户实测：「打不了标」）。
+     * 改成 ORPCError，提示原样送到界面。
+     */
     if (input.tagId == null && !input.name) {
-      throw new Error("要么选一个已有标签，要么输入新名字");
+      throw new ORPCError("BAD_REQUEST", {
+        message: "要么选一个已有标签，要么输入新名字",
+      });
     }
     const db = getDatabase();
     const rows = loadTagRows();
@@ -1075,7 +1082,9 @@ export const nameCharacterGroup = os
     if (input.tagId != null) {
       const picked = rows.find((row) => row.id === input.tagId);
       if (!picked) {
-        throw new Error("选中的标签不存在（可能已被删除），请重新选择");
+        throw new ORPCError("BAD_REQUEST", {
+          message: "选中的标签不存在（可能已被删除），请重新选择",
+        });
       }
       tagId = picked.id;
       tagName = picked.name;
@@ -1092,16 +1101,19 @@ export const nameCharacterGroup = os
        *   · 不是它 → 换个名字新建。
        */
       if (existing) {
-        throw new Error(
-          `标签库里已经有「${wanted}」。如果就是这个角色，请从输入框下面的建议里点选（那会按"导入已有标签"处理）；` +
-            `如果是同名的另一个角色，请换个名字。`
-        );
+        throw new ORPCError("BAD_REQUEST", {
+          message:
+            `标签库里已经有「${wanted}」。如果就是这个角色，请从输入框下面的建议里点选（那会按"导入已有标签"处理）；` +
+            `如果是同名的另一个角色，请换个名字。`,
+        });
       }
       const root = rows.find(
         (row) => row.parentId === null && row.name === CHARACTER_ROOT_TAG_NAME
       );
       if (!root) {
-        throw new Error("标签库里没有「角色」这个分类，无法新建角色标签");
+        throw new ORPCError("BAD_REQUEST", {
+          message: "标签库里没有「角色」这个分类，无法新建角色标签",
+        });
       }
       const inserted = db
         .insert(tags)
@@ -1109,7 +1121,9 @@ export const nameCharacterGroup = os
         .returning({ id: tags.id })
         .get();
       if (!inserted?.id) {
-        throw new Error("创建角色标签失败");
+        throw new ORPCError("INTERNAL_SERVER_ERROR", {
+          message: "创建角色标签失败",
+        });
       }
       tagId = inserted.id;
       tagName = wanted;

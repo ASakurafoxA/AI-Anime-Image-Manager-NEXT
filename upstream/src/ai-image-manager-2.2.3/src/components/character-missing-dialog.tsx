@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { PhotoLightbox, type LightboxPhoto } from "@/components/PhotoLightbox";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { LazyThumb } from "@/components/ui/lazy-thumb";
 import {
   Dialog,
   DialogContent,
@@ -159,6 +160,40 @@ export function CharacterMissingDialog({
     [expanded, groupPhotos]
   );
 
+  /**
+   * 自用（2026-10-23 · 会话#10）：**点缩影也能看大图**。
+   * 用户反馈：少于 5 张的行没有「展开」按钮，于是没有看大图的入口。
+   * 点缩略图 → 按需拉整组照片（缓存）→ 打开大图，并停在被点的那张。
+   */
+  const openLightboxAt = useCallback(
+    async (index: number, row: CharacterMissingRow, thumbIndex: number) => {
+      let photos = groupPhotos[index];
+      if (!photos || photos.length === 0) {
+        const ids = row.photoIds ?? [];
+        if (ids.length === 0) {
+          return;
+        }
+        setLoadingGroup(index);
+        try {
+          const result = (await faceActions.getCharacterGroupPhotos(ids)) as {
+            photos?: GroupPhoto[];
+          };
+          photos = result?.photos ?? [];
+          setGroupPhotos((prev) => ({ ...prev, [index]: photos as GroupPhoto[] }));
+        } catch (error) {
+          toast.error(error instanceof Error ? error.message : String(error));
+          return;
+        } finally {
+          setLoadingGroup(null);
+        }
+      }
+      if (photos && photos.length > 0) {
+        setLightbox({ index: Math.min(thumbIndex, photos.length - 1), photos });
+      }
+    },
+    [groupPhotos]
+  );
+
   function toggleSelect(index: number, photoId: number) {
     setSelection((prev) => {
       const next = new Set(prev[index] ?? []);
@@ -265,16 +300,12 @@ export function CharacterMissingDialog({
                 >
                   <div className="flex items-start gap-3">
                     <div className="flex shrink-0 items-center gap-1">
-                      {thumbs.slice(0, 5).map((thumb) => (
-                        <img
-                          alt=""
-                          className="h-12 w-12 rounded-[4px] object-cover"
-                          decoding="async"
-                          height={48}
+                      {thumbs.slice(0, 5).map((thumb, thumbIndex) => (
+                        <LazyThumb
+                          className="h-12 w-12 cursor-zoom-in rounded-[4px]"
                           key={thumb}
-                          loading="lazy"
+                          onClick={() => void openLightboxAt(index, row, thumbIndex)}
                           src={toLocalMediaUrl(thumb)}
-                          width={48}
                         />
                       ))}
                       {(row.photoIds?.length ?? 0) > 5 && (
@@ -381,11 +412,8 @@ export function CharacterMissingDialog({
                                   }
                                   type="button"
                                 >
-                                  <img
-                                    alt=""
-                                    className="aspect-square w-full rounded-[4px] object-cover"
-                                    decoding="async"
-                                    loading="lazy"
+                                  <LazyThumb
+                                    className="aspect-square w-full rounded-[4px]"
                                     src={toLocalMediaUrl(
                                       photo.thumbnailPath ?? photo.path
                                     )}

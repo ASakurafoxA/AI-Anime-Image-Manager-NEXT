@@ -5,7 +5,7 @@ import {
   useNavigate,
   useRouterState,
 } from "@tanstack/react-router";
-import { ArrowLeft, Ellipsis, Eraser, Play, User } from "lucide-react";
+import { ArrowLeft, ChevronDown, Ellipsis, Eraser, Play, User } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -148,6 +148,12 @@ export function PeoplePage() {
   }, [queryClient]);
 
   const [featureBusy, setFeatureBusy] = useState(false);
+  /*
+   * 自用（2026-10-23 · 会话#10）：用户口径「合并入口」——
+   * 原来工具栏并排两颗按钮（发现新角色 / 给已有角色补漏）名字长、看着像同一件事，
+   * 现在合成**一个「角色识别」按钮 + 两项菜单**。功能、接口、两道门禁都没动。
+   */
+  const [entryOpen, setEntryOpen] = useState(false);
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
   const [missingOpen, setMissingOpen] = useState(false);
   const [missingRows, setMissingRows] = useState<CharacterMissingRow[]>([]);
@@ -219,6 +225,13 @@ export function PeoplePage() {
     setMissingApplying(row.tagId);
     try {
       const result = (await faceActions.nameCharacterGroup({
+        /*
+         * 自用（2026-10-23 · 会话#10）：**必须带 tagId**。
+         * 这里原来只传 name，服务端会走"手动输入新名字"那条路，发现同名标签就拒绝，
+         * 客户端又只拿到 "Internal server error" → 用户看到的就是「打不了标」。
+         * 这一行本来就是「给已有角色补漏」，直接按 tagId 复用那个标签即可。
+         */
+        tagId: row.tagId,
         name: row.tagName,
         photoIds: targetIds,
       })) as { applied?: number; attempted?: number };
@@ -337,36 +350,61 @@ export function PeoplePage() {
         </div>
       </div>
 
-      {/* 工具栏：两颗识别按钮 */}
+      {/* 工具栏：一个「角色识别」入口 + 两项菜单（2026-10-23 合并入口） */}
       <div className="flex flex-wrap items-center gap-2 border-border border-b px-4 py-2 sm:px-6">
-        <button
-          className="rounded-[6px] border border-border bg-card px-3 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
-          disabled={!taggingReady || featureUnavailable}
-          onClick={() => setDiscoveryOpen(true)}
-          title={
-            (!taggingReady && taggingGateHint) ||
-            featureGateHint ||
-            t("characterDiscoveryHint")
-          }
-          type="button"
-        >
-          {t("characterDiscoveryTitle")}
-        </button>
-        <button
-          className="rounded-[6px] border border-border bg-card px-3 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
-          disabled={missingBusy || !taggingReady || featureUnavailable}
-          onClick={() => void handleDetectMissing()}
-          title={
-            (!taggingReady && taggingGateHint) ||
-            featureGateHint ||
-            t("peopleFindUnnamedCharactersHint")
-          }
-          type="button"
-        >
-          {missingBusy
-            ? t("peopleFindUnnamedCharactersBusy")
-            : t("peopleFindUnnamedCharacters")}
-        </button>
+        <Popover onOpenChange={setEntryOpen} open={entryOpen}>
+          <PopoverTrigger asChild>
+            <button
+              className="flex items-center gap-1 rounded-[6px] border border-border bg-card px-3 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+              disabled={missingBusy || !taggingReady || featureUnavailable}
+              title={
+                (!taggingReady && taggingGateHint) ||
+                featureGateHint ||
+                t("characterRecognitionHint")
+              }
+              type="button"
+            >
+              {missingBusy
+                ? t("peopleFindUnnamedCharactersBusy")
+                : t("characterRecognitionMenu")}
+              <ChevronDown className="h-3 w-3 opacity-70" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent align="start" className="w-80 gap-1 p-1">
+            <button
+              className="flex w-full flex-col gap-0.5 rounded-[6px] px-2.5 py-2 text-left transition-colors hover:bg-muted disabled:opacity-50"
+              disabled={!taggingReady || featureUnavailable}
+              onClick={() => {
+                setEntryOpen(false);
+                setDiscoveryOpen(true);
+              }}
+              type="button"
+            >
+              <span className="font-medium text-[12px] text-foreground">
+                {t("characterRecognitionDiscovery")}
+              </span>
+              <span className="text-[11px] text-muted-foreground leading-snug">
+                {t("characterDiscoveryHint")}
+              </span>
+            </button>
+            <button
+              className="flex w-full flex-col gap-0.5 rounded-[6px] px-2.5 py-2 text-left transition-colors hover:bg-muted disabled:opacity-50"
+              disabled={missingBusy || !taggingReady || featureUnavailable}
+              onClick={() => {
+                setEntryOpen(false);
+                void handleDetectMissing();
+              }}
+              type="button"
+            >
+              <span className="font-medium text-[12px] text-foreground">
+                {t("characterRecognitionMissing")}
+              </span>
+              <span className="text-[11px] text-muted-foreground leading-snug">
+                {t("peopleFindUnnamedCharactersHint")}
+              </span>
+            </button>
+          </PopoverContent>
+        </Popover>
         {/*
           自用（2026-10-20 · 会话#10）：**打标门禁提示要一直显示**。
           它原来被 `!featureGateHint` 挡在后面 —— 只要"角色特征还没算"，

@@ -966,6 +966,11 @@ i18n.use(initReactI18next).init({
         settingsCharacterWorkersPerCard: "角色识别进程数",
         settingsCharacterWorkersPerCardHint:
           "角色识别是「每张图解码+缩放」的瓶颈，进程越多越快：以每卡 1 个为 100%，实测 2 个约 151%、4 个约 220%，4 个之后不再变快（默认 4）。想更快选 4；机器很忙或不稳就往下调。建向量（CLIP）不受这个设置影响",
+        characterRecognitionMenu: "角色识别",
+        characterRecognitionHint:
+          "一个入口做两件事：发现新角色（把没有角色标签的图聚成组）/ 给已有角色补漏（找出没打这个标签的图）",
+        characterRecognitionDiscovery: "发现新角色（无标签聚类）",
+        characterRecognitionMissing: "给已有角色补漏",
         characterDiscoveryTitle: "识别无标签角色并命名",
         characterDiscoveryHint:
           "在「一张角色标签都没有」的图里做聚类，把像一个角色的图归成一组，你给每组起名字后批量打成 AI 建议标签（不覆盖已有标签）",
@@ -3524,6 +3529,11 @@ i18n.use(initReactI18next).init({
         settingsCharacterWorkersPerCard: "Character recognition processes",
         settingsCharacterWorkersPerCardHint:
           "Character recognition is bottlenecked by per-image decode and resize, so more workers is faster: taking 1 per GPU as 100%, measured about 151% with 2 and 220% with 4; it stops improving past 4 (default 4). Pick 4 for speed, lower it if the machine gets busy or unstable. Embedding (CLIP) is not affected by this setting",
+        characterRecognitionMenu: "Character recognition",
+        characterRecognitionHint:
+          "One entry for two jobs: find new characters (cluster untagged photos) / fill gaps for known characters (photos missing that tag)",
+        characterRecognitionDiscovery: "Find new characters (cluster untagged)",
+        characterRecognitionMissing: "Fill gaps for known characters",
         characterDiscoveryTitle: "Detect untagged characters and name them",
         characterDiscoveryHint:
           "Clusters photos that have no character tags at all, groups look-alikes, and lets you name each group to write AI-suggested tags (existing tags are never overwritten)",

@@ -26,6 +26,7 @@ import { faceActions } from "@/actions/faces";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { PhotoLightbox, type LightboxPhoto } from "@/components/PhotoLightbox";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { LazyThumb } from "@/components/ui/lazy-thumb";
 import {
   Dialog,
   DialogContent,
@@ -375,6 +376,41 @@ export function CharacterDiscoveryDialog({
     }
   }
 
+  /**
+   * 自用（2026-10-23 · 会话#10）：**点缩影也能看大图**。
+   * 用户反馈：少于 5 张的组没有「展开」按钮，于是没有看大图的入口。
+   * 这里点缩略图 → 先按需拉整组照片（缓存）→ 打开大图，并停在被点的那张。
+   */
+  async function openLightboxAt(
+    index: number,
+    group: CharacterGroupView,
+    thumbIndex: number
+  ) {
+    const key = group.representativeId;
+    let photos = groupPhotos[key];
+    if (!photos || photos.length === 0) {
+      setLoadingGroup(key);
+      try {
+        const result = (await faceActions.getCharacterGroupPhotos(
+          group.photoIds
+        )) as { photos?: GroupPhoto[] };
+        photos = result?.photos ?? [];
+        setGroupPhotos((prev) => ({ ...prev, [key]: photos as GroupPhoto[] }));
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : String(error));
+        return;
+      } finally {
+        setLoadingGroup(null);
+      }
+    }
+    if (photos && photos.length > 0) {
+      setLightbox({
+        index: Math.min(thumbIndex, photos.length - 1),
+        photos,
+      });
+    }
+  }
+
   /** 勾选 / 取消勾选一张图。 */
   function toggleSelect(key: number, photoId: number) {
     setSelection((prev) => {
@@ -682,15 +718,12 @@ export function CharacterDiscoveryDialog({
                 >
                   <div className="flex items-start gap-3">
                     <div className="flex shrink-0 items-center gap-1">
-                      {group.thumbnails.slice(0, 5).map((thumb) => (
-                        <img
-                          alt=""
-                          className="h-12 w-12 rounded-[4px] object-cover"
-                          height={48}
+                      {group.thumbnails.slice(0, 5).map((thumb, thumbIndex) => (
+                        <LazyThumb
+                          className="h-12 w-12 cursor-zoom-in rounded-[4px]"
                           key={thumb}
-                          loading="lazy"
+                          onClick={() => void openLightboxAt(index, group, thumbIndex)}
                           src={toLocalMediaUrl(thumb)}
-                          width={48}
                         />
                       ))}
                       {/* 展开/收起：看整组图 + 勾选部分图（用户要求） */}
@@ -839,12 +872,10 @@ export function CharacterDiscoveryDialog({
                                   {isPicked && <Check className="h-3.5 w-3.5" />}
                                 </button>
                                 {/* 点图片 = 看大图 */}
-                                <img
-                                  alt=""
-                                  className={`h-[76px] w-full cursor-zoom-in rounded-[4px] object-cover ${
+                                <LazyThumb
+                                  className={`h-[76px] w-full cursor-zoom-in rounded-[4px] ${
                                     isPicked ? "ring-2 ring-primary" : ""
                                   }`}
-                                  loading="lazy"
                                   onClick={() =>
                                     setLightbox({ index: photoIndex, photos })
                                   }
