@@ -86,5 +86,9 @@ Get-FileHash "<刚下载的文件>" -Algorithm SHA256
 | `wd14-models.zip` | 上表全部文件（含 `models/` 这一层）| `<图库>` |
 | `pixai-tagger-v1.0.zip`（仅 NEXT 需要）| `pixai-tagger-v1.0.onnx` + `config.json` | `<图库>\models` |
 
-> **网盘链接（PixAI 模型）**：<https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>　提取码：`6666`
+> **PixAI 打标模型怎么拿（两选一）**：
+> ① Releases 最早那版 [`v2.2.3` 的 `pixai-tagger-v1.0.zip`](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases/download/v2.2.3/pixai-tagger-v1.0.zip)；
+> ② 网盘（**与安装包同一目录**）：<https://pan.baidu.com/s/1jDBvv4tL9v5_BgYhRDJcGQ?pwd=6666>　提取码：`6666`
+>
+> ⚠️ 别和 CCIP 那个链接搞混：CCIP 是 <https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>（339 MB，放 `<图库>\models\ccip\`）。
 > 其余模型（中文 CLIP / WD14）都可以直接走官方源，不必放网盘。

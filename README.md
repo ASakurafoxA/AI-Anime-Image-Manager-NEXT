@@ -1,4 +1,4 @@
-﻿# AI Anime Image Manager NEXT（PixAI Tagger v1.0 · 自用修改）
+# AI Anime Image Manager NEXT（PixAI Tagger v1.0 · 自用修改）
 
 > **本项目是「AI Image Manager」的修改版** —— 基于 [Uyoung666/ai-image-manager](https://github.com/Uyoung666/ai-image-manager) **v2.2.3** 修改而来。
 > 上游采用 MIT License（Copyright © 2025 Luan Roger）；本仓库为个人自用修改版，与上游作者无关。
@@ -154,19 +154,34 @@ git apply --whitespace=nowarn ../patches/next.patch
 > 完整改动见 Releases 里的版本说明与 [使用说明.md](使用说明.md)。
 
 
-## 下载（网盘）
+## 下载
 
-| 内容 | 链接 |
-|---|---|
-| **安装包（三个版本的 MSI）** | <https://pan.baidu.com/s/1jDBvv4tL9v5_BgYhRDJcGQ?pwd=6666>　提取码：`6666` |
-| **PixAI 打标模型**（只有 NEXT 需要） | 与 **NEXT 安装包同一网盘目录**：<https://pan.baidu.com/s/1jDBvv4tL9v5_BgYhRDJcGQ?pwd=6666> 提取码 `6666` |
-| 模型（WD14 打标）| https://huggingface.co/SmilingWolf/wd-vit-tagger-v3 |
-| 模型（中文 CLIP 语义搜索，**已随安装包提供**）| https://huggingface.co/Xenova/chinese-clip-vit-base-patch16 |
-| **CCIP 角色识别模型**（三版共用，339 MB） | <https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666> 提取码 `6666`；放法见 [CCIP模型安装说明.md](CCIP模型安装说明.md) |
+**两种拿法**：Release 页直接下（推荐，附校验信息），或网盘 <https://pan.baidu.com/s/1jDBvv4tL9v5_BgYhRDJcGQ?pwd=6666> 提取码 `6666`（安装包与 PixAI 模型在同一目录）。
 
-> ⚠️ **版本号仍是 2.2.3**：如果你装过同一版本的旧安装包，请**先卸载旧的、再装新的**（卸载不会删图库和设置）。
+### 1. 安装包（MSI）
 
+| 版本 | 文件名 | 大约 |
+|---|---|---|
+| **NEXT**（本仓库，PixAI 打标） | `AI Anime Image Manager NEXT-2.2.3.6.msi` | 336 MB |
+| WD | `AI Anime Image Manager WD-2.2.3.4.msi` | 665 MB |
+| 本地版 | `AI Anime Image Manager-2.2.3.4.msi` | 665 MB |
 
+都在 [Releases](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases) 的最新版页面（**只保留最新一个安装包**）；
+每个仓库根目录 `校验信息.md` 里有 **MD5 / SHA-256**，下完先核对。
+
+> ⚠️ 版本号仍是 **2.2.3.x**：装过旧包请**先卸载旧的、再装新的**（卸载不会删图库和设置）。
+
+### 2. 模型（两个，别搞混）
+
+| 模型 | 谁需要 | 大小 | 从哪里下载 | 解压/放到 |
+|---|---|---|---|---|
+| **PixAI 打标模型**（给图片打标签） | **只有 NEXT** | 1.72 GB | ① Release 最早那版 [`v2.2.3` 的 `pixai-tagger-v1.0.zip`](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases/download/v2.2.3/pixai-tagger-v1.0.zip)<br>② 网盘（与安装包同一目录）：<https://pan.baidu.com/s/1jDBvv4tL9v5_BgYhRDJcGQ?pwd=6666> 提取码 `6666` | `<图库>\models\pixai-tagger-v1.0\` |
+| **CCIP 角色识别模型**（认角色用） | 三版**共用** | 339 MB | ① Release 最新版附件 `CCIP-Model-20261018.zip`<br>② 网盘：<https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666> 提取码 `6666` | `<图库>\models\ccip\model_feat.onnx` |
+
+- **中文 CLIP（语义搜图）已随安装包提供**，不用单独下。
+- 两个模型**不能互相替代**：PixAI 负责"打标签"，CCIP 负责"认角色"；WD / 本地版用包内的 WD14 打标，**不需要** PixAI。
+- 参考：WD14 上游 <https://huggingface.co/SmilingWolf/wd-vit-tagger-v3>；中文 CLIP 上游 <https://huggingface.co/Xenova/chinese-clip-vit-base-patch16>
+- 放法细节：[CCIP模型安装说明.md](CCIP模型安装说明.md)、[MODELS.md](MODELS.md)
 ## 构建
 
 ```powershell
