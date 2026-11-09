@@ -60,12 +60,37 @@ function buildOrtFeeds(ort, session, provided) {
   return feeds;
 }
 
-const toInt64 = (ort, tensor) =>
-  new ort.Tensor(
+/**
+ * 分词器给的张量 → ORT int64 输入。
+ *
+ * ⚠️ 自用（2026-11-08 · 会话#11 用户报「文本搜图搜不出任何结果」）：
+ * **不能直接读 `tensor.data`** ✗
+ *
+ * 现场：`onnxruntime-node` 升到 1.26 后，它的 `Tensor` 把数据放在 `cpuData`，
+ * `data` 只是原型上的 getter；而 `@xenova/transformers` 2.17.2 的 Tokenizer 用
+ * `Object.assign(this, new ONNXTensor(...))` **只复制自有属性** → 原型 getter 丢失，
+ * 分词结果的 `.data` 永远是 undefined → 这里 `BigInt64Array.from(undefined)` 抛出
+ * 「undefined is not iterable」→ 文本向量化整条链失败：
+ *   · 启动 warmup 报 `AI search warmup failed`
+ *   · 每次文本搜索报 `AI semantic recall degraded`，退化成只剩文件名/标签匹配 →
+ *     像「桌边的少女」「对着镜子自拍」这种自然语言描述必然 0 结果 ✗
+ *
+ * 修法：优先 `cpuData`（新 API），回退 `data`（旧 API），两边都兼容 ✓
+ * （ORT 自己的输出张量不受影响：它们的 `data` 仍能通过原型 getter 取到。）
+ */
+const tensorData = (tensor) => tensor?.cpuData ?? tensor?.data;
+
+const toInt64 = (ort, tensor) => {
+  const data = tensorData(tensor);
+  if (!data) {
+    throw new Error("Tokenizer tensor has no data (cpuData/data both missing)");
+  }
+  return new ort.Tensor(
     "int64",
-    BigInt64Array.from(tensor.data, (value) => BigInt(value)),
+    BigInt64Array.from(data, (value) => BigInt(value)),
     tensor.dims
   );
+};
 
 function validateAdapter(adapter) {
   if (!adapter || adapter.protocolVersion !== 1) {

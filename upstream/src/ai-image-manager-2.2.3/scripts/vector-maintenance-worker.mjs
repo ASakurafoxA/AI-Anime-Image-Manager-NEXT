@@ -56,6 +56,12 @@ const DEFAULT_TABLES = [
   "pixai_embeddings",
   "wd14_embeddings",
   "color_embeddings",
+  /*
+   * 自用（2026-11-08 · 会话#11 补）：**ccip_embeddings 原来不在这张清单里** ✗
+   * 它是「角色识别」用的表，全库算特征时分几千批写入 → 攒到 770 个碎片没人合并，
+   * 导致「识别漏标签」单次查询 850ms（合并后 6ms）。现在纳入默认清理范围 ✓
+   */
+  "ccip_embeddings",
 ];
 
 const INDEX_TABLES = ["photo_embeddings", "pixai_embeddings"];

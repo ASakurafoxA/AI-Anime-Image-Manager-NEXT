@@ -138,6 +138,22 @@ interface SemanticSearchMeta {
   used: boolean;
 }
 
+/**
+ * 自用（2026-11-09 · 会话#11）：语义这一路**这次没跑完**（超时 / 失败 / 不可用）的判定。
+ *
+ * 依据：`used === false` 说明这轮结果里没有任何语义证据；`reason` 是服务端在
+ * 语义分支被 reject 时写入的错误文案（例如 `[Timeout] AI semantic search exceeded 6000ms`）。
+ * 只有这两条同时成立才提示 —— 正常的"覆盖不全"由上面那条 state 提示负责，两者不重复 ✓
+ */
+function isSemanticDegraded(meta: SemanticSearchMeta | null): boolean {
+  if (!meta || meta.used) {
+    return false;
+  }
+  return /timeout|timed out|failed|unavailable|error/i.test(
+    String(meta.reason ?? "")
+  );
+}
+
 interface SequenceDataSource {
   key: string;
   photoIds: number[];
@@ -323,6 +339,15 @@ function HomePage() {
     minSimilarity?: number;
   } | null>(null);
   const lastImageSearchPathRef = useRef<string | null>(null);
+  /*
+   * 自用（2026-11-08 · 会话#11 用户要求）：「继续搜索相似图像」。
+   *
+   * 背景：以图搜图是两段式的 —— 查询图若是**库里已存过的整图**，指纹几毫秒命中就直接返回，
+   * 语义检索被跳过（当年因为"以图搜图好慢"改的），所以只能看到那 1 张、没有相似图。
+   * 这个按钮补上那条路：跳过指纹、只跑语义（PixAI 1024 维特征做余弦检索，约 6~10 秒）。
+   */
+  const [imageSearchSimilarBusy, setImageSearchSimilarBusy] = useState(false);
+  const [imageSearchSimilarTried, setImageSearchSimilarTried] = useState(false);
   const colorHex = filter.appliedSearch?.colorHex ?? null;
   const [lightboxIndex, setLightboxIndex] = useState(-1);
   // 自用版：序列功能已隐藏，浏览模式恒为「照片」
@@ -469,6 +494,18 @@ function HomePage() {
       return !previous;
     });
   }, []);
+  /*
+   * 自用（2026-11-08 · 会话#11，**已回退** #2026-11-08-09 的"切换开关就重搜"）：
+   *
+   * 原意是"像浏览那样重新取数"，但实测：
+   *   切换 → 触发一次完整语义搜索 → 冷启动时**语义检索 6 秒超时**
+   *   → 降级成 SQLite-only（只按文件名/标签）→ 自然语言查询 **0 结果** ✗
+   *   用户看到的就是「结果明明出来了，切换后整体灰白一下，然后变成无结果」。
+   *
+   * 现在改成：**切换开关只在已有结果上做显示过滤**（`searchPhotosForDisplay` 里的
+   * `inHiddenFolder` 判断），毫秒级完成、不联网、不会超时 ✓
+   * 隐藏的那些照片本来就在结果集里（检索始终搜全库），所以"关掉隐藏"能立刻插回原位 ✓
+   */
   const [addToAlbumIds, setAddToAlbumIds] = useState<number[]>([]);
   /** 自用版新增：批量打标签的目标照片（空数组 = 未打开） */
   const [batchTagIds, setBatchTagIds] = useState<number[]>([]);
@@ -499,7 +536,21 @@ function HomePage() {
    * 注意：这是**每次启动/刷新的初始值** ✓（没有持久化 ✓），拖过之后按当前会话算 ✓。
    */
   const [searchMinSimilarity, setSearchMinSimilarity] = useState(0.4);
-  const [searchResultLimit, setSearchResultLimit] = useState(100);
+  /*
+   * 自用（2026-11-09 · 会话#11 用户报「选了 300 但结果恒定 200」）：
+   * 主进程里 `SEMANTIC_MAX_DEPTH = 200` 是**语义召回的深度硬上限**
+   *（再大就会把 LanceDB 那一路拖过熔断线 → 整路被丢弃 → 纯中文查询变 0 结果）。
+   * 所以「最多显示」永远拿不到 200 以上，界面上给 300 只会骗人 ✗
+   * 这里把上限对齐成 200，并把历史保存值（可能存着 300）夹回来 ✓
+   */
+  const MAX_SEARCH_RESULT_LIMIT = 200;
+  const [searchResultLimit, setSearchResultLimit] = useState(() => {
+    const saved = Number(localStorage.getItem("aim.searchResultLimit"));
+    if (!Number.isFinite(saved) || saved <= 0) {
+      return 100;
+    }
+    return Math.min(MAX_SEARCH_RESULT_LIMIT, saved);
+  });
   const [sortOrder, setSortOrder] = useState<SortOrder>(loadSortOrder);
   const [gridColumnWidth, setGridColumnWidth] = useState(loadGridColumnWidth);
   const [galleryToolbarHeight, setGalleryToolbarHeight] = useState(52);
@@ -2286,6 +2337,18 @@ function HomePage() {
     !filter.favoriteOnly
       ? searchExactTotal
       : photos.length;
+  /*
+   * 自用（2026-11-08 · 会话#11）：「继续搜索相似图像」的显示条件 ——
+   * 只有「以图搜图、已经出结果、而且**全都是指纹命中的同一张图**（没有语义相似结果）」时才出现。
+   * 语义结果一旦补进来，条件自然不再成立，按钮不会一直挂着 ✓
+   */
+  const showImageSearchSimilarPrompt =
+    searchMode === "image" &&
+    !(searchLoading || imageSearchSimilarTried) &&
+    (searchResults?.length ?? 0) > 0 &&
+    (searchResults ?? []).every(
+      (photo) => (photo as { isExactCopy?: boolean }).isExactCopy === true
+    );
   const totalPhotos = isSearching ? searchDisplayCount : totalAllFromQuery;
   const loading = isSearching
     ? searchLoading
@@ -3333,6 +3396,9 @@ function HomePage() {
     setSearchLoading(true);
     setSearchError(null);
     setSearchHasMore(false);
+    // 新一轮以图搜图 → 「继续搜索相似图像」的试过/进行中状态要清掉
+    setImageSearchSimilarBusy(false);
+    setImageSearchSimilarTried(false);
     const startTime = performance.now();
     try {
       const previewPromise = imageSearchActions
@@ -3408,6 +3474,60 @@ function HomePage() {
       if (gen === searchGenerationRef.current) {
         setSearchLoading(false);
       }
+    }
+  }
+
+  /**
+   * 自用（2026-11-08 · 会话#11 用户要求）：「继续搜索相似图像」——
+   * 跳过指纹、只跑语义检索，把结果**追加**到当前列表后面（已存过的那张仍排第一）。
+   *
+   * 为什么不在原搜索里直接跑：指纹命中是 3ms 秒回（当年按"以图搜图好慢"定的口径），
+   * 想要相似图得单独给一个入口，让用户自己决定要不要多等这 6~10 秒 ✓
+   */
+  async function handleImageSearchSimilar() {
+    const imagePath = filter.appliedSearch?.imagePath ?? null;
+    if (!(imagePath && !imageSearchSimilarBusy)) {
+      return;
+    }
+    const gen = searchGenerationRef.current;
+    setImageSearchSimilarBusy(true);
+    try {
+      const result = await imageSearchActions.search(imagePath, 500, {
+        semanticOnly: true,
+      });
+      // 竞态保护：这期间用户换了搜索 → 丢弃这次结果
+      if (gen !== searchGenerationRef.current) {
+        return;
+      }
+      const similar = ((result as { results?: Photo[] }).results ?? []).filter(
+        (photo) => photo.id != null
+      );
+      const existing = searchResults ?? [];
+      const seen = new Set(existing.map((photo) => photo.id));
+      const added = similar.filter((photo) => !seen.has(photo.id));
+      const merged = [...existing, ...added];
+      setSearchResults(merged);
+      setSearchResultSourceKey(
+        createSearchResultSourceKey(
+          gen,
+          merged.map((photo) => photo.id)
+        )
+      );
+      if (added.length > 0) {
+        toast.success(t("imageSearchSimilarFound", { count: added.length }));
+      } else {
+        toast.info(t("imageSearchSimilarEmpty"));
+      }
+    } catch (error) {
+      console.warn(
+        "[ImageSearch] similar search failed:",
+        error instanceof Error ? error.message : error
+      );
+      toast.error(t("toastImageSearchFailed"));
+    } finally {
+      // 失败也算"试过了"，别让按钮一直挂着诱导重复点
+      setImageSearchSimilarTried(true);
+      setImageSearchSimilarBusy(false);
     }
   }
 
@@ -3850,24 +3970,44 @@ function HomePage() {
                       : null}
                   </label>
                 )}
-                <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
-                  <span>{t("searchResultLimit")}</span>
-                  <select
-                    aria-label={t("searchResultLimit")}
-                    className="h-6 rounded border border-border bg-card px-1 text-[11px]"
-                    onChange={(event) =>
-                      // 上限 300 是接口契约（shared.ts 的 CompoundSearchSchema），
-                      // 超过会被拒绝并导致"0 结果但不报错"
-                      setSearchResultLimit(Math.min(300, Number(event.target.value)))
-                    }
-                    value={searchResultLimit}
-                  >
-                    <option value={30}>30</option>
-                    <option value={100}>100</option>
-                    <option value={200}>200</option>
-                    <option value={300}>300</option>
-                  </select>
-                </label>
+                {/*
+                 * 自用（2026-11-08 · 会话#11 用户口径）：
+                 * 「主界面不用显示这个『最多显示 100』，这个是文本搜图的时候用的，
+                 *   主界面显示没用，还容易有歧义」「以图搜图这边也生效的吗？不生效就去掉」
+                 *
+                 * 事实：这个值只喂给 `performSearch` 的 `searchParams.limit`
+                 * —— 只有 **text / exif / color** 三种搜索走它；
+                 *   · 纯浏览不经过 performSearch → 不生效 ✗
+                 *   · 以图搜图走 `imageSearchActions.search(imagePath, 500)`（上限写死 500）→ 也不生效 ✗
+                 * 两种情况都不该显示，否则会误导成"这界面只给 100 张 / 500 张"。
+                 * 所以：只在**文本 / 筛选类搜索**时显示；出结果时它随工具条换行到搜索框下面 ✓
+                 */}
+                {searchMode && searchMode !== "image" && (
+                  <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                    <span>{t("searchResultLimit")}</span>
+                    <select
+                      aria-label={t("searchResultLimit")}
+                      className="h-6 rounded border border-border bg-card px-1 text-[11px]"
+                      onChange={(event) => {
+                        // 2026-11-09：上限对齐到语义召回深度（200），并记住选择
+                        const next = Math.min(
+                          MAX_SEARCH_RESULT_LIMIT,
+                          Number(event.target.value)
+                        );
+                        setSearchResultLimit(next);
+                        localStorage.setItem(
+                          "aim.searchResultLimit",
+                          String(next)
+                        );
+                      }}
+                      value={searchResultLimit}
+                    >
+                      <option value={30}>30</option>
+                      <option value={100}>100</option>
+                      <option value={200}>200</option>
+                    </select>
+                  </label>
+                )}
                 <SortDropdown
                   onChange={handleSortChange}
                   order={sortOrder}
@@ -3901,6 +4041,38 @@ function HomePage() {
                       indexed: searchSemantic.indexedPhotos,
                       total: searchSemantic.totalPhotos,
                     })}
+              </div>
+            )}
+          {/*
+           * 自用（2026-11-09 · 会话#11）：**语义这一路这次没跑完**（超时 / 失败）时要说出来 ✗→✓
+           *
+           * 以前：超时只写进 `semantic.reason`，界面判断的是 `state`（只反映索引覆盖），
+           * 于是"搜失败了"被显示成"库里没有" —— 用户根本分不清 ✗
+           * 现在：明确提示 + 一键重试（重试时通常已热，成功率很高）✓
+           */}
+          {searchMode !== null &&
+            searchMode !== "image" &&
+            !searchLoading &&
+            isSemanticDegraded(searchSemantic) && (
+              <div className="flex flex-wrap items-center gap-3 border-amber-300 border-b bg-amber-50 px-4 py-2 text-amber-900 text-xs dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+                <span>{t("semanticSearchDegraded")}</span>
+                <button
+                  className="rounded-[6px] border border-amber-400/70 bg-amber-100/70 px-2 py-0.5 font-medium text-amber-900 transition-colors hover:bg-amber-200/80 dark:bg-amber-900/40 dark:text-amber-100"
+                  onClick={() => {
+                    const applied = filter.appliedSearch;
+                    if (!applied) {
+                      return;
+                    }
+                    void performSearch(
+                      applied.query ?? "",
+                      applied.filters,
+                      applied.colorHex ?? undefined
+                    );
+                  }}
+                  type="button"
+                >
+                  {t("semanticSearchRetry")}
+                </button>
               </div>
             )}
         </div>
@@ -4002,8 +4174,27 @@ function HomePage() {
                   selectedIds={selectedIds}
                   semanticTopSimilarity={searchSemantic?.topSimilarity}
                   sequenceError={sequenceError}
+                  /*
+                   * 自用（2026-11-08 · 会话#11）：搜索时**关掉虚拟窗口**，按布局全量渲染。
+                   * 搜索结果有上限（≤300），代价可接受；换来的是不再出现
+                   * "留白 / 灰块 / 滚动闪烁"这类由虚拟窗口在列表骤变时算错引起的问题 ✓
+                   */
+                  disableVirtualization={isSearching}
+                  /*
+                   * 自用（2026-11-08 · 会话#11 用户报「开关眼睛之后整屏灰块、还点不动」）：
+                   * 灰块是 PhotoGrid 的**加载骨架**（不可点）。触发条件是
+                   * `sequenceLoading || (loading && photos.length === 0)`。
+                   *
+                   * 现场：搜索出了结果，但「隐藏目录」开关把这些结果全过滤掉了 →
+                   * 显示用的照片是 0 张；而序列视图还要等一次"来源就绪"才肯结束加载，
+                   * 于是骨架屏一直挂着 ✗（既不显示"没有匹配的图片"，也不恢复列表）。
+                   *
+                   * 修法：**没有照片可显示时不要再当成"加载中"** ——
+                   * 搜索已经结束、且一张都不剩，就让网格去渲染空状态 ✓
+                   */
                   sequenceLoading={
-                    !(sequenceViewReady || gallerySnapshot.retaining)
+                    !(sequenceViewReady || gallerySnapshot.retaining) &&
+                    !(isSearching && !searchLoading && photos.length === 0)
                   }
                   sequenceMode={gallerySnapshot.value.mode}
                   sequences={gallerySnapshot.value.sequences}
@@ -4012,6 +4203,30 @@ function HomePage() {
                   sortOrder={sortOrder}
                   topInset={galleryToolbarHeight}
                 />
+                {/*
+                 * 自用（2026-11-08 · 会话#11 用户要求）：结果下方的空白处给一个
+                 * 「继续搜索相似图像」入口 —— 指纹只回答"这张你存过"，要按画面/角色找相似
+                 * 得再跑一次语义检索（PixAI 1024 维特征做余弦检索，约 6~10 秒）。
+                 */}
+                {showImageSearchSimilarPrompt && (
+                  <div className="pointer-events-none absolute inset-x-0 bottom-6 z-[6] flex justify-center px-4">
+                    <div className="pointer-events-auto flex max-w-[560px] flex-col items-center gap-2 rounded-[10px] border border-border bg-card/95 px-4 py-3 text-center shadow-lg backdrop-blur-sm">
+                      <p className="text-[11px] text-muted-foreground">
+                        {t("imageSearchSimilarHint")}
+                      </p>
+                      <button
+                        className="rounded-[6px] bg-primary px-3 py-1.5 font-medium text-[12px] text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-progress disabled:opacity-70"
+                        disabled={imageSearchSimilarBusy}
+                        onClick={() => void handleImageSearchSimilar()}
+                        type="button"
+                      >
+                        {imageSearchSimilarBusy
+                          ? t("imageSearchSimilarRunning")
+                          : t("imageSearchSimilarButton")}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
               <GalleryRestoreOverlay
                 active={restorePending && !gallerySnapshot.retaining}

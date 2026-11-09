@@ -11,7 +11,8 @@
  */
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, Image as ImageIcon, Pencil, X } from "lucide-react";
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { toast } from "sonner";
@@ -91,6 +92,38 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
     y: number;
   } | null>(null);
   const [settingCover, setSettingCover] = useState(false);
+  const coverMenuRef = useRef<HTMLDivElement>(null);
+  const [coverMenuPos, setCoverMenuPos] = useState({ left: 8, top: 8 });
+
+  /*
+   * 自用（2026-11-08 · 会话#11 用户反馈）：右键「设为图集封面」的菜单跑到离鼠标很远的地方 ✗
+   *
+   * 真因：菜单原来直接挂在 `<section className="album-view-enter">` 里面。那个动画是
+   * `animation-fill-mode: both`，播完后 `transform: translateY(0) scale(1)` **仍然生效**；
+   * 而 CSS 规定「祖先只要带 transform，`position: fixed` 子元素的参照系就变成这个祖先」
+   * → `left/top = clientX/clientY` 又被 section 自身的偏移平移了一次，看起来就"飘走了"。
+   * （同一个道理也解释了很多"fixed 弹层位置不对"的老问题。）
+   *
+   * 修法：① 遮罩和菜单都 **portal 到 body**，彻底不受祖先 transform 影响 ✓
+   *       ② 顺手夹进视口，右键屏幕右下角时菜单不会溢出窗口 ✓
+   */
+  useLayoutEffect(() => {
+    if (!coverMenu) {
+      return;
+    }
+    const margin = 8;
+    const width = coverMenuRef.current?.offsetWidth ?? 160;
+    const height = coverMenuRef.current?.offsetHeight ?? 40;
+    const left = Math.max(
+      margin,
+      Math.min(coverMenu.x, window.innerWidth - width - margin)
+    );
+    const top = Math.max(
+      margin,
+      Math.min(coverMenu.y, window.innerHeight - height - margin)
+    );
+    setCoverMenuPos({ left, top });
+  }, [coverMenu]);
 
   async function setAsCover() {
     if (!coverMenu || settingCover) {
@@ -393,31 +426,34 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
           </div>
         )}
 
-        {coverMenu && (
-          <>
-            {/* 点别处关掉菜单 */}
-            <button
-              aria-label={t("close")}
-              className="fixed inset-0 z-[999] cursor-default"
-              onClick={() => setCoverMenu(null)}
-              type="button"
-            />
-            <div
-              className={`${menuClass} fixed z-[1000] min-w-[160px] overflow-hidden rounded-[8px] border border-border bg-popover p-1 shadow-xl`}
-              style={{ left: coverMenu.x, top: coverMenu.y }}
-            >
+        {coverMenu &&
+          createPortal(
+            <>
+              {/* 点别处关掉菜单 */}
               <button
-                className="flex w-full items-center gap-2 rounded-[6px] px-2.5 py-2 text-left text-[12px] text-foreground hover:bg-muted disabled:opacity-50"
-                disabled={settingCover}
-                onClick={() => void setAsCover()}
+                aria-label={t("close")}
+                className="fixed inset-0 z-[999] cursor-default"
+                onClick={() => setCoverMenu(null)}
                 type="button"
+              />
+              <div
+                className={`${menuClass} fixed z-[1000] min-w-[160px] overflow-hidden rounded-[8px] border border-border bg-popover p-1 shadow-xl`}
+                ref={coverMenuRef}
+                style={coverMenuPos}
               >
-                <ImageIcon className="h-3.5 w-3.5" />
-                {t("manualRolesSetCover")}
-              </button>
-            </div>
-          </>
-        )}
+                <button
+                  className="flex w-full items-center gap-2 rounded-[6px] px-2.5 py-2 text-left text-[12px] text-foreground hover:bg-muted disabled:opacity-50"
+                  disabled={settingCover}
+                  onClick={() => void setAsCover()}
+                  type="button"
+                >
+                  <ImageIcon className="h-3.5 w-3.5" />
+                  {t("manualRolesSetCover")}
+                </button>
+              </div>
+            </>,
+            document.body
+          )}
 
         {lightbox && (
           <PhotoLightbox

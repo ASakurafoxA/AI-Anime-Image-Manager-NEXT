@@ -1,4 +1,4 @@
-﻿import {
+import {
   getAdvancedExifStatus,
   pauseAdvancedExif,
   resumeAdvancedExif,
@@ -26,6 +26,7 @@ import {
 } from "./handlers/duplicate-cleanup";
 import {
   applyDuplicateKeepCountHandler,
+  applyDuplicateKeepCountToAllHandler,
   updateDuplicateReview,
 } from "./handlers/duplicate-review";
 import {
@@ -159,6 +160,7 @@ import {
 
 export const photos = {
   applyDuplicateKeepCount: applyDuplicateKeepCountHandler,
+  applyDuplicateKeepCountToAll: applyDuplicateKeepCountToAllHandler,
   addTag,
   analyzeUnnamedCharacters,
   getCharacterSuggestProgress,

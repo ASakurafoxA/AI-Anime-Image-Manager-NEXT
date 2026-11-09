@@ -349,6 +349,63 @@ export function CharacterDiscoveryDialog({
     setSuggestions((prev) => ({ ...prev, [index]: [] }));
   }
 
+  /**
+   * 自用（2026-11-08 · 会话#11 用户口径）：
+   * 「≤5 张就不用再展开了，直接在小图上操作就可以了」
+   *
+   * 于是 ≤5 张的组：进弹窗就把**真实照片**拉回来（每组 ≤5 张，很轻），
+   * 让那一排小图带勾选圈。为什么不直接给预览缩略图加圈：预览只有路径、没有 photo.id；
+   * 而且服务端给预览时是「代表图排第一」的**另一种顺序**（`previewIds`），
+   * 拿下标猜 id 会**勾错图** ✗ —— 所以宁可多一次按组拉取，也要拿到真实 id ✓
+   * 用 `loadingSmallRef` 防重复请求；拉失败了就维持"点小图看大图"的老样子，不影响列表。
+   * ⚠️ 结果是**一次性合并回填**：列表最多 200 组，逐组 setState 会触发上百次重渲染（界面会卡一下）。
+   */
+  const loadingSmallRef = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    if (!(open && groups)) {
+      return;
+    }
+    const pending = groups.filter(
+      (group) =>
+        group.size > 0 &&
+        group.size <= 5 &&
+        !groupPhotos[group.representativeId] &&
+        !loadingSmallRef.current.has(group.representativeId)
+    );
+    if (pending.length === 0) {
+      return;
+    }
+    for (const group of pending) {
+      loadingSmallRef.current.add(group.representativeId);
+    }
+    void (async () => {
+      const loaded: Array<[number, GroupPhoto[]]> = [];
+      await Promise.all(
+        pending.map(async (group) => {
+          try {
+            const result = (await faceActions.getCharacterGroupPhotos(
+              group.photoIds
+            )) as { photos?: GroupPhoto[] };
+            loaded.push([group.representativeId, result?.photos ?? []]);
+          } catch {
+            // 拉失败 → 退化成不可勾选（仍可点开大图）；删掉记录，下次再试
+            loadingSmallRef.current.delete(group.representativeId);
+          }
+        })
+      );
+      if (loaded.length === 0) {
+        return;
+      }
+      setGroupPhotos((prev) => {
+        const next = { ...prev };
+        for (const [key, photos] of loaded) {
+          next[key] = photos;
+        }
+        return next;
+      });
+    })();
+  }, [open, groups, groupPhotos]);
+
   /** 展开/收起某组；展开时**按需**拉整组照片（不展开不拉，避免一次拉几千张）。 */
   async function toggleExpand(index: number, group: CharacterGroupView) {
     const key = group.representativeId;
@@ -426,6 +483,20 @@ export function CharacterDiscoveryDialog({
 
   function clearSelection(key: number) {
     setSelection((prev) => ({ ...prev, [key]: new Set() }));
+  }
+
+  /**
+   * 一键全选（2026-11-08 · 会话#11 用户口径）：
+   * 「一两百张里只有几张不对，却要把其他需要的全部点一遍，太麻烦」
+   * → 先全选、再把不对的那几张点掉就行。
+   * ⚠️ 不要做成"全选/全不选"切换：这里的**空集 = 整组**（不勾选就是整组打标），
+   * 「全不选」会变成"反而给整组打标"，是反的、会误操作 ✗ —— 取消用「清空勾选」。
+   */
+  function selectAll(key: number, list: GroupPhoto[]) {
+    setSelection((prev) => ({
+      ...prev,
+      [key]: new Set(list.map((photo) => photo.id)),
+    }));
   }
 
   /**
@@ -704,6 +775,11 @@ export function CharacterDiscoveryDialog({
               const expanded = expandedGroups.has(groupKey);
               const chosen = selection[groupKey] ?? new Set<number>();
               const photos = groupPhotos[groupKey] ?? [];
+              /**
+               * ≤5 张的组：这一排小图就是整组，所以要有勾选圈（见上面的 auto-load effect）。
+               * >5 张的组仍用预览缩略图，勾选去展开区里做。
+               */
+              const inlinePhotos = group.size <= 5 ? photos : [];
               const loadingThis = loadingGroup === groupKey;
               return (
                 <div
@@ -718,15 +794,57 @@ export function CharacterDiscoveryDialog({
                 >
                   <div className="flex items-start gap-3">
                     <div className="flex shrink-0 items-center gap-1">
-                      {group.thumbnails.slice(0, 5).map((thumb, thumbIndex) => (
-                        <LazyThumb
-                          className="h-12 w-12 cursor-zoom-in rounded-[4px]"
-                          key={thumb}
-                          onClick={() => void openLightboxAt(index, group, thumbIndex)}
-                          src={toLocalMediaUrl(thumb)}
-                        />
-                      ))}
-                      {/* 展开/收起：看整组图 + 勾选部分图（用户要求） */}
+                      {/* ≤5 张：整组就在这一排里 → 小图直接能勾选（不用先展开） */}
+                      {group.size <= 5 && inlinePhotos.length > 0
+                        ? inlinePhotos.map((photo, inlineIndex) => {
+                            const picked = chosen.has(photo.id);
+                            return (
+                              <div className="relative" key={photo.id}>
+                                <button
+                                  aria-label={t(
+                                    "characterDiscoveryToggleSelect"
+                                  )}
+                                  aria-pressed={picked}
+                                  className={`absolute top-0.5 left-0.5 z-10 flex h-5 w-5 items-center justify-center rounded-full border-2 transition-colors ${
+                                    picked
+                                      ? "border-primary bg-primary text-white"
+                                      : "border-white/80 bg-black/35 hover:bg-black/60"
+                                  }`}
+                                  onClick={() => toggleSelect(groupKey, photo.id)}
+                                  type="button"
+                                >
+                                  {picked && <Check className="h-3 w-3" />}
+                                </button>
+                                <LazyThumb
+                                  className={`h-12 w-12 cursor-zoom-in rounded-[4px] ${
+                                    picked ? "ring-2 ring-primary" : ""
+                                  }`}
+                                  onClick={() =>
+                                    setLightbox({
+                                      index: inlineIndex,
+                                      photos: inlinePhotos,
+                                    })
+                                  }
+                                  src={toLocalMediaUrl(
+                                    photo.thumbnailPath || photo.path
+                                  )}
+                                />
+                              </div>
+                            );
+                          })
+                        : group.thumbnails.slice(0, 5).map((thumb, thumbIndex) => (
+                            <LazyThumb
+                              className="h-12 w-12 cursor-zoom-in rounded-[4px]"
+                              key={thumb}
+                              onClick={() =>
+                                void openLightboxAt(index, group, thumbIndex)
+                              }
+                              src={toLocalMediaUrl(thumb)}
+                            />
+                          ))}
+                      {/* 展开/收起：看整组图 + 勾选部分图（用户要求）
+                          2026-11-08 · 会话#11：**>5 张才展开**（≤5 张全部缩略图已经列出来了，
+                          按用户口径"直接在 5 张小图上勾选"就够，不需要再展开一层）✓ */}
                       {group.size > 5 && (
                         <button
                           className="ml-1 shrink-0 rounded-[4px] border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
@@ -829,6 +947,16 @@ export function CharacterDiscoveryDialog({
                     <div className="border-border border-t pt-2">
                       <div className="mb-2 flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
                         <span>{t("characterDiscoverySelectHint")}</span>
+                        {/* 一键全选（2026-11-08 · 会话#11）：都选中就不用再点「全选」了 */}
+                        {photos.length > 0 && chosen.size < photos.length && (
+                          <button
+                            className="underline transition-colors hover:text-foreground"
+                            onClick={() => selectAll(groupKey, photos)}
+                            type="button"
+                          >
+                            {t("manualRolesSelectAll")}
+                          </button>
+                        )}
                         {chosen.size > 0 && (
                           <>
                             <span className="text-foreground">

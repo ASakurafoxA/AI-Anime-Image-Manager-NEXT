@@ -297,11 +297,30 @@ describe("duplicate cleanup deletion plans", () => {
     const second = await call(findDuplicates, { forceRescan: true });
     expect(second.groups[0].status).toBe("dismissed");
   });
+  /*
+   * 自用（2026-11-09 · 会话#11）：注入点从「读向量」改成「第 2 次取向量库版本」。
+   *
+   * 原因：查重优化后，**pHash 已确认的配对不再加载向量**（原来会白读几万条 768 维向量），
+   * 而且重复组成员的整文件哈希会复用上一轮落库的值（fixture 里已经有指纹）——
+   * 于是 `vectors.read` / `computeFullFileHash` 都可能一次都不被调用，原来的注入口失效。
+   * `getDuplicateVectorRevision` 仍然会在「扫描开始」和「发布前校验」各调一次，
+   * 第 2 次正好落在"验证完、还没发布"这个检查点上 ✓（取消/暂停/改设置都能被它触发）
+   */
+  function triggerOnSecondVectorRevision(action: () => void) {
+    let calls = 0;
+    vectors.revision.mockImplementation(() => {
+      calls += 1;
+      if (calls === 2) {
+        action();
+      }
+      return Promise.resolve("vectors:1");
+    });
+  }
+
   it("keeps old results when settings change during verification", async () => {
     const before = getTestDb().select().from(duplicatePairs).all();
-    vectors.read.mockImplementationOnce(() => {
+    triggerOnSecondVectorRevision(() => {
       setSetting("duplicates.settingsRevision", "2");
-      return Promise.resolve(new Map());
     });
     await expect(call(findDuplicates, { forceRescan: true })).rejects.toThrow(
       "STALE_RUN"
@@ -315,13 +334,11 @@ describe("duplicate cleanup deletion plans", () => {
     ]);
     // 正常扫完的分支才带 runId（暂停/取消分支返回 stopped + 上次结果，见下面两条用例）
     expect((a as { runId?: string }).runId).toBe((b as { runId?: string }).runId);
-    expect(vectors.read).toHaveBeenCalledTimes(1);
   });
   it("cancels without publishing partial results", async () => {
     const before = getTestDb().select().from(duplicatePairs).all();
-    vectors.read.mockImplementationOnce(() => {
+    triggerOnSecondVectorRevision(() => {
       cancelDuplicateScan();
-      return Promise.resolve(new Map());
     });
     /*
      * 自用（2026-10-17 第二轮）：暂停/取消**不再当失败抛出** ✓ ——
@@ -342,9 +359,8 @@ describe("duplicate cleanup deletion plans", () => {
    */
   it("pauses at the next checkpoint and reports paused instead of cancelled", async () => {
     const before = getTestDb().select().from(duplicatePairs).all();
-    vectors.read.mockImplementationOnce(() => {
+    triggerOnSecondVectorRevision(() => {
       pauseDuplicateScan();
-      return Promise.resolve(new Map());
     });
     // 暂停同样**不抛错**：返回"已保存的结果 + stopped=paused" ✓（界面显示「已暂停」）
     const pausedResult = await call(findDuplicates, { forceRescan: true });
@@ -365,7 +381,7 @@ describe("duplicate cleanup deletion plans", () => {
     ).resolves.toBeTruthy();
     expect(consumePauseRequest()).toBe(false);
   });
-  it("rolls back pairs and fingerprints when snapshot publication fails", async () => {
+  it("rolls back pairs but keeps verified fingerprints when snapshot publication fails", async () => {
     const before = getTestDb().select().from(duplicatePairs).all();
     const fingerprints = getTestDb()
       .select()
@@ -377,10 +393,21 @@ describe("duplicate cleanup deletion plans", () => {
     await expect(call(findDuplicates, { forceRescan: true })).rejects.toThrow(
       "snapshot failed"
     );
+    // 发布结果（pairs）必须整体回滚 —— 不能留下半份结果
     expect(getTestDb().select().from(duplicatePairs).all()).toEqual(before);
-    expect(getTestDb().select().from(duplicatePhotoFingerprints).all()).toEqual(
-      fingerprints
-    );
+    /*
+     * 自用（2026-11-09 · 会话#11）：**指纹故意保留** ✗→✓
+     *
+     * 指纹是"文件内容哈希"的缓存，不是发布结果；保留它，用户在失败/取消之后再扫时
+     * 就不必把每个文件重新读一遍（这正是"查重好慢"的主因）。
+     * 于是这里的约定从"指纹也回滚"改成"指纹保留且可用"。
+     */
+    const after = getTestDb()
+      .select()
+      .from(duplicatePhotoFingerprints)
+      .all();
+    expect(after).toHaveLength(fingerprints.length);
+    expect(after.every((row) => Boolean(row.fullSha256))).toBe(true);
   });
   it("reuses verified hashes on cache hits and invalidates on vector revision", async () => {
     await call(findDuplicates, { forceRescan: true });

@@ -114,6 +114,14 @@ interface MasonryGridProps {
   hasMore?: boolean;
   isLoadingMore?: boolean;
   isPlaceholderData?: boolean;
+  /**
+   * 自用（2026-11-08 · 会话#11 用户报「搜索结果留白 / 灰块 / 滚动闪烁」）：
+   * true = **不启用虚拟窗口**，按布局全量渲染。
+   * 搜索结果的条数有上限（≤300），全量渲染的开销可以接受；
+   * 而虚拟窗口那一套在"列表被过滤/重搜后长度骤变"时反复出错（留白、闪烁、不可点的灰块），
+   * 用"全量渲染"把这些坑一次性绕开 ✓
+   */
+  disableVirtualization?: boolean;
   itemStateVersion?: unknown;
   items: Array<{
     fullWidth?: boolean;
@@ -174,6 +182,7 @@ export const MasonryGrid = memo(
       routeKey,
       restoreGateReady = true,
       isPlaceholderData = false,
+      disableVirtualization = false,
       topInset = 0,
     }: MasonryGridProps,
     ref
@@ -301,6 +310,19 @@ export const MasonryGrid = memo(
       if (el.scrollHeight !== scrollHeightStateRef.current) {
         scrollHeightStateRef.current = el.scrollHeight;
         setScrollHeight(el.scrollHeight);
+      }
+      /*
+       * 自用（2026-11-08 · 会话#11）：内容变短（例如切换「隐藏目录」让结果变少）时，
+       * 把仍在旧位置的滚动条拉回范围内，并同步给 state —— 否则
+       * "滚动位置 > 内容高度"会让所有卡片被判成在视口外、一律不渲染缩略图 ✗
+       */
+      const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+      if (el.scrollTop > maxScrollTop) {
+        el.scrollTop = maxScrollTop;
+        if (Math.abs(scrollTopStateRef.current - maxScrollTop) > 0.5) {
+          scrollTopStateRef.current = maxScrollTop;
+          setScrollTop(maxScrollTop);
+        }
       }
     }, []);
 
@@ -656,11 +678,25 @@ export const MasonryGrid = memo(
       return reflowScrollTop;
     })();
     // Select the final virtual window before React can unmount retained cards.
-    const effectiveScrollTop =
+    /*
+     * 自用（2026-11-08 · 会话#11 用户报「开关眼睛之后缩略图加载不出来、灰块还不能点」）：
+     * **必须把滚动位置收敛到内容范围内** ✗→✓
+     *
+     * 现场：切换「隐藏目录」开关后列表从 141 张变成很少（甚至 0 张），
+     * 但 DOM 里的 `scrollTop` 还停在旧的大数值（列表变短时浏览器不一定补发 scroll 事件，
+     * 我们的 `scrollTop` state 也可能还是旧值）→ 于是
+     * `shouldRenderItemImage()` 拿这个超大值算出「可见区间」在页面下方很远的地方，
+     * 顶部所有卡片都被判成"在视口外" → `renderImage=false`：
+     *   · 卡片退化成纯灰 div（PhotoCard 里那个 `if (!renderImage)` 分支）
+     *   · 而且那个分支是 `aria-hidden`、**没有 onClick** → 灰块点不动 ✗（用户实测正是如此）
+     * 收敛之后，判定用的位置永远落在真实内容里，图就会正常渲染 ✓
+     */
+    const rawEffectiveScrollTop =
       plannedScrollTop ??
       (hasInitialPositionedRef.current
         ? (scrollElement?.scrollTop ?? scrollTop)
         : initialScrollTop);
+    const effectiveScrollTop = clampScrollTop(rawEffectiveScrollTop);
 
     useLayoutEffect(() => {
       const prevReturnToPhotoRequest = prevReturnToPhotoRequestRef.current;
@@ -1111,14 +1147,49 @@ export const MasonryGrid = memo(
                     {h.label}
                   </div>
                 ))}
-              {visibleItems.map(({ index, style }) => (
+              {(disableVirtualization
+                ? positions.map((position, index) => ({
+                    index,
+                    /*
+                     * ⚠️ 自用（2026-11-08 · 会话#11）：**必须补上 `position: absolute`** ✗→✓
+                     *
+                     * 虚拟窗口那条路（`useMasonryVirtualWindow`）会把位置包成
+                     * `{ position: "absolute", top, left, width, height }`；
+                     * 而"全量渲染"这条分支一开始直接用了布局算出的原始对象
+                     * （只有 `{ top, left, width, height }`，没有 `position`）→
+                     * 卡片退回普通文档流：`left/top` 被忽略、块级元素一张占一行 ✗
+                     * → 用户看到的就是「搜索结果一张图一行、列表特别长」。
+                     * 补上 `position: absolute` 后与虚拟窗口完全等价 ✓
+                     */
+                    style: {
+                      position: "absolute",
+                      top: position.top,
+                      left: position.left,
+                      width: position.width,
+                      height: position.height,
+                    } as React.CSSProperties,
+                  }))
+                : (visibleItems as Array<{
+                    index: number;
+                    style: React.CSSProperties;
+                  }>)
+              ).map(({ index, style }) => (
                 <div key={items[index].id} style={style}>
                   {renderItem(items[index], index, style, {
-                    renderImage: shouldRenderItemImage(
-                      style,
-                      effectiveScrollTop,
-                      effectiveViewportHeight
-                    ),
+                    /*
+                     * 自用（2026-11-08 · 会话#11）：**虚拟窗口里的卡片一律渲染图片** ✗→✓
+                     *
+                     * 原来这里再用 `shouldRenderItemImage(style, scrollTop, viewportHeight)`
+                     * 二次收窄：只给"离视口 ±1 屏"的卡片加载图，其它给灰块占位。
+                     * 但实测（用户报「搜索结果大量灰块、还点不动」+ 日志证明每张卡都有缩略图、
+                     * 过滤也正常）这个几何判定会**和真实视口错位** → 眼前的卡片被判成"在视口外"
+                     * → 全渲染成灰块；而灰块那条分支 `aria-hidden`、没有 onClick，所以点不动 ✗
+                     *
+                     * 现在改成：**只要进了虚拟窗口（visibleItems）就渲染图**。
+                     * 屏幕外的保护仍然存在 —— 虚拟窗口本身就是按位置切片的（overscan 控制条数），
+                     * 已经足够限制同时挂载的 <img> 数量；宁可多加载几张，也不要在用户眼前留灰块 ✓
+                     */
+                    renderImage: true,
                   })}
                 </div>
               ))}

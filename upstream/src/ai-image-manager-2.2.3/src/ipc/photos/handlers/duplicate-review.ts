@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getDatabase } from "@/db";
 import {
   applyDuplicateKeepCount,
+  applyDuplicateKeepCountToAllGroups,
   DUPLICATE_REVIEW_DECISIONS,
   updateDuplicateReviewState,
 } from "@/services/duplicate-review";
@@ -38,3 +39,11 @@ export const applyDuplicateKeepCountHandler = os
     })
   )
   .handler(({ input }) => applyDuplicateKeepCount(getDatabase(), input));
+
+/*
+ * 自用（2026-11-09 · 会话#11）：**一次设置所有组的保留数量** ✓
+ * （用户原话："我这几千个组每个都要重复操作三次才能添加很费劲" —— 逐个调必然爆炸）
+ */
+export const applyDuplicateKeepCountToAllHandler = os
+  .input(z.object({ count: z.number().int().positive().max(64) }))
+  .handler(({ input }) => applyDuplicateKeepCountToAllGroups(getDatabase(), input));

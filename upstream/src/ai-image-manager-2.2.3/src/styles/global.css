@@ -1,4 +1,4 @@
-﻿@import "tailwindcss";
+@import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/inter";
@@ -3670,5 +3670,32 @@ html[data-theme-transition="circle"] .theme-toggle-switch * {
   .whats-new-github-link,
   .whats-new-continue {
     transition: none;
+  }
+}
+
+/*
+ * 自用（2026-11-09 · 会话#11 用户要求）：重复图片检测里「忽略整组」的**离场动画**。
+ * 原来点完这一组是"啪"一下从列表里消失，看不出发生了什么；现在淡出 + 轻微收缩，
+ * 动画结束后组件才把它从缓存里移除（见 duplicates.tsx 的 `leavingGroups`）✓
+ */
+.duplicates-group-leaving {
+  animation: duplicates-group-leave 180ms ease-in forwards;
+  pointer-events: none;
+}
+
+@keyframes duplicates-group-leave {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .duplicates-group-leaving {
+    animation: none;
   }
 }

@@ -1,4 +1,4 @@
-﻿import i18n from "i18next";
+import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import { LOCAL_STORAGE_KEYS } from "@/constants";
 
@@ -2062,6 +2062,15 @@ i18n.use(initReactI18next).init({
         searchMatchSemantic: "语义匹配",
         searchMinSimilarity: "相似度 ≥",
         searchResultLimit: "最多显示",
+        semanticSearchDegraded:
+          "这次语义检索没跑完（超时或不可用），只按文件名/标签匹配了。",
+        semanticSearchRetry: "重试",
+        imageSearchSimilarButton: "继续搜索相似图像",
+        imageSearchSimilarHint:
+          "当前只查找完全一致的图片。要查找更多相似图片，请点下方按钮。",
+        imageSearchSimilarRunning: "正在找相似图…",
+        imageSearchSimilarFound: "又找到 {{count}} 张相似图",
+        imageSearchSimilarEmpty: "没有找到更相似的图片",
         showHiddenFolderPhotos: "显示隐藏目录",
         searchTopSimilarity: "本次最高 {{value}}%",
         searchSimilarityRange: "本次 {{min}}%~{{max}}%",
@@ -2137,6 +2146,20 @@ i18n.use(initReactI18next).init({
         duplicateDecisionSummary:
           "保留 {{keepCount}} · 删除 {{deleteCount}} · 待决定 {{undecidedCount}}",
         duplicateApplyKeepCount: "按数量选择保留",
+        duplicateBulkKeepLabel: "保留",
+        duplicateBulkKeepApply: "应用到全部组",
+        duplicateBulkKeepApplying: "正在应用…",
+        duplicateBulkKeepApplied: "已更新 {{updated}} 个组，跳过 {{skipped}} 个",
+        duplicateAutoQueueLabel: "「应用数量」后直接入队",
+        duplicateHidePixivVariants: "筛除 Pixiv 差分",
+        duplicateHidePixivVariantsHint:
+          "同一作品号的不同分P（id_p0、id_p1…）视为差分，不再显示为重复；只作用于「视觉相似」，不影响「完全相同」",
+        duplicateBulkKeepHint:
+          "只标记保留/删除，不会加入待清理（删除仍需点「清理全部待处理」并确认）",
+        duplicateBulkKeepConfirmTitle: "应用到全部组？",
+        duplicateBulkKeepConfirmDescription:
+          "将对 {{groups}} 个组设置“保留 {{count}} 张”，并覆盖这些组已有的保留/删除选择。这一步只标记选择：既不会删除文件，也不会把这些组加入待清理；删除还需要点「清理全部待处理」并在确认框里确认。",
+        duplicateBulkKeepConfirmAction: "应用",
         duplicateKeepCountOption: "保留 {{count}} 张",
         duplicateKeepAll: "全部保留",
         duplicateKeepCountTitle: "应用保留数量",
@@ -2161,7 +2184,7 @@ i18n.use(initReactI18next).init({
         duplicatePendingStat: "待清理",
         duplicateReclaimStat: "待清理大小",
         duplicateSafetyHint:
-          "每组至少保留一张；清理项先进入应用内最近删除，30 天后移到系统回收站",
+          "每组至少保留一张；清理项先进入应用内最近删除\n30 天后移到系统回收站",
         duplicateScanBusyHint:
           "有 AI 任务正在跑（打标 / 特征提取）—— 查重不和它互斥，但会抢 CPU 和磁盘，速度会变慢",
         duplicateCleanupButton: "清理全部待处理 {{count}} 张",
@@ -2171,6 +2194,7 @@ i18n.use(initReactI18next).init({
         duplicateCleanupDescription:
           "将从 {{groups}} 个重复组中把 {{count}} 张图片移入本应用的“最近删除”（完全相同 {{exactGroups}} 组 / {{exactCount}} 张，视觉相似 {{similarGroups}} 组 / {{similarCount}} 张），待清理大小 {{size}}。每组指定的保留项不会被清理；其他相册和标签关系不会被改写，图片在最近删除期间会从图库视图隐藏。原文件暂不移动，空间要到系统回收站清空后才会释放。",
         duplicateConfirmCleanup: "移入最近删除",
+        duplicateCleanupPreparing: "准备中…",
         duplicateCleanupSuccess: "已将 {{count}} 张重复图片移入最近删除",
         duplicateCleanupPlanFailed: "创建清理计划失败，请刷新后重试",
         duplicateCleanupExecuteFailed: "执行清理计划失败，图片未被部分清理",
@@ -4710,6 +4734,15 @@ i18n.use(initReactI18next).init({
         searchMatchSemantic: "Semantic match",
         searchMinSimilarity: "Similarity ≥",
         searchResultLimit: "Show up to",
+        semanticSearchDegraded:
+          "Semantic search did not finish this time (timeout or unavailable); only filename/tag matches are shown.",
+        semanticSearchRetry: "Retry",
+        imageSearchSimilarButton: "Search for similar images",
+        imageSearchSimilarHint:
+          "Only exact matches are shown right now. To find more similar images, click the button below.",
+        imageSearchSimilarRunning: "Looking for similar images…",
+        imageSearchSimilarFound: "Found {{count}} more similar images",
+        imageSearchSimilarEmpty: "No more similar images found",
         showHiddenFolderPhotos: "Show hidden folders",
         searchTopSimilarity: "Top score {{value}}%",
         searchSimilarityRange: "This search: {{min}}%–{{max}}%",
@@ -4787,6 +4820,21 @@ i18n.use(initReactI18next).init({
         duplicateDecisionSummary:
           "Keep {{keepCount}} · Delete {{deleteCount}} · Undecided {{undecidedCount}}",
         duplicateApplyKeepCount: "Choose keep count",
+        duplicateBulkKeepLabel: "Keep",
+        duplicateBulkKeepApply: "Apply to all groups",
+        duplicateBulkKeepApplying: "Applying…",
+        duplicateBulkKeepApplied:
+          "Updated {{updated}} groups, skipped {{skipped}}",
+        duplicateAutoQueueLabel: "Queue after applying",
+        duplicateHidePixivVariants: "Hide Pixiv variants",
+        duplicateHidePixivVariantsHint:
+          "Treat different pages of the same Pixiv work (id_p0, id_p1…) as variants instead of duplicates; applies to Visually similar only, never to Exact",
+        duplicateBulkKeepHint:
+          "Marks keep/delete only — nothing is queued (deleting still needs 'Clean up all' plus confirmation)",
+        duplicateBulkKeepConfirmTitle: "Apply to all groups?",
+        duplicateBulkKeepConfirmDescription:
+          'This sets "keep {{count}}" on {{groups}} groups and overwrites their existing keep/delete choices. It only marks choices: nothing is deleted and no group is queued; deleting still requires "Clean up all" plus confirmation.',
+        duplicateBulkKeepConfirmAction: "Apply",
         duplicateKeepCountOption: "Keep {{count}} images",
         duplicateKeepAll: "Keep all",
         duplicateKeepCountTitle: "Apply keep count",
@@ -4812,7 +4860,7 @@ i18n.use(initReactI18next).init({
         duplicatePendingStat: "Pending cleanup",
         duplicateReclaimStat: "Pending file size",
         duplicateSafetyHint:
-          "At least one image is kept per group; cleanup first uses this app’s Recently Deleted, then the system recycle bin after 30 days",
+          "At least one image is kept per group; cleanup first uses this app’s Recently Deleted\nand moves to the system recycle bin after 30 days",
         duplicateScanBusyHint:
           "An AI task is running (tagging / embedding). Duplicate scanning is not blocked, but it competes for CPU and disk, so it will be slower.",
         duplicateCleanupButton: "Clean all {{count}} pending images",
@@ -4822,6 +4870,7 @@ i18n.use(initReactI18next).init({
         duplicateCleanupDescription:
           "Move {{count}} images from {{groups}} duplicate groups to this app’s Recently Deleted ({{exactGroups}} exact groups / {{exactCount}} images, {{similarGroups}} visually similar groups / {{similarCount}} images). Pending file size: {{size}}. Keepers are never cleaned; other album and tag associations are kept while the images are hidden from library views. Originals move to the system recycle bin after 30 days, and disk space is released when it is emptied.",
         duplicateConfirmCleanup: "Move to Recently Deleted",
+        duplicateCleanupPreparing: "Preparing…",
         duplicateCleanupSuccess:
           "Moved {{count}} duplicate images to Recently Deleted",
         duplicateCleanupPlanFailed:

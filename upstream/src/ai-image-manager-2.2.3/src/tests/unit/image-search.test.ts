@@ -70,6 +70,25 @@ describe("searchByImageWithPhash", () => {
     expect(hits[1]).toMatchObject({ isExactCopy: true, phashDistance: 3 });
   });
 
+  it("「继续搜索相似图像」：semanticOnly 时跳过指纹，只跑语义", async () => {
+    queryPhashIndex.mockReturnValue([{ photoId: 7, distance: 0 }]);
+    aiSearchByImage.mockResolvedValue([
+      { photoId: 11, similarity: 0.93 },
+      { photoId: 12, similarity: 0.9 },
+    ]);
+
+    const hits = await searchByImageWithPhash(tmpFile, 500, {
+      semanticOnly: true,
+    });
+
+    // 指纹这一路整套都不该被碰：不算指纹、不查指纹索引 ✓
+    expect(computePHash).not.toHaveBeenCalled();
+    expect(queryPhashIndex).not.toHaveBeenCalled();
+    expect(aiSearchByImage).toHaveBeenCalledWith(tmpFile, 500);
+    expect(hits.map((h) => h.photoId)).toEqual([11, 12]);
+    expect(hits.every((h) => h.isExactCopy === false)).toBe(true);
+  });
+
   it("指纹没命中时才走语义，并保持原样返回", async () => {
     queryPhashIndex.mockReturnValue([]);
     aiSearchByImage.mockResolvedValue([

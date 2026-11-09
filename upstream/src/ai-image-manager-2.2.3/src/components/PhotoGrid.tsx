@@ -103,6 +103,8 @@ interface PhotoGridProps {
    * 避免基于假数据做错误定位。
    */
   isPlaceholderData?: boolean;
+  /** 自用（2026-11-08 · 会话#11）：搜索时关掉虚拟窗口，按布局全量渲染（见 MasonryGrid 同名参数）。 */
+  disableVirtualization?: boolean;
   /** 当搜索/浏览切换时数据尚未同步，显示半透明遮罩以避免闪烁 */
   isStale?: boolean;
   loading: boolean;
@@ -918,6 +920,7 @@ export const PhotoGrid = memo(
     faceOverlayByPhotoId,
     faceOverlaysVisible = true,
     isPlaceholderData = false,
+    disableVirtualization = false,
     isStale = false,
     onSelect,
     onSelectSequence,
@@ -1249,12 +1252,11 @@ export const PhotoGrid = memo(
       if (!node) {
         return;
       }
-      // Set initial width synchronously so MasonryGrid never renders with
-      // containerWidth=0 (avoids a blank first frame while waiting for the
-      // async ResizeObserver callback).
-      const w = node.clientWidth;
-      setContainerWidth(w);
-      // ResizeObserver for subsequent size changes.
+      /*
+       * 宽度在挂载时同步量一次（避免 MasonryGrid 用 containerWidth=0 渲染出空白帧），
+       * 之后交给 ResizeObserver 跟随窗口/侧栏变化。
+       */
+      setContainerWidth(node.clientWidth);
       const observer = new ResizeObserver(([entry]) => {
         setContainerWidth(entry.contentRect.width);
       });
@@ -1840,6 +1842,7 @@ export const PhotoGrid = memo(
             hasMore={hasMore}
             isLoadingMore={isLoadingMore}
             isPlaceholderData={isPlaceholderData}
+            disableVirtualization={disableVirtualization}
             itemStateVersion={itemStateVersion}
             items={displayPhotos}
             onEndReached={onEndReached}

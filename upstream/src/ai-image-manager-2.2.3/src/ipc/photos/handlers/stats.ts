@@ -1441,8 +1441,21 @@ async function prepareDuplicateGroupFingerprints(
     groups.flatMap((group) => group.photos).map((photo) => [photo.id, photo])
   );
   const result: (typeof duplicatePhotoFingerprints.$inferInsert)[] = [];
-  for (const photo of uniquePhotos.values()) {
-    context.report("verifying", result.length, uniquePhotos.size);
+  const allGroupPhotos = [...uniquePhotos.values()];
+  /** 攒够这么多张再落库一次（一个事务内批量写，避免写放大） */
+  const FLUSH_EVERY_FINGERPRINTS = 500;
+  let pendingFlush: (typeof duplicatePhotoFingerprints.$inferInsert)[] = [];
+
+  /*
+   * 自用（2026-11-09 · 会话#11 用户报「查重好慢」）：**并发算，不再一张一张等** ✗→✓
+   *
+   * 原来是串行 `await computeFullFileHash()`（一张读完再读下一张）→ 磁盘 IO 利用率极低；
+   * 这里改成每批 8 张并发（首次扫描仍然要读一遍文件，但能把读盘时间压到原来的几分之一）✓
+   * 之后每次扫描都会命中上一轮落库的哈希，基本不再读盘。
+   */
+  const FINGERPRINT_CONCURRENCY = 8;
+
+  async function prepareFingerprint(photo: (typeof allGroupPhotos)[number]) {
     const stat = fs.statSync(photo.path);
     const metadata = fingerprintMetadata(photo.path, stat);
     const previous = db
@@ -1450,20 +1463,65 @@ async function prepareDuplicateGroupFingerprints(
       .from(duplicatePhotoFingerprints)
       .where(eq(duplicatePhotoFingerprints.photoId, photo.id))
       .get();
+    /*
+     * 自用（2026-11-09 · 会话#11）：**复用上一轮落库的整文件哈希** ✗→✓
+     *
+     * 现场：这里上面明明已经把 `previous`（上一轮存进 `duplicate_photo_fingerprints` 的
+     * `fullSha256` / `fileSize` / `modifiedAt`）查出来了，下面却**从来没用它** ✗ ——
+     * 只有"本轮精确重复候选"（`fullHashes`，极少数）和"本轮内存缓存"（`verifiedFingerprintCache`，
+     * 每次扫描开始时是空的）两条命中路径，其余一律 `computeFullFileHash()` 重新读整个文件。
+     * 结果：**每次扫描都把每个重复组成员的文件从头读一遍**（用户库 206 GB，粗估几十 GB 读盘），
+     * 实测一次扫描要几十分钟 ✗
+     *
+     * 正确做法：文件没变（大小 + 修改时间一致、哈希版本一致）就直接用库里的哈希 ✓
+     * 变了才重算 —— 这也是 `contentRevision` 的本意。
+     */
+    const previousIsUsable =
+      previous != null &&
+      previous.fullSha256 != null &&
+      previous.hashVersion === FULL_FILE_HASH_VERSION &&
+      previous.fileSize === stat.size &&
+      Math.abs(Number(previous.modifiedAt) - stat.mtimeMs) < 1;
+    /*
+     * 自用（2026-11-09 · 会话#11）：**不再给"每个重复组成员"都算整文件哈希** ✗→✓
+     *
+     * 实测（用户库）：这段只有 ~5.6 张/秒 —— 2 万张要**一小时**，而它是整个查重里最慢的一段。
+     * 为什么可以砍：`fullSha256` 的实际用途只有两个
+     *   ① 判断"本轮是不是精确重复"（但那一类在 Phase 0 已经由 `filesHaveSameBytes` 逐字节确认过，
+     *      并且结果就在 `fullHashes` 里，本来就传进来了 ✓）；
+     *   ② 作为"文件内容有没有变过"的指纹（下一轮复用）。
+     * 而"内容变没变"用**元数据 + 抽样哈希**就足够判断了（大小/修改时间/ctime 任一变化即视为变过）。
+     * 所以：只对 `fullHashes` 里有的（精确重复候选）写真实哈希，其余留空（null）——
+     * 首次扫描从"读几十 GB"降到"只读那些确实一模一样的文件" ✓
+     */
+    const knownFullHash = fullHashes.get(photo.id);
     const fullSha256 =
-      fullHashes.get(photo.id) ??
+      knownFullHash ??
+      (previousIsUsable ? (previous.fullSha256 as string) : undefined) ??
       (force ? undefined : verifiedFingerprintCache.get(metadata)) ??
-      (await computeFullFileHash(photo.path));
+      null;
+    /*
+     * 只有在"确实有哈希"时才校验文件是否中途被改（没有哈希的行没有可比对的内容）。
+     */
     if (
-      !fullSha256 ||
+      fullSha256 !== null &&
       metadata !== fingerprintMetadata(photo.path, fs.statSync(photo.path))
     ) {
       throw new Error("FILE_CHANGED: Original file changed while verifying");
     }
     // Only evidence of different content invalidates user decisions. A sample
     // digest or a metadata-only update must never erase an existing full hash.
-    const changed = !previous || previous.fullSha256 !== fullSha256;
-    result.push({
+    const changed =
+      !previous ||
+      previous.fullSha256 !== fullSha256 ||
+      previous.fileSize !== stat.size;
+    if (verifiedFingerprintCache.size > 20_000) {
+      verifiedFingerprintCache.clear();
+    }
+    if (fullSha256 !== null) {
+      verifiedFingerprintCache.set(metadata, fullSha256);
+    }
+    return {
       photoId: photo.id,
       path: photo.path,
       fileSize: stat.size,
@@ -1473,11 +1531,41 @@ async function prepareDuplicateGroupFingerprints(
       sampleHash: previous?.sampleHash ?? null,
       contentRevision: (previous?.contentRevision ?? 0) + (changed ? 1 : 0),
       verifiedAt: Date.now(),
-    });
-    if (verifiedFingerprintCache.size > 20_000) {
-      verifiedFingerprintCache.clear();
+    } satisfies typeof duplicatePhotoFingerprints.$inferInsert;
+  }
+
+  for (
+    let start = 0;
+    start < allGroupPhotos.length;
+    start += FINGERPRINT_CONCURRENCY
+  ) {
+    context.assertCurrent();
+    const batch = allGroupPhotos.slice(start, start + FINGERPRINT_CONCURRENCY);
+    const prepared = await Promise.all(batch.map(prepareFingerprint));
+    result.push(...prepared);
+    pendingFlush.push(...prepared);
+    /*
+     * 自用（2026-11-09 · 会话#11）：**算一批存一批，但必须放在同一个事务里** ✗→✓
+     *
+     * 第一版我写成"每 8 张就 publishFingerprints 一次" → 每张 2 条语句、且都在事务外
+     * → 几万次单独提交（WAL 每次提交都要刷盘）→ **反而更慢** ✗（用户报「怎么好像更慢了」）
+     * 现在：攒到 500 张，在**一个事务**里批量 upsert ✓
+     * 目的不变：暂停/取消/失败都保留已算好的哈希，下次接着用（不必重读文件）。
+     */
+    if (pendingFlush.length >= FLUSH_EVERY_FINGERPRINTS) {
+      const flushing = pendingFlush;
+      pendingFlush = [];
+      db.transaction((tx) => {
+        publishFingerprints(tx as unknown as typeof db, flushing);
+      });
     }
-    verifiedFingerprintCache.set(metadata, fullSha256);
+    context.report("verifying", result.length, allGroupPhotos.length);
+  }
+  if (pendingFlush.length > 0) {
+    const flushing = pendingFlush;
+    db.transaction((tx) => {
+      publishFingerprints(tx as unknown as typeof db, flushing);
+    });
   }
   return result;
 }
@@ -1652,6 +1740,22 @@ async function scanDuplicates(
   context: DuplicateScanContext
 ) {
   const db = getDatabase();
+  /*
+   * 自用（2026-11-09 · 会话#11）：**每个阶段打一条耗时**（永久保留，排障用）。
+   *
+   * 起因：用户报"查重好慢"，但扫描是一个大函数，日志里只有"开始/结束"，
+   * 根本看不出时间花在 stat、抽样哈希、全量哈希、pHash 配对、还是指纹校验上 ✗
+   * 现在每跨过一个阶段就记一条，下次直接看数字定位，不再靠猜 ✓
+   */
+  const scanStartedAt = Date.now();
+  const logStage = (stage: string, detail?: Record<string, number>) => {
+    const elapsed = Date.now() - scanStartedAt;
+    console.log(
+      `[DupScan] stage=${stage} elapsed=${elapsed}ms${
+        detail ? ` ${JSON.stringify(detail)}` : ""
+      }`
+    );
+  };
   const sensitivity = getDuplicateSensitivityConfig(
     getSetting("duplicates.sensitivity")
   );
@@ -1708,6 +1812,7 @@ async function scanDuplicates(
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
   }
+  logStage("stat", { photos: allPhotos.length });
   const photoRevision = createDuplicatePhotoRevision(allPhotos);
   const vectorRevision = await getDuplicateVectorRevision();
   const settingsRevision = getSetting("duplicates.settingsRevision") ?? "0";
@@ -1789,6 +1894,7 @@ async function scanDuplicates(
         completeDuplicateDetectionRun(db, runId);
         return summaries;
       });
+      logStage("cache-hit", { pairs: existing.length });
       return { fromCache: true, groups, runId };
     }
 
@@ -1821,20 +1927,44 @@ async function scanDuplicates(
     // digest is only a filter; it is never persisted as or treated as exact.
     const sampleHashByPhotoId = new Map<number, string>();
     const candidatePhotos: (typeof allPhotos)[0][] = [];
-    for (const group of sizeGroups.values()) {
-      if (group.length < 2) {
-        continue;
-      }
-      for (const p of group) {
-        context.report("hashing", sampleHashByPhotoId.size, allPhotos.length);
-        const sampleHash = await computeSampleFileHash(p.path);
-        if (sampleHash) {
-          sampleHashByPhotoId.set(p.id, sampleHash);
-          candidatePhotos.push(p);
+    /*
+     * 自用（2026-11-09 · 会话#11）：**抽样哈希改成并发** ✗→✓
+     *
+     * 实测（用户库 79,128 张）：这一段**串行**跑 2,875 张要 **64.5 秒**（每张约 22 ms）——
+     * 同样的读法我用脚本离线测只要 0.3 ms/张（合计 0.9 秒）。
+     * 差这么多是因为每张要 5 次异步系统调用（open → stat → 读头 → 读尾 → close），
+     * 串行时每次调用的固定开销（含杀软实时扫描）都白等 ✗
+     * 改成每批 16 张并发 → 预期降到 4~6 秒 ✓
+     */
+    const SAMPLE_HASH_CONCURRENCY = 16;
+    const sizeGroupPhotos = [...sizeGroups.values()]
+      .filter((group) => group.length >= 2)
+      .flat();
+    for (
+      let start = 0;
+      start < sizeGroupPhotos.length;
+      start += SAMPLE_HASH_CONCURRENCY
+    ) {
+      context.assertCurrent();
+      const chunk = sizeGroupPhotos.slice(
+        start,
+        start + SAMPLE_HASH_CONCURRENCY
+      );
+      const hashes = await Promise.all(
+        chunk.map((photo) => computeSampleFileHash(photo.path))
+      );
+      for (let index = 0; index < chunk.length; index++) {
+        const sampleHash = hashes[index];
+        if (!sampleHash) {
+          continue;
         }
+        sampleHashByPhotoId.set(chunk[index].id, sampleHash);
+        candidatePhotos.push(chunk[index]);
       }
+      context.report("hashing", sampleHashByPhotoId.size, allPhotos.length);
     }
 
+    logStage("sample-hash", { photos: candidatePhotos.length });
     const sampleGroups = new Map<string, (typeof allPhotos)[0][]>();
     for (const photo of candidatePhotos) {
       const sampleHash = sampleHashByPhotoId.get(photo.id);
@@ -1850,23 +1980,39 @@ async function scanDuplicates(
     }
 
     const fullHashByPhotoId = new Map<number, string>();
-    for (const sampleGroup of sampleGroups.values()) {
-      if (sampleGroup.length < 2) {
-        continue;
-      }
-      for (const photo of sampleGroup) {
-        context.report(
-          "hashing",
-          fullHashByPhotoId.size,
-          candidatePhotos.length
-        );
-        const fullHash = await computeFullFileHash(photo.path);
+    /*
+     * 自用（2026-11-09 · 会话#11）：全量哈希也改成**有限并发**（8 张一批）。
+     * 这段只有在"抽样哈希撞车"时才跑（本次实测 1,435 张），但读的是整个文件、单次几十 MB，
+     * 并发太高反而会让机械盘来回找道 → 取 8 比较稳 ✓
+     */
+    const FULL_HASH_CONCURRENCY = 8;
+    const fullHashPhotos = [...sampleGroups.values()]
+      .filter((group) => group.length >= 2)
+      .flat();
+    for (
+      let start = 0;
+      start < fullHashPhotos.length;
+      start += FULL_HASH_CONCURRENCY
+    ) {
+      context.assertCurrent();
+      const chunk = fullHashPhotos.slice(start, start + FULL_HASH_CONCURRENCY);
+      const hashes = await Promise.all(
+        chunk.map((photo) => computeFullFileHash(photo.path))
+      );
+      for (let index = 0; index < chunk.length; index++) {
+        const fullHash = hashes[index];
         if (fullHash) {
-          fullHashByPhotoId.set(photo.id, fullHash);
+          fullHashByPhotoId.set(chunk[index].id, fullHash);
         }
       }
+      context.report(
+        "hashing",
+        fullHashByPhotoId.size,
+        candidatePhotos.length
+      );
     }
 
+    logStage("full-hash", { photos: fullHashByPhotoId.size });
     for (const group of sizeGroups.values()) {
       if (group.length < 2) {
         continue;
@@ -1969,6 +2115,7 @@ async function scanDuplicates(
         : [];
     const phashPairs = [...precisePairs, ...widePairs];
 
+    logStage("phash-pairs", { pairs: phashPairs.length, tiny: precisePairs.length });
     let phashProcessed = 0;
     for (const pair of phashPairs) {
       const { photoAId: aId, photoBId: bId } = pair;
@@ -2003,19 +2150,37 @@ async function scanDuplicates(
     // Sort by distance (lower = more likely duplicate)
     candidates.sort((a, b) => a.phashDistance - b.phashDistance);
 
-    const uniqueIds = new Set<number>();
+    /*
+     * 自用（2026-11-09 · 会话#11）：**只给"真的需要 AI 确认"的配对加载向量** ✗→✓
+     *
+     * 原来这里把**所有候选照片**（几万条）的 768 维向量一次性读进内存 ——
+     * 但下面是这样的规则：`exact` 配对和 `距离 ≤ phashThreshold` 的配对**根本不用向量**
+     * （pHash 已足够可信，代码里明确写了不让 AI 去否决它）。
+     * 而"加宽档"在 1 万张以上的库里本来就不启用 → 全库扫描时 `uniqueIds` 动辄几万，
+     * 这一读就是几十 MB、几十秒，纯属白干 ✗
+     * 改成：只收集"距离超阈值、需要 AI 确认"的配对成员；一条都没有就完全跳过读取 ✓
+     */
+    const idsNeedingVectorVerification = new Set<number>();
     for (const c of candidates) {
-      uniqueIds.add(c.photoAId);
-      uniqueIds.add(c.photoBId);
+      if (c.matchType === "exact" || c.phashDistance <= phashThreshold) {
+        continue;
+      }
+      idsNeedingVectorVerification.add(c.photoAId);
+      idsNeedingVectorVerification.add(c.photoBId);
     }
 
     let vectors: Map<number, number[]> = new Map();
-    try {
-      vectors = await getPhotoVectors(Array.from(uniqueIds), true);
-    } catch {
-      throw new Error(
-        "VECTOR_UNAVAILABLE: Could not verify duplicate candidates"
-      );
+    if (idsNeedingVectorVerification.size > 0) {
+      try {
+        vectors = await getPhotoVectors(
+          Array.from(idsNeedingVectorVerification),
+          true
+        );
+      } catch {
+        throw new Error(
+          "VECTOR_UNAVAILABLE: Could not verify duplicate candidates"
+        );
+      }
     }
 
     const confirmedPairs: CandidatePair[] = [];
@@ -2068,6 +2233,7 @@ async function scanDuplicates(
       fullHashByPhotoId,
       context
     );
+    logStage("fingerprints", { photos: fingerprints.length });
     await assertInputsCurrent();
     context.report("publishing", allPhotos.length, allPhotos.length);
     const groups = db.transaction((tx) => {
@@ -2111,6 +2277,7 @@ async function scanDuplicates(
       completeDuplicateDetectionRun(db, runId);
       return summaries;
     });
+    logStage("publish", { groups: groups.length });
     return { groups, fromCache: false, runId };
   } catch (error) {
     failDuplicateDetectionRun(db, runId, error);
@@ -2308,6 +2475,32 @@ export const dismissDuplicate = os
     return { success: true };
   });
 
+/**
+ * 自用（2026-11-09 · 会话#11）：从 `groupKey` 里解析出成员 id。
+ *
+ * `groupKey` 的格式是 `${matchType}:${成员id.join("-")}`（见 `createDuplicateGroupPreview`），
+ * 例如 `exact:12-34-56`、`similar:12-34`。解析失败就返回 `null`，
+ * 调用方按"这组已经过期，请重新扫描"处理 —— 和原来 `find()` 找不到时的行为一致 ✓
+ */
+function parseDuplicateGroupMemberIds(groupKey: string): number[] | null {
+  const separator = groupKey.indexOf(":");
+  if (separator <= 0) {
+    return null;
+  }
+  const idPart = groupKey.slice(separator + 1);
+  if (!idPart) {
+    return null;
+  }
+  const ids = idPart.split("-").map((value) => Number(value));
+  if (
+    ids.length === 0 ||
+    ids.some((id) => !Number.isInteger(id) || id <= 0)
+  ) {
+    return null;
+  }
+  return [...new Set(ids)];
+}
+
 export const dismissDuplicates = os
   .input(
     z.object({
@@ -2317,21 +2510,48 @@ export const dismissDuplicates = os
   )
   .handler(({ input }) => {
     const db = getDatabase();
-    const group = hydrateDuplicateGroups(
-      db,
-      loadNonSequenceDuplicatePairs(db)
-    ).find((candidate) => candidate.groupKey === input.groupKey);
-    if (!group) {
+    /*
+     * 自用（2026-11-09 · 会话#11 用户报「点忽略整组会卡一下，前端也跟着卡」）：
+     * **不再为了改一个组去把全库分组重建一遍** ✗→✓
+     *
+     * 原实现：`hydrateDuplicateGroups(loadNonSequenceDuplicatePairs(db)).find(...)` ——
+     * 载入全部 23,400 对、连表取出 15,539 张照片、重建 5,441 个组，**只为了找一个组** ✗
+     * 而且是同步跑在主进程上 → 界面整块卡住（连前端一起卡）。
+     *
+     * 现在：`groupKey` 本身就是 `matchType:成员id-成员id-…`（见 duplicate-groups.ts 的
+     * createDuplicateGroupPreview），直接解析出成员 id，再按"两端都在这个集合里"取本组配对，
+     * 只改这几行 ✓ 查询量从"全表"降到"一组"（通常 1~2 行）。
+     */
+    const memberIds = parseDuplicateGroupMemberIds(input.groupKey);
+    if (!memberIds) {
       throw new Error("Duplicate group is stale; rescan before ignoring");
     }
     return db.transaction((tx) => {
+      const groupPairs = tx
+        .select({ id: duplicatePairs.id })
+        .from(duplicatePairs)
+        .where(
+          and(
+            inArray(duplicatePairs.photoAId, memberIds),
+            inArray(duplicatePairs.photoBId, memberIds)
+          )
+        )
+        .all();
+      if (groupPairs.length === 0) {
+        throw new Error("Duplicate group is stale; rescan before ignoring");
+      }
       const result = tx
         .update(duplicatePairs)
         .set({
           status: input.dismissed ? "dismissed" : "pending",
           resolvedAt: input.dismissed ? Date.now() : null,
         })
-        .where(inArray(duplicatePairs.id, group.pairIds))
+        .where(
+          inArray(
+            duplicatePairs.id,
+            groupPairs.map((pair) => pair.id)
+          )
+        )
         .run();
       const review = tx
         .select()
@@ -2352,9 +2572,7 @@ export const dismissDuplicates = os
           .run();
         tx.insert(duplicateReviewEvents)
           .values({
-            detailsJson: JSON.stringify({
-              memberIds: group.photos.map((photo) => photo.id),
-            }),
+            detailsJson: JSON.stringify({ memberIds }),
             eventType: input.dismissed ? "USER_IGNORE" : "USER_UNIGNORE",
             groupKey: input.groupKey,
             groupVersion: review.groupVersion,

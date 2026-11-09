@@ -32,6 +32,8 @@ import { DuplicateCleanupBatches } from "@/components/duplicate-cleanup-batches"
 import { FilterDropdown } from "@/components/filter-dropdown";
 import { MasonryBackToTop } from "@/components/MasonryBackToTop";
 import { type LightboxPhoto, PhotoLightbox } from "@/components/PhotoLightbox";
+import { Switch } from "@/components/ui/switch";
+import { isPixivPageVariant } from "@/utils/pixiv-variants";
 import {
   Tooltip as AppTooltip,
   TooltipContent as AppTooltipContent,
@@ -66,6 +68,7 @@ const DECISION_LABELS = {
   DELETE: "duplicateDecisionDelete",
   UNDECIDED: "duplicateDecisionUndecided",
 } as const;
+
 
 function useDuplicatesQuery() {
   const queryClient = useQueryClient();
@@ -256,7 +259,14 @@ const DuplicatePhotoTile = memo(function DuplicatePhotoTile({
         onClick={onPreview}
         type="button"
       >
-        <div className="relative flex h-36 items-center justify-center bg-muted/30 p-2">
+        {/*
+          自用（2026-11-09 · 会话#11 用户要求）：**鼠标悬停在图片上显示该图完整路径** ✓
+          只在缩略图区域挂 tooltip（下面的文件名那条保持不变），路径用 break-all 折行显示，
+          否则长路径会把 tooltip 撑到屏幕外 ✗
+        */}
+        <AppTooltip>
+          <AppTooltipTrigger asChild>
+            <div className="relative flex h-36 items-center justify-center bg-muted/30 p-2">
           {failed ? (
             <Images className="h-8 w-8 text-muted-foreground/30" />
           ) : (
@@ -285,6 +295,30 @@ const DuplicatePhotoTile = memo(function DuplicatePhotoTile({
             </span>
           ) : null}
         </div>
+          </AppTooltipTrigger>
+          <AppTooltipContent className="max-w-[420px]">
+            {/*
+              自用（2026-11-09 · 会话#11 用户要求）：「点击路径能复制路径（和主界面一样）」✓
+              主界面走的是 `navigator.clipboard.writeText` + `pathCopied` 提示，这里完全复用同一套 ✓
+            */}
+            <button
+              className="block cursor-pointer break-all text-left text-[11px] leading-snug hover:underline"
+              onClick={async (event) => {
+                event.stopPropagation();
+                try {
+                  await navigator.clipboard.writeText(photo.path);
+                  toast.success(t("pathCopied"));
+                } catch {
+                  toast.error(t("copyFailed"));
+                }
+              }}
+              title={t("copyPath")}
+              type="button"
+            >
+              {photo.path}
+            </button>
+          </AppTooltipContent>
+        </AppTooltip>
         <div className="border-border border-t p-2.5">
           <AppTooltip>
             <AppTooltipTrigger asChild>
@@ -526,6 +560,7 @@ const DuplicateGroupCard = memo(function DuplicateGroupCard({
   loadingPhotos,
   onDismiss,
   onApplyKeepCount,
+  defaultKeepCount,
   onDecisionChange,
   onLoadMore,
   onPreview,
@@ -542,6 +577,8 @@ const DuplicateGroupCard = memo(function DuplicateGroupCard({
   loadingPhotos: boolean;
   onDismiss: () => void;
   onApplyKeepCount: (count: number) => void;
+  /** 上面「全部组保留 N 张」的值：组内输入框留空时就用它（自动跟随全局）✓ */
+  defaultKeepCount: number;
   onDecisionChange: (photoId: number, decision: DuplicatePhotoDecision) => void;
   onLoadMore: () => void;
   onPreview: (photoId: number) => void;
@@ -551,6 +588,20 @@ const DuplicateGroupCard = memo(function DuplicateGroupCard({
 }) {
   const [keepCountValue, setKeepCountValue] = useState("");
   const dismissed = group.status === "dismissed";
+  /*
+   * 自用（2026-11-09 · 会话#11 用户报「每项里的没有跟随上面的全局数量设置，导致点不了应用」）：
+   *
+   * 原来这里初始值是空字符串 → `keepCountIsValid` 为 false → 每组都必须先手打一个数字
+   * 才能点「应用数量」✗（几千个组等于几千次输入）。
+   * 现在：**输入框留空 = 用上面的全局保留数**（`defaultKeepCount`），
+   * 组内张数不足时自动夹到组内张数；用户手动输入则以手输为准 ✓
+   */
+  const trimmedKeepCount = keepCountValue.trim();
+  const usesGlobalKeepCount = trimmedKeepCount.length === 0;
+  const globalKeepCountForGroup = Math.min(
+    Math.max(1, defaultKeepCount),
+    Math.max(1, group.photoCount)
+  );
   const keepCountOptions = useMemo(
     () =>
       [...new Set([1, 2, 3, group.photoCount])]
@@ -565,13 +616,14 @@ const DuplicateGroupCard = memo(function DuplicateGroupCard({
         })),
     [group.photoCount, t]
   );
-  const normalizedKeepCount = keepCountValue.trim();
+  const normalizedKeepCount = trimmedKeepCount;
   const parsedKeepCount = Number.parseInt(normalizedKeepCount, 10);
-  const keepCountIsValid =
-    INTEGER_INPUT_PATTERN.test(normalizedKeepCount) &&
-    Number.isSafeInteger(parsedKeepCount) &&
-    parsedKeepCount >= 1 &&
-    parsedKeepCount <= group.photoCount;
+  const keepCountIsValid = usesGlobalKeepCount
+    ? globalKeepCountForGroup >= 1
+    : INTEGER_INPUT_PATTERN.test(normalizedKeepCount) &&
+      Number.isSafeInteger(parsedKeepCount) &&
+      parsedKeepCount >= 1 &&
+      parsedKeepCount <= group.photoCount;
   let toggleClass = "bg-muted text-muted-foreground hover:text-foreground";
   if (enabled) {
     toggleClass = "bg-destructive/10 text-destructive hover:bg-destructive/15";
@@ -647,14 +699,23 @@ const DuplicateGroupCard = memo(function DuplicateGroupCard({
                 editable
                 onChange={setKeepCountValue}
                 options={keepCountOptions}
-                placeholder={t("duplicateApplyKeepCount")}
-                value={keepCountValue}
+                placeholder={String(globalKeepCountForGroup)}
+                value={
+                  usesGlobalKeepCount
+                    ? String(globalKeepCountForGroup)
+                    : keepCountValue
+                }
               />
               <button
                 className="rounded-[5px] border border-border px-2.5 py-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed"
                 disabled={busy || !keepCountIsValid}
                 onClick={() => {
-                  onApplyKeepCount(parsedKeepCount);
+                  onApplyKeepCount(
+                    usesGlobalKeepCount
+                      ? globalKeepCountForGroup
+                      : parsedKeepCount
+                  );
+                  // 应用后清空 → 继续跟随上面的全局数量 ✓
                   setKeepCountValue("");
                 }}
                 type="button"
@@ -759,19 +820,64 @@ export function DuplicatesPage() {
   const queryClient = useQueryClient();
   const parentRef = useRef<HTMLDivElement>(null);
   const toolbarRef = useRef<HTMLDivElement>(null);
+  /* 自用（2026-11-09 · 会话#11 用户要求）：**去掉「全部待处理」标签**；
+     但默认状态仍是 `"all"`（列表照旧显示全部待处理），
+     三个标签只作为"筛选"用；点「查看全部待处理」也能回到这个状态 ✓ */
   const [filter, setFilter] = useState<GroupFilter>("all");
+  /*
+   * 自用（2026-11-09 · 会话#11）：**Pixiv 差分筛除**开关（默认开启）——
+   * 只筛「视觉相似」，不碰「完全相同」（那边需要人工看），选择会记住 ✓
+   */
+  const HIDE_PIXIV_VARIANTS_KEY = "aim.duplicatesHidePixivVariants";
+  const [hidePixivVariants, setHidePixivVariants] = useState(
+    () => localStorage.getItem(HIDE_PIXIV_VARIANTS_KEY) !== "0"
+  );
   const [enabledGroups, setEnabledGroups] = useState<
     Record<string, number | undefined>
   >({});
   const savingGroupKeys = useRef(new Set<string>());
   const [savingGroups, setSavingGroups] = useState<Record<string, boolean>>({});
+  /*
+   * 自用（2026-11-09 · 会话#11 用户要求）：**忽略整组时要有离场动画**（现在是"突然消失"）。
+   * 做法：先把这一组记进 `leavingGroups` → 卡片加上 `.duplicates-group-leaving` 播淡出/收缩，
+   * 动画结束再把缓存里那一组改成"已忽略"（它才会真正从当前筛选里消失）✓
+   */
+  const [leavingGroups, setLeavingGroups] = useState<Record<string, boolean>>(
+    {}
+  );
+  /*
+   * 自用（2026-11-09 · 会话#11 用户口径）：「动效还是有点生硬，再丝滑点」。
+   * 离场卡片淡出后，下面的卡片会**瞬间跳上去**，这就是"生硬"的来源 ✗
+   * 这里加一个 320ms 的 `reflowing` 窗口：这期间所有卡片的 `transform` 都带过渡，
+   * 于是"补位上移"变成滑上去 ✓（只在这个短窗口内加过渡，平时不加，
+   * 否则虚拟列表滚动时每帧改 translateY 都会做补间、滚动发飘 ✗）
+   */
+  const [reflowing, setReflowing] = useState(false);
+  /*
+   * 自用（2026-11-09 · 会话#11 用户口径）：
+   * 「我这几千个组每个都要重复操作三次才能添加很费劲」—— 减掉重复劳动 ✓
+   *
+   * ① `bulkKeepCount`：顶栏一次把**所有组**设成"保留 N 张"（服务端批量，一次事务）✓
+   * ② `autoQueueOnApply`：打开后，组内点「应用数量」= **直接加入清理队列**
+   *    （原来还得再点一次「确认清理此组」；默认关闭，避免误操作 ✓ 选择会被记住）
+   */
+  const BULK_KEEP_COUNT_KEY = "aim.duplicatesBulkKeepCount";
+  const AUTO_QUEUE_KEY = "aim.duplicatesAutoQueueOnApply";
+  const [bulkKeepCount, setBulkKeepCount] = useState(() => {
+    const saved = Number(localStorage.getItem(BULK_KEEP_COUNT_KEY));
+    return Number.isFinite(saved) && saved >= 1 ? Math.min(64, saved) : 1;
+  });
+  const [autoQueueOnApply, setAutoQueueOnApply] = useState(
+    () => localStorage.getItem(AUTO_QUEUE_KEY) === "1"
+  );
   const [cleanupPlan, setCleanupPlan] =
     useState<DuplicateCleanupPlanResult | null>(null);
-  const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);
-  const [keepCountRequest, setKeepCountRequest] = useState<{
-    count: number;
-    group: DuplicateGroupSummary;
-  } | null>(null);
+  const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);  /**
+   * 自用（2026-11-09 · 会话#11 用户担心「两个新选项互相配合一键全删」）：
+   * 批量"保留 N 张"会**覆盖所有组已有的保留/删除选择**，所以执行前必须二次确认 ✓
+   * （注意：它只写决策，**不会入队、更不会删文件**；真正的删除仍要点「清理全部待处理」并在确认框里确认。）
+   */
+  const [bulkApplyConfirmOpen, setBulkApplyConfirmOpen] = useState(false);
   const [previewState, setPreviewState] = useState<{
     groupKey: string;
     photoId: number;
@@ -951,6 +1057,26 @@ export function DuplicatesPage() {
     }
   };
 
+  /*
+   * 自用（2026-11-09 · 会话#11）：**一次设置所有组的保留数量**（服务端批量，一个事务）✓
+   * 完成后刷新一次列表：分组/计数会变，刷新是正确的（这是"批量操作"，用户预期会更新）。
+   */
+  const applyKeepCountToAll = useMutation({
+    mutationFn: (count: number) => duplicateActions.applyKeepCountToAll(count),
+    onError: (error) =>
+      toast.error(t(duplicateErrorKey(error, "duplicateReviewSaveFailed"))),
+    onSuccess: (result) => {
+      setEnabledGroups({});
+      toast.success(
+        t("duplicateBulkKeepApplied", {
+          skipped: result.skipped,
+          updated: result.updated,
+        })
+      );
+      queryClient.invalidateQueries({ queryKey: ["duplicates"] });
+    },
+  });
+
   const rescan = useMutation({
     mutationFn: () => duplicateActions.scan(true) as Promise<DuplicatesResult>,
     onSuccess: (result) => {
@@ -967,8 +1093,60 @@ export function DuplicatesPage() {
         group.groupKey,
         group.status !== "dismissed"
       ),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ["duplicates"] }),
+    /*
+     * 自用（2026-11-09 · 会话#11 用户报「点忽略整组会卡一下」）：
+     * **不要再整表重取** ✗→✓
+     *
+     * 原来这里 `invalidateQueries(["duplicates"])` → 立刻重跑一次列表查询：
+     * 主进程要把 23,400 对重新分组、把 15,539 张图的数据经 IPC 传过来，前端再全量重渲染 ✗
+     * 而"忽略/取消忽略"只改这一组的忽略状态（服务端已确认写入成功），
+     * 所以直接改本地缓存里的**这一个组**就够了，界面立刻响应、不需要任何请求 ✓
+     */
+    onSuccess: (_data, group) => {
+      const dismissed = group.status !== "dismissed";
+      const applyToCache = () => {
+        queryClient.setQueryData<DuplicatesResult>(
+          ["duplicates"],
+          (previous) =>
+            previous
+              ? {
+                  ...previous,
+                  groups: previous.groups.map((candidate) =>
+                    candidate.groupKey === group.groupKey
+                      ? {
+                          ...candidate,
+                          reviewComplete: false,
+                          reviewNeedsReview: !dismissed,
+                          status: dismissed ? "dismissed" : "active",
+                        }
+                      : candidate
+                  ),
+                }
+              : previous
+        );
+      };
+      if (!dismissed) {
+        // 取消忽略：这一组会重新出现，直接改缓存即可（没有"离场"）
+        applyToCache();
+        return;
+      }
+      // 忽略：先播离场动画（淡出 + 轻微上浮/收缩），再真正移出列表，
+      // 并开一个 320ms 的补位窗口让下面的卡片"滑"上来 ✓
+      setLeavingGroups((previous) => ({
+        ...previous,
+        [group.groupKey]: true,
+      }));
+      window.setTimeout(() => {
+        applyToCache();
+        setLeavingGroups((previous) => {
+          const next = { ...previous };
+          delete next[group.groupKey];
+          return next;
+        });
+        setReflowing(true);
+        window.setTimeout(() => setReflowing(false), 320);
+      }, 260);
+    },
     onError: () => toast.error(t("duplicateIgnoreFailed")),
   });
 
@@ -1132,13 +1310,32 @@ export function DuplicatesPage() {
       queryClient.invalidateQueries({ queryKey: ["duplicates"] });
     },
     onSuccess: (result) => {
+      /*
+       * 自用（2026-11-09 · 会话#11 用户报「确定之后还要等一会才从列表上消失」）：
+       * 原来成功后 `invalidateQueries(["duplicates"])` → **整表重取**（5,441 组 + 15,000 张图），
+       * 主进程重建分组、前端全量重渲染，所以"删除成功"到"列表消失"之间卡一段 ✗
+       * 现在：直接把本次清理涉及的组从**缓存里移除**（我们本来就知道是哪些组），界面立刻更新 ✓
+       * 批次列表仍照常失效（那个很轻）。
+       */
+      const executedGroupKeys = new Set(
+        cleanupPlan?.groups.map((group) => group.groupKey) ?? []
+      );
       setCleanupPlan(null);
       setCleanupDialogOpen(false);
       setEnabledGroups({});
+      queryClient.setQueryData<DuplicatesResult>(["duplicates"], (previous) =>
+        previous
+          ? {
+              ...previous,
+              groups: previous.groups.filter(
+                (group) => !executedGroupKeys.has(group.groupKey)
+              ),
+            }
+          : previous
+      );
       queryClient.invalidateQueries({
         queryKey: ["duplicate-cleanup-batches"],
       });
-      queryClient.invalidateQueries({ queryKey: ["duplicates"] });
       toast.success(
         t("duplicateCleanupSuccess", { count: result.deletedCount })
       );
@@ -1169,26 +1366,37 @@ export function DuplicatesPage() {
     onError: () => toast.error(t("duplicateReviewSaveFailed")),
     onSuccess: (result, variables) => {
       applySavedReview(result);
-      setKeepCountRequest(null);
       setEnabledGroups((previous) => ({
         ...previous,
-        [variables.group.groupKey]: undefined,
+        /*
+         * 自用（2026-11-09 · 会话#11）：`autoQueueOnApply` 打开时，**应用数量后直接入队** ✓
+         * 原来这里固定写 undefined（即"清掉入队标记"），用户还得再点一次「确认清理此组」——
+         * 几千个组就是几千次多余点击 ✗
+         *
+         * 保险（用户担心「一键全删」）：**只有这一组真的存在"删除"项时才入队** ✓
+         * 例如"组内 2 张、保留 2 张"= 什么都不删，就不该占用待清理位；
+         * 而且每组至少保留 1 张是服务端强制的（count >= 1），不可能把一组删空。
+         */
+        [variables.group.groupKey]:
+          autoQueueOnApply &&
+          result.members.some((member) => member.decision === "DELETE")
+            ? result.reviewRevision
+            : undefined,
       }));
     },
   });
 
+  /*
+   * 自用（2026-11-09 · 会话#11 用户口径）：「这个界面不要」——
+   * 以前如果这一组已经有保留/删除选择，点「应用数量」会先弹一个"应用保留数量…会覆盖已有审核决定"的确认框 ✗
+   * 用户在做批量清理（几千个组），这个确认框等于每组多一次点击，明确要求去掉 ✓
+   * 现在直接应用。防误删的保护不在这里，而在最后一步：
+   * 真正的删除仍然要经过「清理全部待处理」+ 确认框 ✓
+   */
   const requestApplyKeepCount = (
     group: DuplicateGroupSummary,
     count: number
   ) => {
-    const summary = decisionSummaries[group.groupKey];
-    if (
-      summary &&
-      (summary.keepPhotoIds.length > 0 || summary.deletePhotoIds.length > 0)
-    ) {
-      setKeepCountRequest({ count, group });
-      return;
-    }
     applyKeepCount.mutate({ count, group });
   };
 
@@ -1273,9 +1481,10 @@ export function DuplicatesPage() {
     return groups.filter(
       (group) =>
         group.status === "active" &&
-        (filter === "all" || group.matchType === filter)
+        (filter === "all" || group.matchType === filter) &&
+        !(hidePixivVariants && isPixivPageVariant(group))
     );
-  }, [filter, groups]);
+  }, [filter, groups, hidePixivVariants]);
 
   const virtualizer = useVirtualizer({
     count: filteredGroups.length,
@@ -1295,17 +1504,30 @@ export function DuplicatesPage() {
     (sum, group) => sum + group.photoCount,
     0
   );
+  /*
+   * 自用（2026-11-09 · 会话#11 用户报「开启筛除之后左侧显示的数目没有变化」）：
+   * 标签上的数字以前是按**全部组**算的，没跟"筛除 Pixiv 差分"走 ✗
+   * 现在统一用 `visibleActiveGroups`（应用同一条筛除规则）来算，数字与列表一致 ✓
+   * 注意「完全相同」永远不受该开关影响（`isPixivPageVariant` 只认 similar）✓
+   */
+  const visibleActiveGroups = hidePixivVariants
+    ? activeGroups.filter((group) => !isPixivPageVariant(group))
+    : activeGroups;
+  const visibleInvolvedPhotos = visibleActiveGroups.reduce(
+    (sum, group) => sum + group.photoCount,
+    0
+  );
   const filters: [GroupFilter, string, number][] = [
-    ["all", t("duplicateFilterAll"), activeGroups.length],
     [
       "exact",
       t("exactDuplicate"),
-      activeGroups.filter((group) => group.matchType === "exact").length,
+      visibleActiveGroups.filter((group) => group.matchType === "exact").length,
     ],
     [
       "similar",
       t("duplicateSimilarGroup"),
-      activeGroups.filter((group) => group.matchType === "similar").length,
+      visibleActiveGroups.filter((group) => group.matchType === "similar")
+        .length,
     ],
     [
       "dismissed",
@@ -1351,8 +1573,8 @@ export function DuplicatesPage() {
           {queryReady && activeGroups.length > 0 ? (
             <div className="order-3 flex w-full items-center divide-x divide-border overflow-x-auto rounded-[7px] border border-border bg-muted/35 lg:order-none lg:w-auto">
               {[
-                [t("duplicateGroupStat"), activeGroups.length],
-                [t("duplicatePhotoStat"), involvedPhotos],
+                [t("duplicateGroupStat"), visibleActiveGroups.length],
+                [t("duplicatePhotoStat"), visibleInvolvedPhotos],
                 [t("duplicatePendingStat"), cleanupCount],
                 [t("duplicateReclaimStat"), formatFileSize(reclaimBytes)],
               ].map(([label, value]) => (
@@ -1399,7 +1621,7 @@ export function DuplicatesPage() {
                 scanBusy ||
                 reviewBusy
               }
-              onClick={() => createCleanupPlan.mutate()}
+              onClick={() => { setCleanupPlan(null); setCleanupDialogOpen(true); createCleanupPlan.mutate(); }}
               type="button"
             >
               <Trash2 className="h-3.5 w-3.5" />
@@ -1427,12 +1649,12 @@ export function DuplicatesPage() {
 
       <div className="relative flex min-h-0 min-w-0 flex-1">
         <nav
-          className={`page-toolbar absolute top-0 right-0 left-0 z-50 flex flex-wrap items-center justify-between gap-2 overflow-x-hidden border-b px-4 py-1.5 sm:px-6 ${
+          className={`page-toolbar absolute top-0 right-0 left-0 z-50 flex flex-wrap items-center justify-between gap-2 overflow-x-hidden border-b px-4 py-1.5 sm:px-6 max-[1100px]:grid max-[1100px]:overflow-x-visible max-[1100px]:grid-cols-[minmax(max-content,auto)_minmax(0,1fr)] max-[1100px]:items-center max-[1100px]:gap-x-2 max-[1100px]:gap-y-1 ${
             isToolbarScrolled ? "is-scrolled" : ""
           }`}
           ref={toolbarRef}
         >
-          <div className="inline-flex max-w-full shrink-0 overflow-x-auto rounded-[8px] border border-border bg-secondary p-1">
+          <div className="inline-flex max-w-full shrink-0 overflow-x-auto rounded-[8px] border border-border bg-secondary p-1 max-[1100px]:min-w-0">
             {filters.map(([key, label, count]) => (
               <button
                 aria-pressed={filter === key}
@@ -1452,6 +1674,79 @@ export function DuplicatesPage() {
               </button>
             ))}
           </div>
+          {/*
+            自用（2026-11-09 · 会话#11 用户口径）：「挪到中间那里」——
+            这个位置就是标签行中间那段空白（筛选标签与右侧提示之间），
+            之前因为文案太长会压到右边提示，现在文案已缩短（"保留" / "「应用数量」后直接入队"）✓
+          */}
+          {queryReady && activeGroups.length > 0 ? (
+            <div className="mx-auto flex flex-nowrap items-center gap-1.5 max-[1100px]:col-span-2 max-[1100px]:col-start-1 max-[1100px]:row-start-2 max-[1100px]:mx-0 max-[1100px]:w-full max-[1100px]:min-w-0 max-[1100px]:flex-wrap max-[1100px]:justify-center">
+              <label
+                className="flex h-[38px] cursor-pointer items-center gap-2 whitespace-nowrap rounded-[8px] border border-border bg-background/80 px-2.5 text-[12px] text-muted-foreground"
+                title={t("duplicateHidePixivVariantsHint")}
+              >
+                <Switch
+                  checked={hidePixivVariants}
+                  onCheckedChange={(next) => {
+                    setHidePixivVariants(next);
+                    localStorage.setItem(
+                      HIDE_PIXIV_VARIANTS_KEY,
+                      next ? "1" : "0"
+                    );
+                  }}
+                />
+                <span>{t("duplicateHidePixivVariants")}</span>
+              </label>
+              <div className="flex h-[38px] items-center gap-1.5 rounded-[8px] border border-border bg-background/80 px-2.5 text-[12px] text-muted-foreground">
+                <span className="whitespace-nowrap">
+                  {t("duplicateBulkKeepLabel")}
+                </span>
+                <input
+                  aria-label={t("duplicateBulkKeepLabel")}
+                  className="h-7 w-16 rounded-[6px] border border-border bg-card px-2 text-center text-[12px] text-foreground tabular-nums"
+                  max={64}
+                  min={1}
+                  onChange={(event) => {
+                    const next = Math.min(
+                      64,
+                      Math.max(1, Number(event.target.value) || 1)
+                    );
+                    setBulkKeepCount(next);
+                    localStorage.setItem(BULK_KEEP_COUNT_KEY, String(next));
+                  }}
+                  type="number"
+                  value={bulkKeepCount}
+                />
+                <AppTooltip>
+                  <AppTooltipTrigger asChild>
+                    <button
+                      className="whitespace-nowrap rounded-[6px] px-2 py-1 font-medium text-foreground transition-colors hover:bg-foreground/5 disabled:opacity-40"
+                      disabled={applyKeepCountToAll.isPending || scanBusy}
+                      onClick={() => setBulkApplyConfirmOpen(true)}
+                      type="button"
+                    >
+                      {applyKeepCountToAll.isPending
+                        ? t("duplicateBulkKeepApplying")
+                        : t("duplicateBulkKeepApply")}
+                    </button>
+                  </AppTooltipTrigger>
+                  <AppTooltipContent>
+                    {t("duplicateBulkKeepHint")}
+                  </AppTooltipContent>
+                </AppTooltip>
+              </div>
+              <label className="flex h-[38px] items-center gap-2 whitespace-nowrap rounded-[8px] border border-border bg-background/80 px-2.5 text-[12px] text-muted-foreground">
+                <Switch
+                  checked={autoQueueOnApply}
+                  onCheckedChange={(next) => {
+                    setAutoQueueOnApply(next);
+                    localStorage.setItem(AUTO_QUEUE_KEY, next ? "1" : "0");
+                  }}
+                />
+                <span>{t("duplicateAutoQueueLabel")}</span>
+              </label>
+            </div>
+          ) : null}
           {scanBusy && showScanProgress ? (
             <div
               className="ml-auto flex min-w-0 max-w-[min(20rem,60vw)] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background/90 px-2 py-1 text-[10px] text-muted-foreground"
@@ -1485,14 +1780,23 @@ export function DuplicatesPage() {
                 但会抢 CPU/磁盘 —— 所以这里只是**提示一句"会变慢"**，不拦、不排队 ✓
               */}
               {aiRunning ? (
-                <span className="ml-auto flex min-w-0 items-center gap-1 text-[10px] text-warning">
+                <span className="ml-auto flex shrink-0 items-center gap-1 whitespace-nowrap text-[10px] text-warning max-[1100px]:col-start-2 max-[1100px]:row-start-1 max-[1100px]:ml-0 max-[1100px]:justify-self-end max-[1100px]:self-center">
                   <AlertTriangle className="h-3.5 w-3.5" />
                   {t("duplicateScanBusyHint")}
                 </span>
               ) : (
-                <span className="ml-auto flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
-                  <ShieldCheck className="h-3.5 w-3.5 text-success" />
-                  {t("duplicateSafetyHint")}
+                <span
+                  className="ml-auto flex shrink-0 items-start gap-1 text-right text-[10px] text-muted-foreground max-[1100px]:col-start-2 max-[1100px]:row-start-1 max-[1100px]:ml-0 max-[1100px]:min-w-0 max-[1100px]:max-w-[min(20rem,45vw)] max-[1100px]:justify-self-end max-[1100px]:self-center"
+                  title={t("duplicateSafetyHint")}
+                >
+                  <ShieldCheck className="mt-px h-3.5 w-3.5 shrink-0 text-success" />
+                  {/*
+                    自用（2026-11-09 · 会话#11 用户口径）：「如果实在放不下就把小字换行吧」——
+                    文案里带换行符，这里用 `whitespace-pre-line` 让它按文案里的位置断成两行、右对齐 ✓
+                  */}
+                  <span className="whitespace-pre-line leading-snug">
+                    {t("duplicateSafetyHint")}
+                  </span>
                 </span>
               )}
             </>
@@ -1606,13 +1910,36 @@ export function DuplicatesPage() {
                   loading: false,
                   total: group.photoCount,
                 };
+                const isLeaving = Boolean(leavingGroups[group.groupKey]);
                 return (
                   <div
                     className="absolute top-0 left-0 w-full pb-4"
                     data-index={item.index}
                     key={item.key}
                     ref={virtualizer.measureElement}
-                    style={{ transform: `translateY(${item.start}px)` }}
+                    style={
+                      isLeaving
+                        ? {
+                            opacity: 0,
+                            pointerEvents: "none",
+                            transform: `translateY(${item.start - 6}px) scale(0.97)`,
+                            /*
+                             * 自用（2026-11-09 · 会话#11）：离场动画走**内联样式**，
+                             * 不依赖 `global.css` 里那条 class 是否被加载/热更新到 ✓
+                             * 缓动用 `cubic-bezier(0.22,1,0.36,1)`（先快后缓、收尾柔和），
+                             * 比默认 `ease` 更"丝滑" ✓
+                             */
+                            transition:
+                              "opacity 260ms cubic-bezier(0.22, 1, 0.36, 1), transform 260ms cubic-bezier(0.22, 1, 0.36, 1)",
+                          }
+                        : {
+                            transform: `translateY(${item.start}px)`,
+                            // 补位窗口内才加过渡：让下面的卡片滑上来，而不是瞬跳 ✓
+                            transition: reflowing
+                              ? "transform 320ms cubic-bezier(0.22, 1, 0.36, 1)"
+                              : undefined,
+                          }
+                    }
                   >
                     <DuplicateGroupCard
                       busy={
@@ -1635,6 +1962,7 @@ export function DuplicatesPage() {
                         enabledGroups[group.groupKey] === group.reviewRevision
                       }
                       group={group}
+                      defaultKeepCount={bulkKeepCount}
                       loadingPhotos={currentDetailState.loading}
                       onApplyKeepCount={(count) =>
                         requestApplyKeepCount(group, count)
@@ -1712,7 +2040,32 @@ export function DuplicatesPage() {
       ) : null}
 
       <ConfirmDialog
-        confirmText={t("duplicateConfirmCleanup")}
+        confirmText={t("duplicateBulkKeepConfirmAction")}
+        description={t("duplicateBulkKeepConfirmDescription", {
+          count: bulkKeepCount,
+          groups: activeGroups.length,
+        })}
+        destructive
+        disabled={applyKeepCountToAll.isPending}
+        onCancel={() => {
+          if (!applyKeepCountToAll.isPending) {
+            setBulkApplyConfirmOpen(false);
+          }
+        }}
+        onConfirm={() => {
+          setBulkApplyConfirmOpen(false);
+          applyKeepCountToAll.mutate(bulkKeepCount);
+        }}
+        open={bulkApplyConfirmOpen}
+        title={t("duplicateBulkKeepConfirmTitle")}
+      />
+
+      <ConfirmDialog
+        confirmText={
+          createCleanupPlan.isPending
+            ? t("duplicateCleanupPreparing")
+            : t("duplicateConfirmCleanup")
+        }
         description={
           cleanupPlan
             ? t("duplicateCleanupDescription", {
@@ -1738,12 +2091,44 @@ export function DuplicatesPage() {
                 ).length,
                 size: formatFileSize(cleanupPlan.deleteBytes),
               })
-            : undefined
+            : /*
+               * 自用（2026-11-09 · 会话#11）：计划还在生成时**先把数字显示出来** ——
+               * 这些数字列表里本来就有，不需要等主进程算完哈希，用户点下去立刻能看到弹框 ✓
+               */
+              t("duplicateCleanupDescription", {
+                exactCount: cleanupGroups
+                  .filter((group) => group.matchType === "exact")
+                  .reduce(
+                    (total, group) =>
+                      total +
+                      (decisionSummaries[group.groupKey]?.deletePhotoIds.length ??
+                        0),
+                    0
+                  ),
+                exactGroups: cleanupGroups.filter(
+                  (group) => group.matchType === "exact"
+                ).length,
+                groups: cleanupGroups.length,
+                count: cleanupCount,
+                similarCount: cleanupGroups
+                  .filter((group) => group.matchType === "similar")
+                  .reduce(
+                    (total, group) =>
+                      total +
+                      (decisionSummaries[group.groupKey]?.deletePhotoIds.length ??
+                        0),
+                    0
+                  ),
+                similarGroups: cleanupGroups.filter(
+                  (group) => group.matchType === "similar"
+                ).length,
+                size: formatFileSize(reclaimBytes),
+              })
         }
         destructive
-        disabled={executeCleanupPlan.isPending}
+        disabled={executeCleanupPlan.isPending || createCleanupPlan.isPending}
         onCancel={() => {
-          if (!executeCleanupPlan.isPending) {
+          if (!(executeCleanupPlan.isPending || createCleanupPlan.isPending)) {
             setCleanupDialogOpen(false);
           }
         }}
@@ -1756,31 +2141,6 @@ export function DuplicatesPage() {
         title={t("duplicateCleanupTitle")}
       />
 
-      <ConfirmDialog
-        confirmText={t("duplicateKeepCountConfirm")}
-        description={
-          keepCountRequest
-            ? t("duplicateKeepCountDescription", {
-                count: keepCountRequest.count,
-                deleteCount:
-                  keepCountRequest.group.photoCount - keepCountRequest.count,
-              })
-            : undefined
-        }
-        disabled={applyKeepCount.isPending}
-        onCancel={() => {
-          if (!applyKeepCount.isPending) {
-            setKeepCountRequest(null);
-          }
-        }}
-        onConfirm={() => {
-          if (keepCountRequest) {
-            applyKeepCount.mutate(keepCountRequest);
-          }
-        }}
-        open={keepCountRequest !== null}
-        title={t("duplicateKeepCountTitle")}
-      />
     </div>
   );
 }

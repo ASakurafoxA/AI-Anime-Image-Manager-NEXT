@@ -185,7 +185,15 @@ function withoutInternalSearchScores<
  * 冷启动（模型/库还没初始化）仍然是 10s ✓，那条没动 ✓。
  */
 const AI_SEARCH_TIMEOUT_MS = 6000;
-const AI_SEARCH_COLD_TIMEOUT_MS = 10_000;
+/*
+ * 自用（2026-11-09 · 会话#11）：**冷启动那次不再卡 10 秒**。
+ *
+ * 现场：冷启动的第一次语义搜索既要加载模型、又要开向量表，10 秒常常不够 →
+ * 超时被丢弃 → 纯中文描述查询变成「未找到匹配的图片」，用户只会以为库是空的 ✗
+ * （热态那次我们还是保留 6 秒熔断，防止"搜三次才出结果"那种拖沓。）
+ * 这里给到 60 秒：实际上等于"首次不设限"，但留一个兜底，避免模型彻底坏掉时永久挂起 ✓
+ */
+const AI_SEARCH_COLD_TIMEOUT_MS = 60_000;
 /*
  * 自用（2026-10 bug 修复）：**语义分支的召回深度上限**。
  *
@@ -326,7 +334,9 @@ export const searchByImage = os
       phashDistance: number | null;
     }> = [];
     try {
-      results = await searchByImageWithPhash(input.imagePath, input.limit);
+      results = await searchByImageWithPhash(input.imagePath, input.limit, {
+        semanticOnly: input.semanticOnly === true,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error("[searchByImage] image search failed:", message);

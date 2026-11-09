@@ -655,3 +655,60 @@ export function applyDuplicateKeepCount(
     ) as DuplicateReviewState;
   });
 }
+
+/**
+ * 自用（2026-11-09 · 会话#11 用户口径）：
+ * 「快捷设置所有组的数量」—— 一次把**所有重复组**设成"保留 N 张" ✓
+ *
+ * 为什么必须放在服务端：用户库里有 5,410 个组，如果按组一个个调 IPC，
+ * 就是 5,410 次往返 + 5,410 个事务，光排队就要好几分钟 ✗
+ * 这里在一个事务里遍历所有组，复用单组的 `applyDuplicateKeepCount`（含排序/校验/事件记录）✓
+ *
+ * 跳过规则：
+ *   · 已忽略的组（ignoreState != ACTIVE）不碰 ✓
+ *   · 组内张数 ≤ 保留数（设 1 张却只有 1 张的同组等）不产生删除，直接跳过 ✓
+ *   · 版本/revision 已变化的组（并发改动）计入 skipped，不影响其它组 ✓
+ */
+export function applyDuplicateKeepCountToAllGroups(
+  db: ReturnType<typeof getDatabase>,
+  input: { count: number }
+): { skipped: number; updated: number } {
+  const groups = db.select().from(duplicateReviewGroups).all();
+  let updated = 0;
+  let skipped = 0;
+  db.transaction((tx) => {
+    for (const group of groups) {
+      if (group.ignoreState !== "ACTIVE") {
+        continue;
+      }
+      const members = tx
+        .select({ photoId: duplicateReviewMembers.photoId })
+        .from(duplicateReviewMembers)
+        .where(eq(duplicateReviewMembers.groupKey, group.groupKey))
+        .all();
+      if (members.length < 2) {
+        skipped += 1;
+        continue;
+      }
+      // 保留数不能超过组内张数；取到上限等于"全都保留"，没有删除动作，跳过不写库 ✓
+      const count = Math.min(input.count, members.length);
+      if (count >= members.length) {
+        skipped += 1;
+        continue;
+      }
+      try {
+        applyDuplicateKeepCount(tx as unknown as ReturnType<typeof getDatabase>, {
+          count,
+          expectedReviewRevision: group.reviewRevision,
+          groupKey: group.groupKey,
+          groupVersion: group.groupVersion,
+        });
+        updated += 1;
+      } catch {
+        // 单个组失败（版本变化等）不影响其它组
+        skipped += 1;
+      }
+    }
+  });
+  return { skipped, updated };
+}

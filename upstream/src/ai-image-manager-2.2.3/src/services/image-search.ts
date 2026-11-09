@@ -37,25 +37,41 @@ export interface ImageSearchHit {
   similarity: number;
 }
 
+export interface ImageSearchOptions {
+  /**
+   * 自用（2026-11-08 · 会话#11 用户口径）：「继续搜索相似图像」。
+   *
+   * true = **只跑语义检索，跳过指纹短路径**。
+   * 为什么需要：查询图是「库里已存过的整图」时，指纹几毫秒就命中，函数会**直接返回**
+   * （见下面的注释），于是用户只看到那 1 张、看不到任何相似图。
+   * 界面上补了一个「继续搜索相似图像」按钮，走的就是这个开关。
+   */
+  semanticOnly?: boolean;
+}
+
 /**
  * 以图搜图：先查指纹，再（必要时）查语义。
  *
  * @param imagePath 查询图路径（可以是图库外的任意图片）
  * @param limit 语义结果条数上限（指纹命中不受此限制）
+ * @param options semanticOnly = 跳过指纹这一路，强制走语义检索
  */
 export async function searchByImageWithPhash(
   imagePath: string,
-  limit = 20
+  limit = 20,
+  options: ImageSearchOptions = {}
 ): Promise<ImageSearchHit[]> {
   const exactHits: ImageSearchHit[] = [];
   let queryPhash: string | null = null;
 
-  try {
-    if (fs.existsSync(imagePath)) {
-      queryPhash = await computePHash(imagePath);
+  if (!options.semanticOnly) {
+    try {
+      if (fs.existsSync(imagePath)) {
+        queryPhash = await computePHash(imagePath);
+      }
+    } catch {
+      queryPhash = null;
     }
-  } catch {
-    queryPhash = null;
   }
 
   if (queryPhash) {

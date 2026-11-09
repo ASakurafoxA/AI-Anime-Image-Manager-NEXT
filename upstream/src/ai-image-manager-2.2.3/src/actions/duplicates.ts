@@ -41,6 +41,9 @@ export const duplicateActions = {
     groupKey: string;
     groupVersion: string;
   }) => ipc.client.photos.applyDuplicateKeepCount(input),
+  /** 自用（2026-11-09 · 会话#11）：一次把所有组设成"保留 N 张" ✓ */
+  applyKeepCountToAll: (count: number) =>
+    ipc.client.photos.applyDuplicateKeepCountToAll({ count }),
   cleanGroups: (
     groups: Array<{
       deletePhotoIds: number[];

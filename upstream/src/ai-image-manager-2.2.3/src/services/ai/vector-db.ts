@@ -217,7 +217,7 @@ function runVectorMaintenanceWorker(
     index?: boolean;
     /** 建索引用：分区数（主进程算好传进来，worker 里不再依赖主进程状态 ✓）。 */
     numPartitions?: number;
-    /** 只清这几张表（不传 = worker 默认四张表）。 */
+    /** 只清这几张表（不传 = worker 默认五张表，含 ccip_embeddings）。 */
     tables?: string[];
   },
   timeoutMs = 30 * 60 * 1000
@@ -336,13 +336,45 @@ async function runMaintenanceInWorker(reason: string): Promise<void> {
     return;
   }
   try {
-    const versions = (await photoTable.listVersions()).length;
-    if (versions <= NEGLIGIBLE_MAINTENANCE_VERSIONS) {
+    /*
+     * 自用（2026-11-08 · 会话#11 修正）：**不能只看 photoTable 一张表** ✗
+     *
+     * 真实现场：`ccip_embeddings` 攒到 **770 个碎片 / 775 个版本**，
+     * 而 `photo_embeddings` 只有 7 个版本 → 这里永远判定"没什么可清" → 跳过整轮维护
+     * → CCIP 表永远不合并 → 「识别漏标签」每次逐个角色比对都要扫 770 个碎片：
+     * 实测单次查询 **~850ms**，300 个角色要 **4 分钟**；合并后单次 **6ms**，总共 ~2 秒 ✓
+     * （顺带：那 770 个碎片的扫描还让主进程 CPU 打满、句柄暴涨。）
+     * 所以改成看**所有表的版本数最大值**：哪张表脏了就清哪张（worker 会逐表处理）。
+     */
+    const candidateTables: Array<[string, LanceTable | null]> = [
+      ["photo_embeddings", photoTable],
+      ["pixai_embeddings", pixaiTable],
+      ["wd14_embeddings", wd14Table],
+      ["color_embeddings", colorTable],
+      ["ccip_embeddings", ccipTable],
+    ];
+    let dirtiest: { name: string; versions: number } = {
+      name: "photo_embeddings",
+      versions: 0,
+    };
+    for (const [name, table] of candidateTables) {
+      if (!table) {
+        continue;
+      }
+      const versions = (await table.listVersions()).length;
+      if (versions > dirtiest.versions) {
+        dirtiest = { name, versions };
+      }
+    }
+    if (dirtiest.versions <= NEGLIGIBLE_MAINTENANCE_VERSIONS) {
       log.info(
-        `[AI] Maintenance: skipped (only ${versions} version(s), nothing to clean) — ${reason}`
+        `[AI] Maintenance: skipped (最脏的 ${dirtiest.name} 也只有 ${dirtiest.versions} 个版本) — ${reason}`
       );
       return;
     }
+    log.info(
+      `[AI] Maintenance: ${dirtiest.name} 有 ${dirtiest.versions} 个版本 → 需要清理（${reason}）`
+    );
   } catch {
     /* 查不出就照旧清一次 */
   }

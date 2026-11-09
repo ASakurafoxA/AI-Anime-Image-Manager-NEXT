@@ -76,6 +76,8 @@ export function CharacterMissingDialog({
   } | null>(null);
   /** 换一批结果（重新分析）时清掉展开/勾选状态 */
   const rowsKeyRef = useRef<string>("");
+  /** ≤5 张那些行已经拉过/正在拉真实照片的（防重复请求；失败会删掉以便重试） */
+  const loadingSmallRef = useRef<Set<number>>(new Set());
   /*
    * 自用（2026-10-18 · 会话#9 用户反馈「这个分析有点久」）：
    * 分析要十几到几十秒，只转圈会让人以为卡死 → 显示**走到哪一步 + 已用几秒** ✓
@@ -126,7 +128,62 @@ export function CharacterMissingDialog({
     setGroupPhotos({});
     setSelection({});
     setLightbox(null);
+    // 结果换了一批 → 小图的加载记录也要清（否则同名下标会被当成"已拉过"）
+    loadingSmallRef.current = new Set();
   }, [rows]);
+
+  /*
+   * 自用（2026-11-08 · 会话#11 用户口径）：「≤5 张就不用再展开了，直接在小图上操作就可以了」。
+   * ≤5 张的行整组就是这一排小图 → 进弹窗就把**真实照片**拉回来（每行 ≤5 张，很轻），
+   * 让这排小图带勾选圈。预览缩略图只有路径、没有 photo.id，勾不了；
+   * 服务端拼预览时还可能因缺缩略图而 `filter` 掉几张，下标更对不上 ✗ → 不按下标猜 id ✓
+   */
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const pending: Array<{ ids: number[]; index: number }> = [];
+    rows.forEach((row, index) => {
+      const ids = row.photoIds ?? [];
+      if (ids.length === 0 || ids.length > 5) {
+        return;
+      }
+      if (groupPhotos[index] || loadingSmallRef.current.has(index)) {
+        return;
+      }
+      loadingSmallRef.current.add(index);
+      pending.push({ ids, index });
+    });
+    if (pending.length === 0) {
+      return;
+    }
+    void (async () => {
+      const loaded: Array<[number, GroupPhoto[]]> = [];
+      await Promise.all(
+        pending.map(async ({ ids, index }) => {
+          try {
+            const result = (await faceActions.getCharacterGroupPhotos(
+              ids
+            )) as { photos?: GroupPhoto[] };
+            loaded.push([index, result?.photos ?? []]);
+          } catch {
+            // 拉失败 → 该行小图退化成不可勾选（仍可点开大图）；允许下次再试
+            loadingSmallRef.current.delete(index);
+          }
+        })
+      );
+      if (loaded.length === 0) {
+        return;
+      }
+      setGroupPhotos((prev) => {
+        const next = { ...prev };
+        for (const [index, photos] of loaded) {
+          next[index] = photos;
+        }
+        return next;
+      });
+    })();
+  }, [open, rows, groupPhotos]);
 
   const toggleExpand = useCallback(
     async (index: number, row: CharacterMissingRow) => {
@@ -210,6 +267,19 @@ export function CharacterMissingDialog({
     setSelection((prev) => ({ ...prev, [index]: new Set() }));
   }
 
+  /**
+   * 一键全选（2026-11-08 · 会话#11 用户口径）：
+   * 「一两百张里只有几张不是的话，要把其他需要的全部选择，很麻烦」→ 先全选、再点掉那几张。
+   * ⚠️ 不做"全选/全不选"切换：这里的**空集 = 整组**（不勾选就是整组打标），
+   * 「全不选」会变成"反而给整组打标"，是反的、会误操作 ✗ —— 取消仍用「清空勾选」。
+   */
+  function selectAll(index: number, list: GroupPhoto[]) {
+    setSelection((prev) => ({
+      ...prev,
+      [index]: new Set(list.map((photo) => photo.id)),
+    }));
+  }
+
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
       <DialogContent
@@ -287,6 +357,9 @@ export function CharacterMissingDialog({
               const isExpanded = expanded.has(index);
               const chosen = selection[index] ?? new Set<number>();
               const photos = groupPhotos[index] ?? [];
+              /** ≤5 张时整组就是这一排小图 → 要有勾选圈（>5 张仍用预览缩略图，勾选去展开区） */
+              const inlinePhotos =
+                (row.photoIds?.length ?? 0) <= 5 ? photos : [];
               const loadingThis = loadingGroup === index;
               const targetIds = chosen.size > 0 ? [...chosen] : row.photoIds ?? [];
               return (
@@ -300,14 +373,57 @@ export function CharacterMissingDialog({
                 >
                   <div className="flex items-start gap-3">
                     <div className="flex shrink-0 items-center gap-1">
-                      {thumbs.slice(0, 5).map((thumb, thumbIndex) => (
-                        <LazyThumb
-                          className="h-12 w-12 cursor-zoom-in rounded-[4px]"
-                          key={thumb}
-                          onClick={() => void openLightboxAt(index, row, thumbIndex)}
-                          src={toLocalMediaUrl(thumb)}
-                        />
-                      ))}
+                      {inlinePhotos.length > 0
+                        ? inlinePhotos.map((photo, inlineIndex) => {
+                            const picked = chosen.has(photo.id);
+                            return (
+                              <div className="relative" key={photo.id}>
+                                <button
+                                  aria-label={t(
+                                    "characterDiscoveryToggleSelect"
+                                  )}
+                                  aria-pressed={picked}
+                                  className={`absolute top-0.5 left-0.5 z-10 flex h-5 w-5 items-center justify-center rounded-full border-2 shadow-sm transition-colors ${
+                                    picked
+                                      ? "border-primary bg-primary text-white"
+                                      : "border-white/80 bg-black/35 hover:bg-black/60"
+                                  }`}
+                                  onClick={() => toggleSelect(index, photo.id)}
+                                  type="button"
+                                >
+                                  {picked && (
+                                    <span className="text-[10px] leading-none">
+                                      ✓
+                                    </span>
+                                  )}
+                                </button>
+                                <LazyThumb
+                                  className={`h-12 w-12 cursor-zoom-in rounded-[4px] ${
+                                    picked ? "ring-2 ring-primary" : ""
+                                  }`}
+                                  onClick={() =>
+                                    setLightbox({
+                                      index: inlineIndex,
+                                      photos: inlinePhotos,
+                                    })
+                                  }
+                                  src={toLocalMediaUrl(
+                                    photo.thumbnailPath ?? photo.path
+                                  )}
+                                />
+                              </div>
+                            );
+                          })
+                        : thumbs.slice(0, 5).map((thumb, thumbIndex) => (
+                            <LazyThumb
+                              className="h-12 w-12 cursor-zoom-in rounded-[4px]"
+                              key={thumb}
+                              onClick={() =>
+                                void openLightboxAt(index, row, thumbIndex)
+                              }
+                              src={toLocalMediaUrl(thumb)}
+                            />
+                          ))}
                       {(row.photoIds?.length ?? 0) > 5 && (
                         <button
                           className="ml-1 shrink-0 rounded-[4px] border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
@@ -358,6 +474,16 @@ export function CharacterMissingDialog({
                     <div className="border-border border-t pt-2">
                       <div className="mb-2 flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
                         <span>{t("characterDiscoverySelectHint")}</span>
+                        {/* 一键全选（2026-11-08 · 会话#11）：已经全选上就不用再显示 */}
+                        {photos.length > 0 && chosen.size < photos.length && (
+                          <button
+                            className="underline transition-colors hover:text-foreground"
+                            onClick={() => selectAll(index, photos)}
+                            type="button"
+                          >
+                            {t("manualRolesSelectAll")}
+                          </button>
+                        )}
                         {chosen.size > 0 && (
                           <>
                             <span className="text-foreground">

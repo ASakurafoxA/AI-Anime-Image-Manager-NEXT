@@ -44,6 +44,11 @@ export const SearchSchema = z.object({
 export const ImageSearchSchema = z.object({
   imagePath: z.string().min(1),
   limit: z.number().optional().default(20),
+  /**
+   * 自用（2026-11-08 · 会话#11）：true = **跳过指纹、只跑语义检索**。
+   * 界面上的「继续搜索相似图像」按钮用它（指纹命中时默认会直接返回，看不到相似图）。
+   */
+  semanticOnly: z.boolean().optional(),
 });
 
 /** 自用新增：在软件里重命名文件夹（同步改磁盘 + 图库记录）。 */

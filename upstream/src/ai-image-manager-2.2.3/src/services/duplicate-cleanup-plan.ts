@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { and, desc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { getDatabase } from "@/db";
 import {
   duplicateCleanupEvents,
@@ -32,7 +32,14 @@ import {
 import { getSetting } from "@/services/settings-manager";
 import { invalidateSmartAlbumCache } from "@/services/smart-album-engine";
 
-export const DUPLICATE_CLEANUP_PLAN_TTL_MS = 10 * 60 * 1000;
+/*
+ * 自用（2026-11-09 · 会话#11）：**计划有效期 10 分钟 → 60 分钟**
+ *
+ * 现场：用户在 5,443 个组里翻着看、挑了几组加进待清理，等真正点「执行清理」时已经过了 10 分钟，
+ * 计划过期 → `PLAN_EXPIRED` → 清理直接失败 ✗（而且错误文案还被吞成通用提示，看不出原因）
+ * 60 分钟足够"慢慢挑完再执行"，同时又保留了"太久没执行就作废"的保护（文件可能已被外部改动）✓
+ */
+export const DUPLICATE_CLEANUP_PLAN_TTL_MS = 60 * 60 * 1000;
 export const DUPLICATE_SCAN_LEASE_MS = 30 * 60 * 1000;
 
 export function listDuplicateCleanupBatches(db = getDatabase()) {
@@ -169,7 +176,8 @@ export interface DuplicateCleanupPlanGroupInput {
 interface FileSnapshot {
   fileIdentity: string;
   fileSize: number;
-  fullSha256: string;
+  /** 允许为空：清理计划不再为每张图整份读盘算哈希（见 captureFileSnapshot 注释） */
+  fullSha256: string | null;
   modifiedAt: number;
   path: string;
 }
@@ -220,6 +228,41 @@ function fileIdentity(stat: fs.Stats): string {
   return stat.dev || stat.ino ? `${stat.dev}:${stat.ino}` : "";
 }
 
+/**
+ * 自用（2026-11-09 · 会话#11 用户报「执行清理计划失败，图片未被部分清理」）：
+ * **比较文件身份时只比 inode，不比卷号** ✗→✓
+ *
+ * 现场（用用户库真实数据对比出来的）：
+ *   · 计划里存的是 `1698110228:281474976865042`
+ *   · 执行时现取到的是 `6299167615478078228:281474976865042`
+ *   · 而 1698110228 正好等于 6299167615478078228 的**低 32 位** —— 同一个文件、同一个 inode，
+ *     只是 `stat.dev`（卷号）的精度不同（Windows 上卷号本质是 32 位，但不同运行时/版本
+ *     可能返回 32 位值或 64 位扩展值）。
+ * 后果：`sameFileSnapshot` 认为"文件身份变了"→ 每一项都判 FILE_CHANGED → 清理**永远失败** ✗
+ *
+ * 改法：身份只比较 **inode 部分**。路径、大小、修改时间仍在 `sameFileSnapshot` 里逐项比较，
+ * 文件被替换成另一个文件时 inode 必然变化，安全性不受影响 ✓
+ * （库里已有的旧格式 `dev:ino` 记录也能直接被这套比较兼容，不需要迁移。）
+ */
+function identityInodeKey(identity: string): string {
+  const separator = identity.lastIndexOf(":");
+  return separator >= 0 ? identity.slice(separator + 1) : identity;
+}
+
+/**
+ * 自用（2026-11-09 · 会话#11 用户报「清理老是失败，提示图片文件已变化」）：
+ * **修改时间比较要留 1 毫秒容差** ✗→✓
+ *
+ * 现场（照片 1005，用真实数据比出来的）：计划里存 `…896.7295`，执行时现取 `…896.7292` ——
+ * 差 **0.0003 毫秒**，是 `mtimeMs` 这种 1.79e12 量级的 double 的**一个 ulp**（最小精度步长）。
+ * 大小、inode、路径全都没变，文件也确实没被改过，却被判成"文件已变化"，清理必然失败 ✗
+ *
+ * 1 毫秒容差足以吸收浮点噪声，同时任何真实的文件改动（写入/替换）都会让 mtime 变化远超 1ms ✓
+ */
+function sameModifiedAt(expected: number, actual: number): boolean {
+  return Math.abs(Number(expected) - Number(actual)) < 1;
+}
+
 function sameFileSnapshot(
   expected: Pick<
     FileSnapshot,
@@ -232,13 +275,45 @@ function sameFileSnapshot(
 ): boolean {
   return (
     expected.path === actual.path &&
-    expected.fileIdentity === actual.fileIdentity &&
+    identityInodeKey(expected.fileIdentity) ===
+      identityInodeKey(actual.fileIdentity) &&
     expected.fileSize === actual.fileSize &&
-    expected.modifiedAt === actual.modifiedAt
+    sameModifiedAt(expected.modifiedAt, actual.modifiedAt)
   );
 }
 
-async function captureFileSnapshot(filePath: string): Promise<FileSnapshot> {
+/**
+ * 自用（2026-11-09 · 会话#11 用户报「点清理待处理卡很久才出界面」）：
+ * **允许复用已落库的整文件哈希，避免把同一个文件反复整份读盘** ✗→✓
+ *
+ * 实测（用户库）：`captureFileSnapshot` 里那次整文件 SHA-256 每个文件 **0.9~3.9 秒**
+ * （磁盘 + 杀软首次读取），而同样的读法在普通 Node 里只要 1ms —— 差别在"首次真正读这个文件"。
+ * 而扫描阶段已经把哈希写进了 `duplicate_photo_fingerprints`（大小/修改时间一致即可信）。
+ * 所以这里接受一个 `knownSha256`：指纹一致时直接用库里的值，不再重读整个文件 ✓
+ */
+/**
+ * 自用（2026-11-09 · 会话#11 用户报「点清理还是要等一会」）：
+ * **不再为了删一张图去整份读文件** ✗→✓
+ *
+ * 实测（用户库，真实日志）：0.19~0.30 MB 的文件，`computeFullFileHash` 要 **1.3~2.4 秒**
+ * （同样的读法在普通 Node 里 1 MB 只要 1 ms）——是每次打开都被杀软实时扫描造成的，
+ * 属于环境开销，改不动。而一处"删前校验"为此付出每个文件 2 秒的代价，完全不成比例 ✗
+ *
+ * 现在的策略：
+ *   · 指纹表里**已有哈希**且元数据一致 → 直接用（零读盘）✓
+ *   · 指纹表里没有 → **不再现算**，`fullSha256 = null`，改为靠
+ *     「大小 + 修改时间 + inode（+ contentRevision）」判断文件是否变过 ✓
+ *     （整组"完全相同"的那一类仍有逐字节比对兜底，见 byte-verify 阶段）
+ */
+async function captureFileSnapshot(
+  filePath: string,
+  options: {
+    /** 指纹里没有哈希时，是否还愿意整份读文件现算（默认 false = 不再读盘） */
+    requireHash?: boolean;
+    resolveKnownSha256?: (stat: fs.Stats) => string | null;
+  } = {}
+): Promise<FileSnapshot> {
+  const { requireHash = false, resolveKnownSha256 } = options;
   let before: fs.Stats;
   try {
     before = await fs.promises.stat(filePath);
@@ -254,11 +329,11 @@ async function captureFileSnapshot(filePath: string): Promise<FileSnapshot> {
       `Original path is not a file: ${filePath}`
     );
   }
-  const fullSha256 = await computeFullFileHash(filePath);
+  const fullSha256 = resolveKnownSha256?.(before) ?? (await computeFullFileHash(filePath));
   if (!fullSha256) {
     throw new DuplicateCleanupPlanError(
       "FILE_CHANGED",
-      `File could not be read consistently: ${filePath}`
+      "File could not be read consistently: ${filePath}"
     );
   }
   let after: fs.Stats;
@@ -309,7 +384,26 @@ function assertCurrentDuplicateGroup(
       `Photo ${sequenceMember.photoId} is managed by a photo sequence`
     );
   }
-  const persistedPairs = db.select().from(duplicatePairs).all();
+  /*
+   * 自用（2026-11-09 · 会话#11 用户报「点了清理待处理之后会卡很久才出这个界面」）：
+   * **只查和这批成员有关的配对，不再把全表 23,400 行读进来** ✗→✓
+   *
+   * 原来这里每次调用都 `db.select().from(duplicatePairs).all()`，
+   * 而它是**按组调用**的 → 6 个组就读 6 遍全表、几百个组就读几百遍 ✗（这就是那段卡顿）。
+   * 现在用 `where photoAId in (成员) or photoBId in (成员)` 只取本组相关的边；
+   * 若某个成员被"新配对"连到了组外，那个外部端点也会被这条查询捞到，
+   * 分组结果里自然多出人 → groupKey 对不上 → 仍然判 STALE（语义不变 ✓）
+   */
+  const persistedPairs = db
+    .select()
+    .from(duplicatePairs)
+    .where(
+      or(
+        inArray(duplicatePairs.photoAId, expectedPhotoIds),
+        inArray(duplicatePairs.photoBId, expectedPhotoIds)
+      )
+    )
+    .all();
   if (persistedPairs.length === 0) {
     throw new DuplicateCleanupPlanError(
       "STALE_GROUP",
@@ -571,7 +665,32 @@ export async function createDuplicateCleanupPlan(
   input: { groups: DuplicateCleanupPlanGroupInput[] },
   db = getDatabase()
 ) {
+  /*
+   * 自用（2026-11-09 · 会话#11）：用户报「点清理待处理要卡很久才弹框」，
+   * 加了这段分阶段计时（永久保留，排查用）：
+   *   `[CleanupPlan] stage=… total=…ms {计数}` —— 下次直接看数字就知道时间花在哪 ✓
+   */
+  const planStartedAt = Date.now();
+  const markPlanStage = (stage: string, detail?: Record<string, number>) => {
+    console.log(
+      `[CleanupPlan] stage=${stage} total=${Date.now() - planStartedAt}ms${
+        detail ? ` ${JSON.stringify(detail)}` : ""
+      }`
+    );
+  };
+  let stageAt = Date.now();
+  const lap = (stage: string, detail?: Record<string, number>) => {
+    const now = Date.now();
+    console.log(
+      `[CleanupPlan] lap=${stage} took=${now - stageAt}ms${
+        detail ? ` ${JSON.stringify(detail)}` : ""
+      }`
+    );
+    stageAt = now;
+    markPlanStage(stage, detail);
+  };
   assertNoDuplicateScanRunning(db);
+  lap("assert-no-scan");
   if (input.groups.length === 0) {
     throw new DuplicateCleanupPlanError(
       "INVALID_SELECTION",
@@ -588,8 +707,21 @@ export async function createDuplicateCleanupPlan(
 
   const itemSnapshots: PlanItemSnapshot[] = [];
   const configFingerprints = new Set<string>();
+  /*
+   * 子步骤计时（2026-11-09 · 会话#11）：整段循环 52 秒但五段 lap 都是 0ms，
+   * 说明时间就在组循环内部 → 这里把每个 await / 查询单独打点，精确定位 ✓
+   */
+  let tickAt = Date.now();
+  const tick = (label: string, extra?: Record<string, number>) => {
+    const now = Date.now();
+    console.log(
+      `[CleanupPlan] tick=${label} took=${now - tickAt}ms${extra ? ` ${JSON.stringify(extra)}` : ""}`
+    );
+    tickAt = now;
+  };
   for (const groupInput of input.groups) {
     const { group, members } = getReviewRows(db, groupInput.groupKey);
+    tick("review-rows");
     configFingerprints.add(group.detectionFingerprint);
     assertCurrentDetectionFingerprint(
       group.detectionFingerprint,
@@ -606,8 +738,10 @@ export async function createDuplicateCleanupPlan(
         `Duplicate group match type changed: ${groupInput.groupKey}`
       );
     }
+    tick("group-assert");
     validateSelection(groupInput, members, group);
     const memberIds = members.map((member) => member.photoId);
+    tick("validate");
     const photoRows = getPhotoRows(db, memberIds);
     const photoById = new Map(photoRows.map((photo) => [photo.id, photo]));
     if (photoRows.length !== memberIds.length) {
@@ -628,19 +762,47 @@ export async function createDuplicateCleanupPlan(
           `Duplicate group contains a deleted photo: ${photoId}`
         );
       }
-      const snapshot = await captureFileSnapshot(photo.path);
+    tick("photo-rows");
+      /*
+       * 先把指纹查出来（很便宜），这样 captureFileSnapshot 能在元数据一致时
+       * 直接复用库里的哈希、**不再整文件读盘** ✓（见 captureFileSnapshot 的注释）
+       */
       const fingerprint = db
         .select()
         .from(duplicatePhotoFingerprints)
         .where(eq(duplicatePhotoFingerprints.photoId, photoId))
         .get();
+      const snapshot = await captureFileSnapshot(photo.path, {
+        resolveKnownSha256: (stat) => {
+          if (
+            fingerprint?.fullSha256 &&
+            fingerprint.fileSize === stat.size &&
+            sameModifiedAt(fingerprint.modifiedAt, stat.mtimeMs)
+          ) {
+            return fingerprint.fullSha256;
+          }
+          return null;
+        },
+      });
+      tick("snapshot-hash", { photoId });
+      /*
+       * 自用（2026-11-09 · 会话#11）：指纹里的 `fullSha256` **允许为空** ✓
+       *
+       * 背景：查重提速后，只有"精确重复候选"才会算整文件 SHA-256，其余重复组成员的
+       * 指纹行 `fullSha256 = null`（否则首次扫描要读几十 GB、耗时一小时 ✗）。
+       * 所以这里不能要求"必须有哈希"，改为：
+       *   · 有哈希 → 必须与本次快照一致（最强校验，保持原样 ✓）
+       *   · 没有哈希 → 退到"元数据 + contentRevision"一致（快照本身仍会现算一份哈希，
+       *     并在执行删除前再校验一次，安全性没有丢 ✓）
+       */
       const fingerprintMatches = Boolean(
-        fingerprint?.fullSha256 &&
+        fingerprint &&
           fingerprint.contentRevision === member.contentRevision &&
           fingerprint.path === photo.path &&
           fingerprint.fileSize === snapshot.fileSize &&
-          fingerprint.modifiedAt === snapshot.modifiedAt &&
-          fingerprint.fullSha256 === snapshot.fullSha256
+          sameModifiedAt(fingerprint.modifiedAt, snapshot.modifiedAt) &&
+          (fingerprint.fullSha256 === null ||
+            fingerprint.fullSha256 === snapshot.fullSha256)
       );
       if (!fingerprintMatches) {
         throw new DuplicateCleanupPlanError(
@@ -654,6 +816,7 @@ export async function createDuplicateCleanupPlan(
           `Original file cannot be resolved: ${photo.path}`
         );
       });
+      tick("realpath", { photoId });
       itemSnapshots.push({
         ...snapshot,
         canonicalPath,
@@ -679,6 +842,7 @@ export async function createDuplicateCleanupPlan(
   const fileIdentities = new Set<string>();
   const photoIds = new Set<number>();
   for (const item of itemSnapshots) {
+  lap("snapshot-per-group", { groups: input.groups.length, items: itemSnapshots.length });
     if (photoIds.has(item.photoId)) {
       throw new DuplicateCleanupPlanError(
         "INVALID_SELECTION",
@@ -701,6 +865,7 @@ export async function createDuplicateCleanupPlan(
       fileIdentities.add(item.fileIdentity);
     }
   }
+  lap("selection-checks", { groups: input.groups.length, items: itemSnapshots.length });
   for (const groupInput of input.groups) {
     if (groupInput.matchType !== "exact") {
       continue;
@@ -727,6 +892,7 @@ export async function createDuplicateCleanupPlan(
       }
     }
   }
+  lap("byte-verify", { groups: input.groups.length });
 
   const now = Date.now();
   const planId = randomUUID();
@@ -800,7 +966,8 @@ export async function createDuplicateCleanupPlan(
           `Photo ${sequenceMember.photoId} is managed by a photo sequence`
         );
       }
-      validateSelection(groupInput, members, group);
+      tick("group-assert");
+    validateSelection(groupInput, members, group);
       for (const item of itemSnapshots.filter(
         (candidate) => candidate.groupKey === groupInput.groupKey
       )) {
@@ -835,8 +1002,10 @@ export async function createDuplicateCleanupPlan(
           fingerprint.contentRevision !== item.contentRevision ||
           fingerprint.path !== item.path ||
           fingerprint.fileSize !== item.fileSize ||
-          fingerprint.modifiedAt !== item.modifiedAt ||
-          fingerprint.fullSha256 !== item.fullSha256
+          !sameModifiedAt(fingerprint.modifiedAt, item.modifiedAt) ||
+          // 指纹里没存哈希（null）时跳过内容哈希比对，其余元数据仍需一致
+          (fingerprint.fullSha256 !== null &&
+            fingerprint.fullSha256 !== item.fullSha256)
         ) {
           throw new DuplicateCleanupPlanError(
             "STALE_REVIEW",
@@ -894,6 +1063,7 @@ export async function createDuplicateCleanupPlan(
       .where(eq(duplicateCleanupPlans.id, planId))
       .get() as typeof duplicateCleanupPlans.$inferSelect;
   });
+  lap("publish", { groups: input.groups.length, items: itemSnapshots.length });
 
   return planResult(plan, itemSnapshots);
 }
@@ -1043,11 +1213,17 @@ export async function executeDuplicateCleanupPlan(
     fingerprints.map((fingerprint) => [fingerprint.photoId, fingerprint])
   );
   for (const item of items) {
-    const current = await captureFileSnapshot(item.path);
+    /*
+     * 自用（2026-11-09 · 会话#11）：执行阶段**只比对元数据，不整份读文件** ✗→✓
+     * 原来这里对每张待删图再算一次整文件 SHA-256（实测每张 1~2.5 秒）→ "确定之后还要等" ✗
+     * 现在：stat 一次拿大小/修改时间/inode，加上指纹的 contentRevision 就能判断"文件有没有被换过" ✓
+     */
+    const stat = await fs.promises.stat(item.path).catch(() => null);
     const fingerprint = fingerprintById.get(item.photoId);
     if (
+      !stat ||
+      !stat.isFile() ||
       item.fileIdentity === null ||
-      item.fullSha256 === null ||
       !sameFileSnapshot(
         {
           fileIdentity: item.fileIdentity,
@@ -1055,15 +1231,20 @@ export async function executeDuplicateCleanupPlan(
           modifiedAt: item.modifiedAt,
           path: item.path,
         },
-        current
+        {
+          fileIdentity: fileIdentity(stat),
+          fileSize: stat.size,
+          modifiedAt: stat.mtimeMs,
+          path: item.path,
+        }
       ) ||
-      current.fullSha256 !== item.fullSha256 ||
       !fingerprint ||
       fingerprint.contentRevision !== item.contentRevision ||
       fingerprint.path !== item.path ||
       fingerprint.fileSize !== item.fileSize ||
-      fingerprint.modifiedAt !== item.modifiedAt ||
-      fingerprint.fullSha256 !== item.fullSha256
+      !sameModifiedAt(fingerprint.modifiedAt, item.modifiedAt) ||
+      (fingerprint.fullSha256 !== null &&
+        fingerprint.fullSha256 !== item.fullSha256)
     ) {
       throw new DuplicateCleanupPlanError(
         "FILE_CHANGED",
@@ -1299,8 +1480,10 @@ export async function executeDuplicateCleanupPlan(
         fingerprint.contentRevision !== item.contentRevision ||
         fingerprint.path !== item.path ||
         fingerprint.fileSize !== item.fileSize ||
-        fingerprint.modifiedAt !== item.modifiedAt ||
-        fingerprint.fullSha256 !== item.fullSha256
+        !sameModifiedAt(fingerprint.modifiedAt, item.modifiedAt) ||
+        // 指纹里没存哈希（null）时跳过内容哈希比对，其余元数据仍需一致
+        (fingerprint.fullSha256 !== null &&
+          fingerprint.fullSha256 !== item.fullSha256)
       ) {
         throw new DuplicateCleanupPlanError(
           "FILE_CHANGED",

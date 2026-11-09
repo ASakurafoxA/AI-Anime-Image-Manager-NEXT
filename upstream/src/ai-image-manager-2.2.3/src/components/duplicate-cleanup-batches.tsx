@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { duplicateActions } from "@/actions/duplicates";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -70,30 +71,36 @@ export function DuplicateCleanupBatches({
   return (
     <Dialog>
       <DialogTrigger asChild>
+        {/*
+         * 自用（2026-11-09 · 会话#11 用户口径）「字体样式弄的和旁边三个按钮一样」：
+         * 之前这里用的是 `text-muted-foreground`（灰字），而「重新扫描 / 清理全部待处理」
+         * 都是 `text-foreground` + `font-medium` + 13px → 并排一眼就能看出不一样 ✗
+         * 现在字号/字重/颜色全部对齐工具栏按钮 ✓
+         */}
         <button
-          className="rounded-md border border-border px-3 py-1.5 text-[13px] text-muted-foreground hover:text-foreground"
+          className="flex items-center gap-1.5 rounded-[6px] border border-border px-3 py-1.5 font-medium text-[13px] text-foreground transition-colors hover:bg-foreground/5"
           type="button"
         >
           {t("duplicateCleanupHistory", { count: batches.data.length })}
         </button>
       </DialogTrigger>
-      <DialogContent className="max-h-[85dvh] overflow-y-auto">
+      <DialogContent className="flex max-h-[85dvh] max-w-lg flex-col gap-3 overflow-hidden">
         <DialogHeader>
           <DialogTitle>
             {t("duplicateCleanupHistory", { count: batches.data.length })}
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="text-[12px] leading-relaxed">
             {t("duplicateCleanupHistoryHint")}
           </DialogDescription>
         </DialogHeader>
-        <ul className="space-y-3">
+        <ul className="min-h-0 space-y-2 overflow-y-auto pr-1">
           {batches.data.map((batch) => (
             <li
-              className="flex min-w-0 flex-wrap items-start justify-between gap-3 rounded-lg border border-border p-3"
+              className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-[8px] border border-border bg-secondary/30 p-3"
               key={batch.batchId}
             >
               <div className="min-w-0 [overflow-wrap:anywhere]">
-                <p>
+                <p className="tabular-nums text-[12.5px] text-foreground leading-relaxed">
                   {t("duplicateCleanupBatchLabel", {
                     date: new Date(batch.executedAt).toLocaleString(),
                     count: batch.remainingCount,
@@ -102,11 +109,11 @@ export function DuplicateCleanupBatches({
                 </p>
                 {failures[batch.batchId]?.length ? (
                   <div
-                    className="mt-3 rounded-md bg-destructive/5 p-3 text-destructive text-sm"
+                    className="mt-2 rounded-[6px] bg-destructive/5 p-2.5 text-[11.5px] text-destructive"
                     role="alert"
                   >
                     <p>{t("duplicateCleanupRestoreFailureHint")}</p>
-                    <ul className="mt-2 space-y-1 text-foreground">
+                    <ul className="mt-1.5 space-y-0.5 text-foreground/90">
                       {failures[batch.batchId].map((item) => (
                         <li className="[overflow-wrap:anywhere]" key={item.id}>
                           {item.filename}
@@ -116,17 +123,19 @@ export function DuplicateCleanupBatches({
                   </div>
                 ) : null}
               </div>
-              <button
+              <Button
                 aria-label={t("duplicateCleanupRestoreButtonForBatch", {
                   id: batch.batchId.slice(0, 8),
                 })}
-                className="shrink-0 rounded border border-border px-3 py-1.5 disabled:opacity-50"
+                className="shrink-0"
                 disabled={restore.isPending}
                 onClick={() => restore.mutate(batch.batchId)}
+                size="sm"
                 type="button"
+                variant="outline"
               >
                 {t("duplicateCleanupRestoreButton")}
-              </button>
+              </Button>
             </li>
           ))}
         </ul>

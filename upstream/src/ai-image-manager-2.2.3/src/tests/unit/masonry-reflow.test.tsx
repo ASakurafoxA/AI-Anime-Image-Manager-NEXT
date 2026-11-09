@@ -482,3 +482,39 @@ describe("masonry reflow continuity", () => {
     expect(located).toHaveBeenCalledWith(1);
   });
 });
+
+/*
+ * 自用（2026-11-08 · 会话#11）回归：**搜索结果关掉虚拟窗口后，卡片必须仍然是绝对定位**。
+ *
+ * 现场：为了治"灰块/留白"，搜索时改成按布局全量渲染；但那条分支一开始直接用了布局算出的
+ * 原始位置对象 `{ top, left, width, height }`，**漏了 `position: "absolute"`** →
+ * 卡片退回普通文档流：`left/top` 被忽略、每张图独占一行 →
+ * 用户看到的就是"语义搜索结果一张图一行、列表特别长" ✗
+ */
+describe("MasonryGrid 全量渲染（disableVirtualization）", () => {
+  it("卡片依然是绝对定位，且水平方向分布在多列", () => {
+    const items = photos.slice(0, 12);
+    const { container } = render(
+      <MasonryGrid
+        {...props}
+        columnCount={4}
+        containerWidth={954}
+        disableVirtualization
+        items={items}
+      />
+    );
+
+    const wrappers = Array.from(
+      container.querySelectorAll<HTMLElement>("[data-photo-id]")
+    ).map((card) => card.parentElement as HTMLElement);
+
+    expect(wrappers.length).toBe(items.length);
+    for (const wrapper of wrappers) {
+      expect(wrapper.style.position).toBe("absolute");
+    }
+
+    // 多列：水平方向不应只有一个取值（否则就是"一张一行"）
+    const lefts = new Set(wrappers.map((wrapper) => wrapper.style.left));
+    expect(lefts.size).toBeGreaterThan(1);
+  });
+});
