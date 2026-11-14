@@ -245,6 +245,10 @@ export const getAppPreferences = os.handler(
     closeBehavior: parseCloseBehavior(
       getSetting(APP_PREFERENCE_KEYS.closeBehavior)
     ),
+    folderTreeExpanded: parseBooleanPreference(
+      getSetting(APP_PREFERENCE_KEYS.folderTreeExpanded),
+      APP_PREFERENCE_DEFAULTS.folderTreeExpanded
+    ),
     reduceMotion: parseBooleanPreference(
       getSetting(APP_PREFERENCE_KEYS.reduceMotion),
       APP_PREFERENCE_DEFAULTS.reduceMotion
@@ -270,6 +274,7 @@ export const setAppPreference = os
       key: z.enum([
         APP_PREFERENCE_KEYS.accentColor,
         APP_PREFERENCE_KEYS.closeBehavior,
+        APP_PREFERENCE_KEYS.folderTreeExpanded,
         APP_PREFERENCE_KEYS.reduceMotion,
         APP_PREFERENCE_KEYS.rememberBounds,
         APP_PREFERENCE_KEYS.updateAutoUpdate,

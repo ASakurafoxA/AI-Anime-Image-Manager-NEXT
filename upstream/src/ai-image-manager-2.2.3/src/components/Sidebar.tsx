@@ -9,6 +9,7 @@
 // biome-ignore-all lint/style/noNestedTernary: scoped component lint cleanup preserves existing UI behavior
 
 import { useLocation, useNavigate } from "@tanstack/react-router";
+import { getFolderTreeExpandedPreference } from "@/actions/ui-preferences";
 import {
   Album,
   CircleHelp,
@@ -319,6 +320,20 @@ interface SidebarProps {
   /** 自用（需求 3）：默认 "single"。 */
   tagSelectMode?: "single" | "multi";
   totalPhotos: number;
+}
+
+/**
+ * 「文件夹默认展开」开关（设置 → 应用行为，2026-11-14 · 会话#12）。
+ * 持久化在 SQLite（`actions/ui-preferences.ts`），localStorage 只是首帧缓存 ——
+ * 因为 dev 版端口一变 localStorage 就换命名空间，值会"丢"。
+ */
+function readFolderTreeDefaultExpandedCached(): boolean {
+  try {
+    const raw = localStorage.getItem("ui.folderTreeExpanded");
+    return raw == null ? true : raw === "true";
+  } catch {
+    return true;
+  }
 }
 
 export function Sidebar({
@@ -1431,27 +1446,42 @@ export function Sidebar({
   // Auto-expand each root parent once without overwriting the user's choices.
   const autoExpandedFolderIdsRef = useRef(new Set<number>());
   useEffect(() => {
-    const newRootParents = folderTree
-      .filter(
-        (node) =>
-          node.children.length > 0 &&
-          !autoExpandedFolderIdsRef.current.has(node.folder.id)
-      )
-      .map((node) => node.folder.id);
-    if (newRootParents.length === 0) {
-      return;
-    }
-
-    for (const id of newRootParents) {
-      autoExpandedFolderIdsRef.current.add(id);
-    }
-    setExpandedFolderIds((previous) => {
-      const next = new Set(previous);
-      for (const id of newRootParents) {
-        next.add(id);
+    /*
+     * 2026-11-14（会话#12 · 用户口径）：加了「文件夹默认展开」开关（设置 → 应用行为）。
+     * 关掉后进软件不再自动展开主文件夹；开（默认）保持原有行为。
+     * 读 SQLite（localStorage 会因 dev 端口变化而丢，不能当唯一来源）。
+     */
+    let cancelled = false;
+    void (async () => {
+      const enabled = await getFolderTreeExpandedPreference();
+      if (cancelled || !enabled) {
+        return;
       }
-      return next;
-    });
+      const newRootParents = folderTree
+        .filter(
+          (node) =>
+            node.children.length > 0 &&
+            !autoExpandedFolderIdsRef.current.has(node.folder.id)
+        )
+        .map((node) => node.folder.id);
+      if (newRootParents.length === 0) {
+        return;
+      }
+
+      for (const id of newRootParents) {
+        autoExpandedFolderIdsRef.current.add(id);
+      }
+      setExpandedFolderIds((previous) => {
+        const next = new Set(previous);
+        for (const id of newRootParents) {
+          next.add(id);
+        }
+        return next;
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [folderTree]);
 
   const updateTagTreeFade = useCallback(() => {

@@ -458,7 +458,6 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
         {lightbox && (
           <PhotoLightbox
             initialIndex={lightbox.index}
-            onBackdropClick={() => setLightbox(null)}
             onClose={() => setLightbox(null)}
             open
             photos={lightbox.photos}
@@ -612,7 +611,6 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
       {lightbox && (
         <PhotoLightbox
           initialIndex={lightbox.index}
-          onBackdropClick={() => setLightbox(null)}
           onClose={() => setLightbox(null)}
           open
           photos={lightbox.photos}

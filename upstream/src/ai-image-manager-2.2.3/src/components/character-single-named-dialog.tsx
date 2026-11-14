@@ -752,7 +752,6 @@ export function CharacterSingleNamedDialog({
         {lightbox && (
           <PhotoLightbox
             initialIndex={lightbox.index}
-            onBackdropClick={() => setLightbox(null)}
             onClose={() => setLightbox(null)}
             open
             photos={lightbox.photos}

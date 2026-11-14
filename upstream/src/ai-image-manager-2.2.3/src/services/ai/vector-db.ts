@@ -2121,6 +2121,29 @@ export async function getCcipVectorCount(): Promise<number> {
 }
 
 /**
+ * 重新打开 CCIP 表句柄（2026-11-14 · 会话#12）。
+ *
+ * 为什么需要：LanceDB 的表句柄会"钉"在打开那一刻的数据版本上。
+ * 如果**索引是在 app 启动之后才建的**（例如本机 11-14 03:37 重建过索引），
+ * 老句柄查近邻时用不到索引 → 退化成暴力扫描。
+ * 离线实测同一张表 **9 ms/次**，而 app 里补漏逐角色比对却要 **800 ms/次**（慢近百倍），
+ * 症状就是这么来的。所以在跑批量检索前把句柄换成"最新版本"。
+ */
+export async function reopenCcipTable(): Promise<boolean> {
+  if (!vectordb) {
+    return false;
+  }
+  try {
+    const table = await vectordb.openTable(CCIP_TABLE_NAME);
+    setCcipTable(table);
+    return true;
+  } catch (err: unknown) {
+    console.warn("[AI] reopenCcipTable failed:", getErrorMessage(err));
+    return false;
+  }
+}
+
+/**
  * 列出已经有 CCIP 特征的照片 id（全库重算时用来**跳过算过的**，实现断点续跑）。
  *
  * 只取 `photo_id` 一列，7 万行量级下开销可接受。

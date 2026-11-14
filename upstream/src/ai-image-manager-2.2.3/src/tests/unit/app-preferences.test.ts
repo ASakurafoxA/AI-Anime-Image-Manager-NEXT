@@ -12,6 +12,8 @@ describe("app preference defaults and validation", () => {
     expect(APP_PREFERENCE_DEFAULTS).toEqual({
       accentColor: "default",
       closeBehavior: "tray",
+      // 2026-11-14（会话#12）：文件夹树默认展开（老行为不变）
+      folderTreeExpanded: true,
       reduceMotion: false,
       rememberBounds: false,
       updateAutoUpdate: true,

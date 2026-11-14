@@ -1518,7 +1518,6 @@ export function CharacterDiscoveryDialog({
           <PhotoLightbox
             initialIndex={lightbox.index}
             /* 用户口径：点图片以外的空白 = 退出大图、回到分组列表（弹窗留着） */
-            onBackdropClick={() => setLightbox(null)}
             onClose={() => setLightbox(null)}
             open
             photos={lightbox.photos}

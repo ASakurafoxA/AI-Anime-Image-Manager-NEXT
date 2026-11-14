@@ -196,24 +196,29 @@ describe("PhotoLightbox", () => {
   });
 
   /*
-   * 自用（2026-10-18 · 会话#9 用户口径）：「给所有模式的大图界面都增加点击空白区域退出的功能」
-   * —— 主图库原来没传 onBackdropClick，所以点图片两侧的黑边毫无反应 ✗
+   * 2026-11-14（会话#12 用户口径）：「点空白关闭要么全做、要么去掉；识别角色里点空白会
+   * 同时响应到后面的界面（误点到打标 / 直接关掉列表）」。→ 统一**去掉**这个行为：
+   * 点空白既不关闭，也不许事件冒泡到下面的对话框。
    */
-  it("closes when clicking the blank area around the image (no onBackdropClick given)", () => {
+  it("点空白区域不再关闭大图（事件也不外泄）", () => {
     const onClose = vi.fn();
+    const onOuterClick = vi.fn();
     render(
-      <PhotoLightbox
-        initialIndex={0}
-        onClose={onClose}
-        open
-        photos={photos}
-      />
+      <div onClick={onOuterClick}>
+        <PhotoLightbox
+          initialIndex={0}
+          onClose={onClose}
+          open
+          photos={photos}
+        />
+      </div>
     );
 
     const surface = screen.getByLabelText("lightboxReview");
-    // 点"空白"：直接点在容器本身上（图片两侧黑边就是这个容器）
     fireEvent.click(surface);
-    expect(onClose).toHaveBeenCalledWith({ index: 0, photoId: 1 });
+    expect(onClose).not.toHaveBeenCalled();
+    // 关键：不能穿透到后面的界面（用户就是被这个坑害到误打标的）
+    expect(onOuterClick).not.toHaveBeenCalled();
   });
 
   it("does not close when clicking the image itself", () => {

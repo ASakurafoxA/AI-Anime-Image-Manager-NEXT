@@ -20,15 +20,21 @@
  * 纯逻辑放在本文件上半部分，可单测；数据库/向量访问在下半部分。
  */
 
-import { inArray, isNull } from "drizzle-orm";
+import { inArray, isNull, sql } from "drizzle-orm";
 import path from "node:path";
 import { getDatabase } from "@/db";
 import { photoTags, photos, tags } from "@/db/schema";
 import { getTagSearchRevision } from "@/services/tag-search-revision";
+import {
+  readCentroidStore,
+  writeCentroidStore,
+} from "@/services/character-centroid-store";
 import { getDataPath } from "@/utils/data-path";
 import {
+  getCcipVectorCount,
   getCcipVectors,
   getPhotoVectors,
+  reopenCcipTable,
   searchByCcipVector,
   searchByPhotoVector,
 } from "@/services/ai/vector-db";
@@ -275,6 +281,29 @@ export function createCentroidAccumulator(
     get seen(): number {
       return seen;
     },
+    /** 原始累加和（存盘复用：下次不必再读一遍全部种子特征） */
+    sums(): Array<{
+      count: number;
+      sum: number[];
+      tagId: number;
+      tagName: string;
+    }> {
+      const out: Array<{
+        count: number;
+        sum: number[];
+        tagId: number;
+        tagName: string;
+      }> = [];
+      for (const [tagId, bucket] of buckets) {
+        out.push({
+          count: bucket.count,
+          sum: Array.from(bucket.sum),
+          tagId,
+          tagName: bucket.tagName,
+        });
+      }
+      return out;
+    },
     result(): CharacterCentroid[] {
       const out: CharacterCentroid[] = [];
       for (const [tagId, bucket] of buckets) {
@@ -433,6 +462,9 @@ let suggestProgress: {
   phase: "seeds" | "search";
   startedAt: number;
   total: number;
+  /** 上一阶段实际耗时（ms）：seeds = 读特征，search = 逐角色比对（排查"慢在哪"用） */
+  seedsMs: number;
+  searchMs: number;
 } | null = null;
 
 export interface CharacterSuggestProgress {
@@ -440,12 +472,22 @@ export interface CharacterSuggestProgress {
   elapsedMs: number;
   phase: "idle" | "seeds" | "search";
   running: boolean;
+  seedsMs: number;
+  searchMs: number;
   total: number;
 }
 
 export function getCharacterSuggestProgress(): CharacterSuggestProgress {
   if (!suggestProgress) {
-    return { running: false, done: 0, total: 0, phase: "idle", elapsedMs: 0 };
+    return {
+      running: false,
+      done: 0,
+      total: 0,
+      phase: "idle",
+      elapsedMs: 0,
+      seedsMs: 0,
+      searchMs: 0,
+    };
   }
   return {
     running: true,
@@ -453,6 +495,8 @@ export function getCharacterSuggestProgress(): CharacterSuggestProgress {
     total: suggestProgress.total,
     phase: suggestProgress.phase,
     elapsedMs: Date.now() - suggestProgress.startedAt,
+    seedsMs: suggestProgress.seedsMs,
+    searchMs: suggestProgress.searchMs,
   };
 }
 
@@ -558,7 +602,8 @@ async function runCharacterAnalysis(
   options: AnalyzeCharacterOptions = {}
 ): Promise<CharacterAnalysisResult> {
   // 先定特征源：首选 CCIP；缺失则按用户口径抛错（不静默回退）。
-  const { loadVectors, search } = await resolveCharacterFeatureAccess();
+  const { loadVectors, search, status: featureAccess } =
+    await resolveCharacterFeatureAccess();
   const db = getDatabase();
   const allTags = db
     .select({ id: tags.id, name: tags.name, parentId: tags.parentId })
@@ -628,9 +673,56 @@ async function runCharacterAnalysis(
     centroidCache.revision === revision &&
     Date.now() - centroidCache.at < CENTROID_CACHE_TTL_MS;
 
+  /*
+   * 磁盘缓存（2026-11-14 · 会话#12）：质心只有几 MB，存下来下次直接读，
+   * 不用再把 1.9 万张图的 768 维重新读一遍。失效判据见 `character-centroid-store.ts`。
+   */
+  const linkStats = db
+    .select({
+      count: sql<number>`count(*)`,
+      maxId: sql<number>`coalesce(max(${photoTags.id}), 0)`,
+    })
+    .from(photoTags)
+    .where(inArray(photoTags.tagId, characterTagIds))
+    .get();
+  const linkCount = Number(linkStats?.count ?? 0);
+  const maxLinkId = Number(linkStats?.maxId ?? 0);
+  const ccipRows = await getCcipVectorCount();
+  const centroidStore = readCentroidStore();
+  const storeHit =
+    centroidStore != null &&
+    centroidStore.ccipRows === ccipRows &&
+    centroidStore.linkCount === linkCount &&
+    centroidStore.maxLinkId === maxLinkId;
+
   let centroids: CharacterCentroid[];
   let seedPhotoCount: number;
-  if (cacheHit && centroidCache) {
+  const seedsStartedAt = performance.now();
+  const minSeedCount = options.minSeedCount ?? DEFAULTS.minSeedCount;
+  if (storeHit && centroidStore) {
+    // 磁盘缓存命中：直接由"每个角色的向量和"算出质心，完全不读特征
+    centroids = [];
+    seedPhotoCount = 0;
+    for (const row of centroidStore.rows) {
+      seedPhotoCount += row.count;
+      if (row.count < minSeedCount || row.sum.length === 0) {
+        continue;
+      }
+      const mean = new Float64Array(row.sum.length);
+      for (let i = 0; i < row.sum.length; i += 1) {
+        mean[i] = row.sum[i] / row.count;
+      }
+      centroids.push({
+        tagId: row.tagId,
+        tagName: row.tagName,
+        seedCount: row.count,
+        centroid: normalize(mean),
+      });
+    }
+    console.log(
+      `[CharacterSuggest] 命中质心磁盘缓存（${centroids.length} 个角色），跳过特征读取`
+    );
+  } else if (cacheHit && centroidCache) {
     centroids = centroidCache.centroids;
     seedPhotoCount = centroidCache.seedPhotos;
     console.log("[CharacterSuggest] 命中特征中心缓存，跳过种子向量读取");
@@ -640,6 +732,8 @@ async function runCharacterAnalysis(
       done: 0,
       elapsedMs: 0,
       phase: "seeds",
+      seedsMs: 0,
+      searchMs: 0,
       startedAt: Date.now(),
       total: seedPhotoIds.length,
     };
@@ -696,9 +790,31 @@ async function runCharacterAnalysis(
       centroids,
       seedPhotos: seedPhotoCount,
     };
+    // 存盘：下次（包括重启后）直接读质心，不再重读全部特征
+    writeCentroidStore({
+      ccipRows,
+      linkCount,
+      maxLinkId,
+      rows: accumulator.sums(),
+      version: 1,
+    });
   }
   const ranked = [...centroids].sort((a, b) => b.seedCount - a.seedCount);
   const considered = ranked.slice(0, MAX_CHARACTERS_PER_RUN);
+  const searchStartedAt = performance.now();
+  if (featureAccess.source === "ccip") {
+    /*
+     * 2026-11-14（会话#12 · 补漏慢的真凶）：表句柄可能钉在"索引还没建成"的旧版本上，
+     * 那样每次近邻检索都退化成暴力扫描（离线 9ms/次 → app 里 800ms/次）。
+     * 批量检索前刷成最新句柄，索引才会被用上。
+     */
+    await reopenCcipTable();
+  }
+  if (suggestProgress) {
+    suggestProgress.seedsMs = Math.round(
+      performance.now() - (seedsStartedAt ?? searchStartedAt)
+    );
+  }
 
   // 按角色检索最像的图，只保留「未命名」的
   /*
@@ -720,6 +836,9 @@ async function runCharacterAnalysis(
     );
     if (suggestProgress) {
       suggestProgress.phase = "search";
+      suggestProgress.searchMs = Math.round(
+        performance.now() - searchStartedAt
+      );
       suggestProgress.done = Math.min(
         start + batch.length,
         considered.length

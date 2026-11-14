@@ -9,6 +9,8 @@ export type CloseBehavior = "tray" | "quit" | "ask";
 export interface AppPreferences {
   accentColor: AccentColor;
   closeBehavior: CloseBehavior;
+  /** 文件夹树进软件时默认展开主文件夹（2026-11-14 · 会话#12） */
+  folderTreeExpanded: boolean;
   reduceMotion: boolean;
   rememberBounds: boolean;
   updateAutoUpdate: boolean;
@@ -18,6 +20,7 @@ export interface AppPreferences {
 export const APP_PREFERENCE_DEFAULTS: AppPreferences = {
   accentColor: DEFAULT_ACCENT_COLOR,
   closeBehavior: "tray",
+  folderTreeExpanded: true,
   reduceMotion: false,
   rememberBounds: false,
   updateAutoUpdate: true,
@@ -27,6 +30,7 @@ export const APP_PREFERENCE_DEFAULTS: AppPreferences = {
 export const APP_PREFERENCE_KEYS = {
   accentColor: ACCENT_COLOR_KEY,
   closeBehavior: "window.closeBehavior",
+  folderTreeExpanded: "ui.folderTreeExpanded",
   reduceMotion: "ui.reduceMotion",
   rememberBounds: "window.rememberBounds",
   updateAutoUpdate: "update.autoUpdate",

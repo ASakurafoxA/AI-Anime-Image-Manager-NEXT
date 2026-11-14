@@ -86,6 +86,8 @@ export function CharacterMissingDialog({
     done: number;
     elapsedMs: number;
     phase: "idle" | "seeds" | "search";
+    seedsMs: number;
+    searchMs: number;
     total: number;
   } | null>(null);
 
@@ -101,6 +103,8 @@ export function CharacterMissingDialog({
           done: number;
           elapsedMs: number;
           phase: "idle" | "seeds" | "search";
+          seedsMs: number;
+          searchMs: number;
           total: number;
         };
         if (!stopped) {
@@ -349,6 +353,13 @@ export function CharacterMissingDialog({
                     Math.round((progress.elapsedMs || 0) / 1000)
                   ),
                 })}
+                {/* 2026-11-14（会话#12）：分段耗时，用来分辨慢在"读特征"还是"逐角色比对" */}
+                {progress.phase === "search" && progress.seedsMs > 0 && (
+                  <span className="ml-1">
+                    （读取 {(progress.seedsMs / 1000).toFixed(1)} 秒 · 比对{" "}
+                    {(progress.searchMs / 1000).toFixed(1)} 秒）
+                  </span>
+                )}
               </span>
             )}
           </div>
@@ -585,7 +596,6 @@ export function CharacterMissingDialog({
         {lightbox && (
           <PhotoLightbox
             initialIndex={lightbox.index}
-            onBackdropClick={() => setLightbox(null)}
             onClose={() => setLightbox(null)}
             open
             photos={lightbox.photos}

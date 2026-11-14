@@ -1,8 +1,13 @@
-﻿import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { FilterDropdown } from "@/components/filter-dropdown";
+import {
+  getFolderTreeExpandedPreference,
+  readCachedFolderTreeExpanded,
+  setFolderTreeExpandedPreference,
+} from "@/actions/ui-preferences";
 import { PRIVATE_BUILD } from "@/config/private-build";
 import { SettingRow } from "@/components/settings/setting-row";
 import {
@@ -45,6 +50,8 @@ function readSidebarCollapsed(): boolean {
     return false;
   }
 }
+
+/** 文件夹树默认展开（默认 **开**）—— 走 SQLite 持久化，见 `actions/ui-preferences.ts` */
 
 /*
  * 自用（2026-10-16）：开机补扫的开关。
@@ -181,6 +188,13 @@ function BehaviorSettingsPage() {
   const [openAtLogin, setOpenAtLogin] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] =
     useState(readSidebarCollapsed);
+  const [folderTreeExpanded, setFolderTreeExpanded] = useState(
+    readCachedFolderTreeExpanded
+  );
+  // 首帧用缓存，挂载后再以 SQLite 为准校正一次
+  useEffect(() => {
+    void getFolderTreeExpandedPreference().then(setFolderTreeExpanded);
+  }, []);
   const [syncCullFavorites, setSyncCullFavorites] = useState(true);
   /*
    * 自用（2026-10-16）：开机补扫两个开关 ✓
@@ -350,6 +364,16 @@ function BehaviorSettingsPage() {
     openAtLoginQueueRef.current?.enqueue(checked);
   }
 
+  function onFolderTreeExpandedChange(checked: boolean) {
+    const previous = folderTreeExpanded;
+    setFolderTreeExpanded(checked);
+    // SQLite 才是持久化来源（localStorage 会因 dev 端口变化而丢），失败则回滚
+    void setFolderTreeExpandedPreference(checked).catch(() => {
+      setFolderTreeExpanded(previous);
+      toast.error(t("saveFailed"));
+    });
+  }
+
   function onSidebarCollapsedChange(checked: boolean) {
     const previous = sidebarCollapsed;
     setSidebarCollapsed(checked);
@@ -412,6 +436,18 @@ function BehaviorSettingsPage() {
           }
           description={t("openAtLoginHint")}
           title={t("openAtLogin")}
+        />
+        {/* 2026-11-14（会话#12 · 用户口径）：文件夹树进软件时默认展开主文件夹 */}
+        <SettingRow
+          action={
+            <Switch
+              ariaLabel={t("settingsFolderTreeExpanded")}
+              checked={folderTreeExpanded}
+              onCheckedChange={onFolderTreeExpandedChange}
+            />
+          }
+          description={t("settingsFolderTreeExpandedHint")}
+          title={t("settingsFolderTreeExpanded")}
         />
         <SettingRow
           action={

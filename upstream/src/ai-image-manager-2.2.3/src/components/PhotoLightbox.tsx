@@ -1,4 +1,4 @@
-﻿import { PRIVATE_BUILD } from "@/config/private-build";
+import { PRIVATE_BUILD } from "@/config/private-build";
 import {
   ChevronLeft,
   ChevronRight,
@@ -70,14 +70,11 @@ interface PhotoLightboxProps {
   initialIndex: number;
   modalOpen?: boolean;
   onAddToAlbum?: (photoId: number) => void;
-  /**
-   * 自用（2026-10）：**点击图片以外的空白**时回调（不传则整块遮罩不响应点击，
-   * 与原来完全一致 —— 主图库那边就不传，行为一个字不变 ✓）。
-   *
-   * 用途：角色识别对话框里嵌入大图查看时，用户点空白 = 退出大图回到分组列表。
-   * 注意点击**图片本身**、按钮、顶部/底部控件条、右侧信息面板都**不算**空白 ✓。
+  /*
+   * 2026-11-14（会话#12）：原来的 `onBackdropClick`（点空白退出）已**删除** ——
+   * 它会让点击穿透到后面的对话框，造成误打标 / 误关列表（用户实测多次踩到）。
+   * 现在点空白只吞掉事件，不关闭大图；关闭用右上角 × 或 Esc。
    */
-  onBackdropClick?: () => void;
   onClose: (result: { index: number; photoId: number }) => void;
   onToggleFavorite?: (photoId: number, nextFavorite: boolean) => Promise<void>;
   open: boolean;
@@ -136,7 +133,6 @@ export const PhotoLightbox = memo(function PhotoLightbox({
   modalOpen = false,
   open,
   onClose,
-  onBackdropClick,
   onToggleFavorite,
   onAddToAlbum,
   showThumbnailsInitially = false,
@@ -781,22 +777,15 @@ export const PhotoLightbox = memo(function PhotoLightbox({
          * 这些排除项缺一不可 —— 否则点翻页按钮、点信息面板里的文字都会把大图关掉 ✗。
          * 图片两侧的**黑边**同样算"空白"→ 点了就退出 ✓
          */
-        const exitLightbox = onBackdropClick ?? requestClose;
-        if (!exitLightbox) {
-          return;
-        }
-        const target = event.target as HTMLElement | null;
-        if (!target) {
-          return;
-        }
-        if (
-          target.closest(
-            "[data-lightbox-image], button, a, input, select, textarea, [role='button'], [role='menu'], [data-lightbox-chrome], header, footer, aside"
-          )
-        ) {
-          return;
-        }
-        exitLightbox();
+        /*
+         * 2026-11-14（会话#12 用户口径）：「点空白关闭要么全做要么去掉；识别角色里点空白会
+         * **同时响应到后面的界面**，大概率误点到打标、或者直接把列表关掉 —— 这就是老误打的原因」。
+         *
+         * 所以：**点空白不再关闭大图**（原来没传 onBackdropClick 时默认也关，正是穿透的元凶），
+         * 并且在这里把事件**吞掉**，绝不允许它冒泡到下面的对话框 / 列表。
+         * 关闭方式：右上角 ×、Esc（以及部分调用方自己的按钮）。
+         */
+        event.stopPropagation();
       }}
       onContextMenu={(event) => {
         const target = event.target as HTMLElement;

@@ -1131,6 +1131,9 @@ i18n.use(initReactI18next).init({
         openAtLoginHint: "软件启动时自动运行",
         sidebarDefaultCollapsed: "侧边栏默认折叠",
         sidebarDefaultCollapsedHint: "启动时默认收起侧边栏",
+        settingsFolderTreeExpanded: "文件夹默认展开",
+        settingsFolderTreeExpandedHint:
+          "进入软件时自动展开主文件夹；关掉则保持收起",
         cullSyncFavorites: "选片保留时同步收藏",
         cullSyncFavoritesHint:
           "保留图片时加入收藏；撤销会恢复图片原有的收藏状态",
@@ -3797,6 +3800,9 @@ i18n.use(initReactI18next).init({
         sidebarDefaultCollapsed: "Default sidebar collapsed",
         sidebarDefaultCollapsedHint:
           "Start with the sidebar collapsed by default",
+        settingsFolderTreeExpanded: "Expand folders by default",
+        settingsFolderTreeExpandedHint:
+          "Automatically expand the main folder when the app opens; turn off to keep it collapsed",
         cullSyncFavorites: "Favorite kept cull images",
         cullSyncFavoritesHint:
           "Add kept images to favorites; undo restores their previous favorite state",
