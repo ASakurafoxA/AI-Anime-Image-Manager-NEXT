@@ -280,6 +280,22 @@ export function CharacterMissingDialog({
     }));
   }
 
+  /**
+   * 反选（2026-11-14 · 会话#12）：与另两个对话框统一（全选 / 反选 / 清空）。
+   * 已勾的取消、没勾的勾上；反选后一张都不剩 → 回到「整组」。
+   */
+  function invertSelection(index: number, list: GroupPhoto[]) {
+    setSelection((prev) => {
+      const current = prev[index] ?? new Set<number>();
+      return {
+        ...prev,
+        [index]: new Set(
+          list.map((photo) => photo.id).filter((id) => !current.has(id))
+        ),
+      };
+    });
+  }
+
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
       <DialogContent
@@ -461,45 +477,43 @@ export function CharacterMissingDialog({
                         ? t("characterSuggestionApplied")
                         : busy
                           ? t("peopleFindUnnamedCharactersBusy")
-                          : chosen.size > 0
-                            ? t("characterDiscoveryNameSelectedApply", {
-                                count: chosen.size,
-                              })
-                            : t("characterSuggestionApply")}
+                          : t("characterSuggestionApply")}
                     </button>
                   </div>
 
                   {/* 展开区：整组图 + 左上角勾选圈（点圈勾选、点图看大图） */}
                   {isExpanded && (
                     <div className="border-border border-t pt-2">
-                      <div className="mb-2 flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
+                      <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                        {/* 说明文字 + 右侧三个按钮：与另两个对话框统一（2026-11-14 · 会话#12） */}
                         <span>{t("characterDiscoverySelectHint")}</span>
-                        {/* 一键全选（2026-11-08 · 会话#11）：已经全选上就不用再显示 */}
-                        {photos.length > 0 && chosen.size < photos.length && (
-                          <button
-                            className="underline transition-colors hover:text-foreground"
-                            onClick={() => selectAll(index, photos)}
-                            type="button"
-                          >
-                            {t("manualRolesSelectAll")}
-                          </button>
-                        )}
-                        {chosen.size > 0 && (
-                          <>
-                            <span className="text-foreground">
-                              {t("characterDiscoverySelected", {
-                                count: chosen.size,
-                              })}
-                            </span>
-                            <button
-                              className="underline transition-colors hover:text-foreground"
-                              onClick={() => clearSelection(index)}
-                              type="button"
-                            >
-                              {t("characterDiscoveryClearSelection")}
-                            </button>
-                          </>
-                        )}
+                        <span className="ml-auto text-foreground">
+                          {t("characterSingleNamedSelected", {
+                            count: chosen.size,
+                            total: photos.length,
+                          })}
+                        </span>
+                        <button
+                          className="rounded-[3px] border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+                          onClick={() => selectAll(index, photos)}
+                          type="button"
+                        >
+                          {t("characterSingleNamedSelectAll")}
+                        </button>
+                        <button
+                          className="rounded-[3px] border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+                          onClick={() => invertSelection(index, photos)}
+                          type="button"
+                        >
+                          {t("characterSingleNamedInvert")}
+                        </button>
+                        <button
+                          className="rounded-[3px] border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+                          onClick={() => clearSelection(index)}
+                          type="button"
+                        >
+                          {t("characterSingleNamedSelectNone")}
+                        </button>
                       </div>
                       {loadingThis ? (
                         <div className="flex items-center gap-2 py-3 text-[12px] text-muted-foreground">

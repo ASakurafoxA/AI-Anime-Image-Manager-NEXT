@@ -967,6 +967,43 @@ i18n.use(initReactI18next).init({
         settingsCharacterWorkersPerCardHint:
           "角色识别是「每张图解码+缩放」的瓶颈，进程越多越快：以每卡 1 个为 100%，实测 2 个约 151%、4 个约 220%，4 个之后不再变快（默认 4）。想更快选 4；机器很忙或不稳就往下调。建向量（CLIP）不受这个设置影响",
         characterRecognitionMenu: "角色识别",
+        characterRecognitionSingleNamed: "多人图只认出一个角色",
+        characterSingleNamedTitle: "多人图里只认出一个角色",
+        characterSingleNamedHint:
+          "这些图人数≥2，却只打了一个角色名——很可能第二个人没被认出来。勾选后可以给它们补上第二个名字。",
+        characterSingleNamedCount: "共 {{total}} 张 · 已加载 {{loaded}} 张",
+        characterSingleNamedEmpty: "没有符合条件的图",
+        characterSingleNamedLoadMore: "加载更多",
+        characterSingleNamedLoading: "加载中…",
+        characterSingleNamedNamePlaceholder:
+          "第二个角色的名字（可检索已有标签）",
+        characterSingleNamedApply: "加到选中的 {{count}} 张",
+        characterSingleNamedDone: "已给 {{count}} 张图加上「{{name}}」",
+        characterSingleNamedGender: "这些图里是：",
+        characterSingleNamedGenderGirl: "女",
+        characterSingleNamedGenderBoy: "男",
+        characterSingleNamedGenderOther: "其他",
+        characterSingleNamedOnlyOneBulk: "其实只有一个人（{{count}}）",
+        characterSingleNamedWrongNameBulk: "名字不对（{{count}}）",
+        characterSingleNamedOnlyOneShort: "1 人",
+        characterSingleNamedWrongNameShort: "名字错",
+        characterSingleNamedOnePersonDone: "已把 {{count}} 张标成「一个人」",
+        characterSingleNamedRemoveDone: "已从 {{count}} 张上移除错名字",
+        characterSingleNamedPeopleUnit: "人",
+        characterSingleNamedRowMeta: "{{count}} 张",
+        characterSingleNamedGroupCount: "已加载 {{loaded}} 组 / 共 {{total}} 组",
+        characterSingleNamedApplyGroup: "补名字（{{count}}）",
+        characterSingleNamedSecondPlaceholder:
+          "第二个角色的名字（留空 = 只有一个人）",
+        characterSingleNamedApplying: "应用中…",
+        characterSingleNamedCorrectionHint:
+          "点「命名」会把「{{from}}」换成这个新名字",
+        characterSingleNamedCorrected:
+          "已把 {{count}} 张的「{{from}}」改成「{{to}}」",
+        characterSingleNamedSelected: "已选 {{count}} / {{total}} 张",
+        characterSingleNamedSelectAll: "全选",
+        characterSingleNamedInvert: "反选",
+        characterSingleNamedSelectNone: "清空",
         characterRecognitionHint:
           "一个入口做两件事：发现新角色（把没有角色标签的图聚成组）/ 给已有角色补漏（找出没打这个标签的图）",
         characterRecognitionDiscovery: "发现新角色（无标签聚类）",
@@ -1020,7 +1057,19 @@ i18n.use(initReactI18next).init({
         characterDiscoveryGroupNamed: "已命名为「{{name}}」✓",
         characterDiscoveryGroupNamedShort: "已命名",
         characterDiscoveryWillUse: "将使用已有标签「{{name}}」（分类：{{root}}）",
+        characterDiscoverySuggestMore:
+          "共 {{total}} 个匹配，这里显示前 {{shown}} 个 —— 继续输入可以缩小范围",
         characterDiscoverySuggestHint: "已有同名标签，点一下直接用：",
+        characterDiscoveryMultiHint:
+          "这一组有 {{count}} 张多人图（最多 {{max}} 人）—— 名字可以多选；只选一个就按单人处理",
+        characterDiscoveryMultiOnlyOne: "只命名一个",
+        characterDiscoveryMultiAgain: "改回多名字",
+        characterDiscoveryExtraNamePlaceholder: "再选一个名字（回车添加）",
+        characterDiscoveryAddName: "添加",
+        characterDiscoveryRemoveName: "移除这个名字",
+        characterDiscoveryPersonCountHint: "这张图里有 {{count}} 个人",
+        characterDiscoveryMultiNamed:
+          "已命名 {{count}} 个角色（新增 {{applied}} 条标签）",
         characterDiscoveryAllNamed:
           "上次发现的角色都已经命名完了。想重新找一遍就点上面的「重新分析」。",
         manualRolesTitle: "我创建的角色",
@@ -1056,7 +1105,17 @@ i18n.use(initReactI18next).init({
           "已退回 {{count}} 张（另有 {{rest}} 张已被你确认过、没有撤回）",
         manualImportTitle: "导入已有标签？",
         manualImportBody:
-          "将给这一组的 {{count}} 张图打上**已有标签**「{{name}}」（分类：{{root}}）。这不会新建角色，也不会出现在「我创建的角色」里。确认要一次给这么多图打标签吗？",
+          "将给这一组的 {{count}} 张图打上已有标签「{{name}}」（分类：{{root}}）。{{createdNote}}确认要一次给这么多图打标签吗？",
+        manualImportBodyPartial:
+          "只给你勾选的 {{count}} 张打上已有标签「{{name}}」（分类：{{root}}；这一组共 {{groupSize}} 张，未勾选的不动）。{{createdNote}}",
+        manualImportBodyMulti:
+          "将给这一组的 {{count}} 张图打上这些已有标签：「{{names}}」（分类：{{root}}）。多人图打全部名字，单人图只打第一个名字。{{createdNote}}确认要一次给这么多图打标签吗？",
+        manualImportBodyMultiPartial:
+          "只给你勾选的 {{count}} 张打上这些已有标签：「{{names}}」（分类：{{root}}；这一组共 {{groupSize}} 张，未勾选的不动）。多人图打全部名字，单人图只打第一个名字。{{createdNote}}",
+        manualImportNoNewRoles:
+          "不会新建角色，也不会出现在「我创建的角色」里。",
+        manualImportCreatesRoles:
+          "其中 {{count}} 个是新名字，会新建角色并出现在「我创建的角色」里。",
         manualImportConfirm: "确认导入",
         characterDiscoveryNameConflict:
           "标签库里已经有「{{name}}」：想用它就点下面的建议（算导入已有标签）；如果是同名的另一个角色，请换个名字。",
@@ -3563,6 +3622,43 @@ i18n.use(initReactI18next).init({
         settingsCharacterWorkersPerCardHint:
           "Character recognition is bottlenecked by per-image decode and resize, so more workers is faster: taking 1 per GPU as 100%, measured about 151% with 2 and 220% with 4; it stops improving past 4 (default 4). Pick 4 for speed, lower it if the machine gets busy or unstable. Embedding (CLIP) is not affected by this setting",
         characterRecognitionMenu: "Character recognition",
+        characterRecognitionSingleNamed: "Multi-person photos with one name",
+        characterSingleNamedTitle: "Multi-person photos with only one character name",
+        characterSingleNamedHint:
+          "These photos show two or more people but only carry one character tag — the second person was probably not recognised. Select them and add the second name.",
+        characterSingleNamedCount: "{{total}} total · {{loaded}} loaded",
+        characterSingleNamedEmpty: "No photos match this filter",
+        characterSingleNamedLoadMore: "Load more",
+        characterSingleNamedLoading: "Loading…",
+        characterSingleNamedNamePlaceholder:
+          "Second character's name (searches existing tags)",
+        characterSingleNamedApply: "Add to {{count}} selected",
+        characterSingleNamedDone: "Added \"{{name}}\" to {{count}} photos",
+        characterSingleNamedGender: "These photos show:",
+        characterSingleNamedGenderGirl: "Female",
+        characterSingleNamedGenderBoy: "Male",
+        characterSingleNamedGenderOther: "Other",
+        characterSingleNamedOnlyOneBulk: "Only one person ({{count}})",
+        characterSingleNamedWrongNameBulk: "Wrong name ({{count}})",
+        characterSingleNamedOnlyOneShort: "1 person",
+        characterSingleNamedWrongNameShort: "Wrong name",
+        characterSingleNamedOnePersonDone: "Marked {{count}} photos as a single person",
+        characterSingleNamedRemoveDone: "Removed the wrong name from {{count}} photos",
+        characterSingleNamedPeopleUnit: "people",
+        characterSingleNamedRowMeta: "{{count}} photos",
+        characterSingleNamedGroupCount: "{{loaded}} of {{total}} groups loaded",
+        characterSingleNamedApplyGroup: "Add name ({{count}})",
+        characterSingleNamedSecondPlaceholder:
+          "Second character's name (leave empty = only one person)",
+        characterSingleNamedApplying: "Applying…",
+        characterSingleNamedCorrectionHint:
+          "\"Name\" will replace \"{{from}}\" with this new name",
+        characterSingleNamedCorrected:
+          "Renamed \"{{from}}\" to \"{{to}}\" on {{count}} photos",
+        characterSingleNamedSelected: "{{count}} of {{total}} selected",
+        characterSingleNamedSelectAll: "Select all",
+        characterSingleNamedInvert: "Invert",
+        characterSingleNamedSelectNone: "Clear",
         characterRecognitionHint:
           "One entry for two jobs: find new characters (cluster untagged photos) / fill gaps for known characters (photos missing that tag)",
         characterRecognitionDiscovery: "Find new characters (cluster untagged)",
@@ -3623,7 +3719,19 @@ i18n.use(initReactI18next).init({
         characterDiscoveryGroupNamedShort: "Named",
         characterDiscoveryWillUse:
           'Will use the existing tag "{{name}}" (category: {{root}})',
+        characterDiscoverySuggestMore:
+          "{{total}} matches — showing the first {{shown}}; type more to narrow it down",
         characterDiscoverySuggestHint: "Existing tags match — click to use:",
+        characterDiscoveryMultiHint:
+          "{{count}} photos here show two or more people (up to {{max}}) — pick as many names as you like; picking one treats them as single-person",
+        characterDiscoveryMultiOnlyOne: "Name just one",
+        characterDiscoveryMultiAgain: "Name several",
+        characterDiscoveryExtraNamePlaceholder: "Add another name (press Enter)",
+        characterDiscoveryAddName: "Add",
+        characterDiscoveryRemoveName: "Remove this name",
+        characterDiscoveryPersonCountHint: "{{count}} people in this photo",
+        characterDiscoveryMultiNamed:
+          "Named {{count}} characters ({{applied}} new tag links)",
         characterDiscoveryAllNamed:
           "Every character found last time has been named. Use \"Analyze again\" to look for more.",
         manualRolesTitle: "Roles I created",
@@ -3661,7 +3769,17 @@ i18n.use(initReactI18next).init({
           "Returned {{count}} image(s) ({{rest}} kept because you had confirmed them)",
         manualImportTitle: "Import an existing tag?",
         manualImportBody:
-          'This tags all {{count}} images in this group with the existing tag "{{name}}" (category: {{root}}). It does not create a role and will not appear under "Roles I created". Tag that many images at once?',
+          'This tags all {{count}} images in this group with the existing tag "{{name}}" (category: {{root}}). {{createdNote}}Tag that many images at once?',
+        manualImportBodyPartial:
+          'Only the {{count}} image(s) you checked will get the existing tag "{{name}}" (category: {{root}}; the group has {{groupSize}} images and unchecked ones stay untouched). {{createdNote}}',
+        manualImportBodyMulti:
+          'This tags all {{count}} images in this group with these existing tags: "{{names}}" (category: {{root}}). Multi-person images get every name; single-person images get only the first. {{createdNote}}Tag that many images at once?',
+        manualImportBodyMultiPartial:
+          'Only the {{count}} image(s) you checked will get these existing tags: "{{names}}" (category: {{root}}; the group has {{groupSize}} images and unchecked ones stay untouched). Multi-person images get every name; single-person images get only the first. {{createdNote}}',
+        manualImportNoNewRoles:
+          'No new roles are created and nothing appears under "Roles I created".',
+        manualImportCreatesRoles:
+          "{{count}} of them are new names, so new roles will be created and listed under \"Roles I created\".",
         manualImportConfirm: "Import",
         characterDiscoveryNameConflict:
           '"{{name}}" already exists in the tag library: click the suggestion below to import it, or use a different name for a different character with the same name.',

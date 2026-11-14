@@ -137,6 +137,203 @@ describe("① 角色图集右键菜单贴在鼠标位置", () => {
   });
 });
 
+describe("⑤ 命名后缩略图不会炸开（2026-11-14 · 会话#12 回归）", () => {
+  it("缓存里是命名前那几十张、组只剩 5 张时，只渲染组内这 5 张", async () => {
+    mocks.getStoredCharacterGroups.mockResolvedValue({
+      groups: [
+        {
+          ...discoveryGroup([1, 2, 3, 4, 5]),
+          maxPersonCount: 1,
+          multiPhotoCount: 0,
+        },
+      ],
+    });
+    // 模拟"展开过的组"：缓存接口一次回 40 张（含组外照片）
+    mocks.getCharacterGroupPhotos.mockResolvedValue({
+      photos: Array.from({ length: 40 }, (_, index) => photo(index + 1)),
+    });
+
+    renderDiscovery();
+
+    await waitFor(() => {
+      const circles = screen.queryAllByLabelText("characterDiscoveryToggleSelect");
+      // 不按 group.photoIds 过滤的话这里会是 40 → 用户看到的"炸开"
+      expect(circles).toHaveLength(5);
+    });
+  });
+});
+
+describe("④ 多人组可以一次命名多个角色（2026-11-14 · 会话#12）", () => {
+  it("多选名字：输入后点「添加」变成 chip，提交时把多个名字一起发出去", async () => {
+    const { faceActions } = await import("@/actions/faces");
+    const nameMock = vi.mocked(faceActions.nameCharacterGroup);
+    nameMock.mockResolvedValue({
+      applied: 5,
+      attempted: 6,
+      tagId: 101,
+      tagName: "甲",
+      tags: [
+        { applied: 5, attempted: 6, tagId: 101, tagName: "甲" },
+        { applied: 2, attempted: 3, tagId: 102, tagName: "乙" },
+      ],
+      namedAll: true,
+      remaining: 0,
+    } as never);
+    mocks.getStoredCharacterGroups.mockResolvedValue({
+      groups: [
+        {
+          ...discoveryGroup([31, 32, 33]),
+          maxPersonCount: 2,
+          multiPhotoCount: 2,
+        },
+      ],
+    });
+
+    renderDiscovery();
+
+    // 多人组会显示"可多选名字"的输入框（只有一个，不是一列）
+    const extraInput = await screen.findByPlaceholderText(
+      "characterDiscoveryExtraNamePlaceholder"
+    );
+    expect(screen.getAllByPlaceholderText("characterDiscoveryExtraNamePlaceholder")).toHaveLength(1);
+
+    fireEvent.change(screen.getByPlaceholderText("characterDiscoveryNamePlaceholder"), {
+      target: { value: "甲" },
+    });
+    // 输入第二个名字 → 点「添加」→ 变成 chip
+    fireEvent.change(extraInput, { target: { value: "乙" } });
+    fireEvent.click(screen.getByText("characterDiscoveryAddName"));
+    await waitFor(() => expect(screen.getByText("乙")).toBeTruthy());
+    // 这一组最多 2 人 → 加满 1 个附加名字后，输入框收起（不再继续加）
+    expect(
+      screen.queryByPlaceholderText("characterDiscoveryExtraNamePlaceholder")
+    ).toBeNull();
+
+    fireEvent.click(screen.getByText("characterDiscoveryNameApply"));
+
+    await waitFor(() => expect(nameMock).toHaveBeenCalledTimes(1));
+    const payload = nameMock.mock.calls[0][0] as {
+      targets: Array<{ name?: string; tagId?: number }>;
+      photoIds: number[];
+    };
+    expect(payload.targets).toEqual([{ name: "甲" }, { name: "乙" }]);
+    expect(payload.photoIds).toEqual([31, 32, 33]);
+  });
+
+  it("只填一个名字（不加 chip）→ 按单人处理，targets 只有一个", async () => {
+    const { faceActions } = await import("@/actions/faces");
+    const nameMock = vi.mocked(faceActions.nameCharacterGroup);
+    nameMock.mockResolvedValue({
+      applied: 3,
+      attempted: 3,
+      tagId: 201,
+      tagName: "甲",
+      tags: [{ applied: 3, attempted: 3, tagId: 201, tagName: "甲" }],
+      namedAll: true,
+      remaining: 0,
+    } as never);
+    mocks.getStoredCharacterGroups.mockResolvedValue({
+      groups: [
+        { ...discoveryGroup([51, 52, 53]), maxPersonCount: 3, multiPhotoCount: 2 },
+      ],
+    });
+
+    renderDiscovery();
+    await screen.findByPlaceholderText("characterDiscoveryExtraNamePlaceholder");
+    fireEvent.change(screen.getByPlaceholderText("characterDiscoveryNamePlaceholder"), {
+      target: { value: "甲" },
+    });
+    fireEvent.click(screen.getByText("characterDiscoveryNameApply"));
+
+    await waitFor(() => expect(nameMock).toHaveBeenCalledTimes(1));
+    const payload = nameMock.mock.calls[0][0] as {
+      targets: Array<{ name?: string; tagId?: number }>;
+    };
+    expect(payload.targets).toEqual([{ name: "甲" }]);
+  });
+
+  it("名字 chip 可以移除", async () => {
+    mocks.getStoredCharacterGroups.mockResolvedValue({
+      groups: [
+        { ...discoveryGroup([61, 62]), maxPersonCount: 3, multiPhotoCount: 1 },
+      ],
+    });
+
+    renderDiscovery();
+    const extraInput = await screen.findByPlaceholderText(
+      "characterDiscoveryExtraNamePlaceholder"
+    );
+    fireEvent.change(extraInput, { target: { value: "乙" } });
+    fireEvent.click(screen.getByText("characterDiscoveryAddName"));
+    await waitFor(() => expect(screen.getByText("乙")).toBeTruthy());
+
+    fireEvent.click(screen.getByLabelText("characterDiscoveryRemoveName"));
+    await waitFor(() => expect(screen.queryByText("乙")).toBeNull());
+  });
+
+  it("附加名字框也能检索已有标签：点建议 → 用 tagId（不新建同名标签）", async () => {
+    const { faceActions } = await import("@/actions/faces");
+    vi.mocked(faceActions.searchCharacterTags).mockResolvedValue({
+      matches: [{ id: 900, name: "初音未来 (hatsune_miku)", rootName: "角色" }],
+      total: 1,
+    } as never);
+    const nameMock = vi.mocked(faceActions.nameCharacterGroup);
+    nameMock.mockResolvedValue({
+      applied: 2,
+      attempted: 2,
+      tagId: 101,
+      tagName: "甲",
+      tags: [
+        { applied: 2, attempted: 2, tagId: 101, tagName: "甲" },
+        { applied: 1, attempted: 1, tagId: 900, tagName: "初音未来 (hatsune_miku)" },
+      ],
+      namedAll: true,
+      remaining: 0,
+    } as never);
+    mocks.getStoredCharacterGroups.mockResolvedValue({
+      groups: [
+        { ...discoveryGroup([71, 72]), maxPersonCount: 3, multiPhotoCount: 1 },
+      ],
+    });
+
+    renderDiscovery();
+    const extraInput = await screen.findByPlaceholderText(
+      "characterDiscoveryExtraNamePlaceholder"
+    );
+    fireEvent.change(extraInput, { target: { value: "初音" } });
+
+    // 250ms 防抖后出建议；点它 → 变成 chip
+    const suggestion = await screen.findByText(/初音未来/);
+    fireEvent.click(suggestion);
+    await waitFor(() => expect(screen.getByText(/初音未来/)).toBeTruthy());
+
+    fireEvent.change(screen.getByPlaceholderText("characterDiscoveryNamePlaceholder"), {
+      target: { value: "甲" },
+    });
+    fireEvent.click(screen.getByText("characterDiscoveryNameApply"));
+
+    await waitFor(() => expect(nameMock).toHaveBeenCalledTimes(1));
+    const payload = nameMock.mock.calls[0][0] as {
+      targets: Array<{ name?: string; tagId?: number }>;
+    };
+    // 已有标签走 tagId，手输的才是 name
+    expect(payload.targets).toEqual([{ name: "甲" }, { tagId: 900 }]);
+  });
+
+  it("全是单人的组：不出现多名字输入框（只命名一个）", async () => {
+    mocks.getStoredCharacterGroups.mockResolvedValue({
+      groups: [{ ...discoveryGroup([41, 42]), maxPersonCount: 1, multiPhotoCount: 0 }],
+    });
+
+    renderDiscovery();
+
+    await screen.findByPlaceholderText("characterDiscoveryNamePlaceholder");
+    expect(
+      screen.queryByPlaceholderText("characterDiscoveryExtraNamePlaceholder")
+    ).toBeNull();
+  });
+});
+
 describe("② ≤5 张也能直接在小图上勾选", () => {
   it("「识别漏标签」小分组：没有展开按钮，但小图上有勾选圈，且只打勾选的图", async () => {
     mocks.getCharacterGroupPhotos.mockResolvedValue({
@@ -177,7 +374,8 @@ describe("② ≤5 张也能直接在小图上勾选", () => {
     await waitFor(() =>
       expect(circles[1]).toHaveAttribute("aria-pressed", "true")
     );
-    fireEvent.click(screen.getByText("characterDiscoveryNameSelectedApply"));
+    // 勾了第 2 张 → 按钮固定叫「打标」（补漏这边不再显示"命名选中的 N 张"）
+    fireEvent.click(screen.getByText("characterSuggestionApply"));
 
     expect(onApply).toHaveBeenCalledTimes(1);
     const [, ids] = onApply.mock.calls[0] as [unknown, number[]];
@@ -248,8 +446,9 @@ describe("② ≤5 张也能直接在小图上勾选", () => {
     await waitFor(() =>
       expect(circles[0]).toHaveAttribute("aria-pressed", "true")
     );
-    // 有勾选后，主按钮变成「命名 N 张」
-    expect(screen.getByText("characterDiscoveryNameSelectedApply")).toBeTruthy();
+    // 有勾选后主按钮文案**不变**（数字提示已去掉，2026-11-14 · 会话#12）
+    expect(screen.getByText("characterDiscoveryNameApply")).toBeTruthy();
+    expect(screen.queryByText("characterDiscoveryNameSelectedApply")).toBeNull();
   });
 });
 
@@ -287,17 +486,18 @@ describe("③ 展开图集支持一键全选", () => {
     );
     expect(circles).toHaveLength(7);
 
-    // 先什么都不选 → 按钮是「打标」；点「全选」后变成 N 张
-    fireEvent.click(screen.getByText("manualRolesSelectAll"));
+    // 什么都不选也点得动 → 按钮固定是「打标」（数字提示已去掉，2026-11-14 · 会话#12）
+    fireEvent.click(screen.getByText("characterSingleNamedSelectAll"));
     await waitFor(() => {
       for (const circle of circles) {
         expect(circle).toHaveAttribute("aria-pressed", "true");
       }
     });
-    // 全选之后这个按钮就该消失（已经全选中了）
-    expect(screen.queryByText("manualRolesSelectAll")).toBeNull();
+    // 三个按钮是常驻的（不再"全选后消失"）
+    expect(screen.getByText("characterSingleNamedInvert")).toBeTruthy();
+    expect(screen.getByText("characterSingleNamedSelectNone")).toBeTruthy();
 
-    fireEvent.click(screen.getByText("characterDiscoveryNameSelectedApply"));
+    fireEvent.click(screen.getByText("characterSuggestionApply"));
     expect(onApply).toHaveBeenCalledTimes(1);
     const [, appliedIds] = onApply.mock.calls[0] as [unknown, number[]];
     expect([...appliedIds].sort((a, b) => a - b)).toEqual(ids);
@@ -320,10 +520,26 @@ describe("③ 展开图集支持一键全选", () => {
     );
     expect(circles).toHaveLength(7);
 
-    fireEvent.click(screen.getByText("manualRolesSelectAll"));
+    /*
+     * 2026-11-14（会话#12）：工具条与「多人图只认出一个名字」统一 ——
+     * 左边保留说明文字，右边固定「已选 N/M + 全选 / 反选 / 清空」三个按钮。
+     */
+    expect(screen.getByText("characterDiscoverySelectHint")).toBeTruthy();
+    expect(screen.getByText("characterSingleNamedInvert")).toBeTruthy();
+    expect(screen.getByText("characterSingleNamedSelectNone")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("characterSingleNamedSelectAll"));
     await waitFor(() => {
       for (const circle of circles) {
         expect(circle).toHaveAttribute("aria-pressed", "true");
+      }
+    });
+
+    // 反选 → 全勾变全不勾（回到"整组"语义）
+    fireEvent.click(screen.getByText("characterSingleNamedInvert"));
+    await waitFor(() => {
+      for (const circle of circles) {
+        expect(circle).toHaveAttribute("aria-pressed", "false");
       }
     });
   });

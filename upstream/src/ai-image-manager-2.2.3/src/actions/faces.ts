@@ -85,10 +85,22 @@ export const faceActions = {
     photoId: number;
     thumbnailPath?: string | null;
   }) => ipc.client.photos.setManualRoleCover(input),
+  /** 多人图里**只认出一个角色**的候选（纯查询，不需要模型） */
+  listSingleNamedMultiPersonPhotos: (input: {
+    limit?: number;
+    offset?: number;
+  }) => ipc.client.photos.listSingleNamedMultiPersonPhotos(input),
+  /** 「其实只有一个人」：把选中图的人数标签改成指定单人标签（性别由界面全局开关决定） */
+  setPhotosSinglePerson: (input: {
+    photoIds: number[];
+    gender: "1girl" | "1boy" | "1other";
+  }) => ipc.client.photos.setPhotosSinglePerson(input),
   /** 给一个聚类组命名（写 AI 建议标签，不覆盖已有标签） */
   nameCharacterGroup: (input: {
     name?: string;
     tagId?: number;
+    /** 多人图命名：一次写多个角色（第一个也用于单人图） */
+    targets?: Array<{ name?: string; tagId?: number }>;
     photoIds: number[];
     confidence?: number;
     groupIndex?: number;

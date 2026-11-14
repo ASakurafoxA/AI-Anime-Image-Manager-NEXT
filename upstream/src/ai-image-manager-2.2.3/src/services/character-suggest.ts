@@ -223,6 +223,80 @@ export function buildCharacterCentroids(
   return centroids;
 }
 
+/**
+ * 流式特征中心累加器（2026-11-14 · 会话#12）。
+ *
+ * 与 `buildCharacterCentroids` 算的是同一个东西，区别是：
+ * **不需要先把几千条 768 维向量全存进 Map**，而是分块读进来就累加、读完即弃。
+ * 这样常驻内存只有"每个角色一个 768 维的 sum"，分析连跑多次也不会把堆撑爆。
+ */
+export function createCentroidAccumulator(
+  tagIdsByPhoto: ReadonlyMap<number, readonly number[]>,
+  tagNameById: ReadonlyMap<number, string>,
+  options: SuggestOptions = {}
+) {
+  const minSeedCount = options.minSeedCount ?? DEFAULTS.minSeedCount;
+  const buckets = new Map<
+    number,
+    { dims: number; sum: Float64Array; count: number; tagName: string }
+  >();
+  let seen = 0;
+
+  return {
+    add(vectors: ReadonlyMap<number, ArrayLike<number>>): void {
+      for (const [photoId, vector] of vectors) {
+        const tagIds = tagIdsByPhoto.get(photoId);
+        if (!tagIds || !vector || vector.length === 0) {
+          continue;
+        }
+        for (const tagId of tagIds) {
+          let bucket = buckets.get(tagId);
+          if (!bucket) {
+            bucket = {
+              dims: vector.length,
+              sum: new Float64Array(vector.length),
+              count: 0,
+              tagName: tagNameById.get(tagId) ?? String(tagId),
+            };
+            buckets.set(tagId, bucket);
+          }
+          if (bucket.dims !== vector.length) {
+            continue; // 维度不一致（模型换过）→ 跳过
+          }
+          for (let i = 0; i < vector.length; i++) {
+            bucket.sum[i] += Number(vector[i]);
+          }
+          bucket.count++;
+        }
+        seen += 1;
+      }
+    },
+    /** 实际累加到的图片数（用于界面/日志） */
+    get seen(): number {
+      return seen;
+    },
+    result(): CharacterCentroid[] {
+      const out: CharacterCentroid[] = [];
+      for (const [tagId, bucket] of buckets) {
+        if (bucket.count < minSeedCount) {
+          continue;
+        }
+        const mean = new Float64Array(bucket.dims);
+        for (let i = 0; i < bucket.dims; i++) {
+          mean[i] = bucket.sum[i] / bucket.count;
+        }
+        out.push({
+          tagId,
+          tagName: bucket.tagName,
+          seedCount: bucket.count,
+          centroid: normalize(mean),
+        });
+      }
+      return out;
+    },
+  };
+}
+
 export interface TagCandidateHits {
   hits: Array<{ photoId: number; similarity: number }>;
   seedCount: number;
@@ -458,7 +532,29 @@ export function collectDescendantTagIds(
  * confidence，冲突时什么都不做 —— 手动/已确认的标签绝不会被覆盖
  * （与 tag-suggester / WD14 / PixAI 同一策略）。
  */
-export async function analyzeUnnamedCharacters(
+/**
+ * 单飞守卫（2026-11-14 · 会话#12）。
+ *
+ * 用户实测：连点「给已有角色补漏」时会叠跑多轮 —— 进度数字忽而 220 忽而 160
+ * （每轮读到的种子/角色数不同），而且两轮抢同一份向量库，越点越慢。
+ * 已经有一轮在跑时直接复用它的结果，不再另起一轮。
+ */
+let analysisInFlight: Promise<CharacterAnalysisResult> | null = null;
+
+export function analyzeUnnamedCharacters(
+  options: AnalyzeCharacterOptions = {}
+): Promise<CharacterAnalysisResult> {
+  if (analysisInFlight) {
+    console.log("[CharacterSuggest] 已有一轮分析在跑，复用这一次的结果");
+    return analysisInFlight;
+  }
+  analysisInFlight = runCharacterAnalysis(options).finally(() => {
+    analysisInFlight = null;
+  });
+  return analysisInFlight;
+}
+
+async function runCharacterAnalysis(
   options: AnalyzeCharacterOptions = {}
 ): Promise<CharacterAnalysisResult> {
   // 先定特征源：首选 CCIP；缺失则按用户口径抛错（不静默回退）。
@@ -539,7 +635,6 @@ export async function analyzeUnnamedCharacters(
     seedPhotoCount = centroidCache.seedPhotos;
     console.log("[CharacterSuggest] 命中特征中心缓存，跳过种子向量读取");
   } else {
-    const seedVectors = new Map<number, number[]>();
     const seedPhotoIds = [...namedIds];
     suggestProgress = {
       done: 0,
@@ -548,6 +643,29 @@ export async function analyzeUnnamedCharacters(
       startedAt: Date.now(),
       total: seedPhotoIds.length,
     };
+    /*
+     * 2026-11-14（会话#12 · 性能）：**流式累加，不再保存全部种子向量**。
+     *
+     * 实测：第 1 次分析 seeds 522ms、单次检索 9ms；紧接着第 2 次 seeds **14,493ms**、
+     * 单次检索 **1,382ms** —— 同样的活慢 28 倍。原因是 19,458 条 × 768 维用普通 JS 数组
+     * 常驻约 0.5 GB（每个数字都是装箱的 double），第二遍再读一份，堆翻倍 → GC 抖动。
+     *
+     * 现在边读边累加（只留每个角色 768 维的和），常驻内存从 ~0.5 GB 降到几 MB ✓
+     */
+    const tagIdsByPhoto = new Map<number, number[]>();
+    for (const row of seedRows) {
+      const list = tagIdsByPhoto.get(row.photoId);
+      if (list) {
+        list.push(row.tagId);
+      } else {
+        tagIdsByPhoto.set(row.photoId, [row.tagId]);
+      }
+    }
+    const accumulator = createCentroidAccumulator(
+      tagIdsByPhoto,
+      nameById,
+      options
+    );
     /*
      * 自用（2026-10-18 · 会话#9）：**分块并发读** —— 每块 2000 张 × 768 维，
      * 串行读 2 万张要十几秒；4 路并发能把这段压到几秒 ✓
@@ -561,9 +679,7 @@ export async function analyzeUnnamedCharacters(
       const batch = chunks.slice(start, start + SEED_CONCURRENCY);
       const loaded = await Promise.all(batch.map((ids) => loadVectors(ids)));
       for (const vectors of loaded) {
-        for (const [photoId, vector] of vectors) {
-          seedVectors.set(photoId, vector);
-        }
+        accumulator.add(vectors);
       }
       if (suggestProgress) {
         suggestProgress.done = Math.min(
@@ -572,13 +688,8 @@ export async function analyzeUnnamedCharacters(
         );
       }
     }
-    const seedPhotos: SeedPhoto[] = seedRows.map((row) => ({
-      photoId: row.photoId,
-      tagId: row.tagId,
-      tagName: nameById.get(row.tagId) ?? String(row.tagId),
-    }));
-    centroids = buildCharacterCentroids(seedPhotos, seedVectors, options);
-    seedPhotoCount = seedVectors.size;
+    centroids = accumulator.result();
+    seedPhotoCount = accumulator.seen;
     centroidCache = {
       at: Date.now(),
       revision,

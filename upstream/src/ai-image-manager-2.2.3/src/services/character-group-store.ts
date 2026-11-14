@@ -24,6 +24,12 @@ export interface StoredCharacterGroup {
   /** 已经命名过的组记住用了哪个标签，界面显示"已命名"，且不会重复提示命名。 */
   namedTagId: number | null;
   namedTagName: string | null;
+  /**
+   * 多人图一次命名多个角色时，这里记全部（2026-11-14 会话#12 新增）。
+   * 老文件没有这两个字段也能正常读 —— 用 `namedTagId` / `namedTagName` 兜底。
+   */
+  namedTagIds?: number[];
+  namedTagNames?: string[];
 }
 
 /**
@@ -128,6 +134,51 @@ export function readCharacterGroups(): StoredCharacterGroups | null {
 /** 覆盖写入分组结果。 */
 export function writeCharacterGroups(data: StoredCharacterGroups): void {
   try {
+    /*
+     * 自用（2026-11-11 · 用户报「我创建的角色都没了，已经第二次」）——**安全网**：
+     * 「我创建的角色」和"分组缓存"存在同一个 json 里，以前任何一次"清分组/重新分析"
+     * 都会把这个文件整份重写甚至删掉，角色列表就被连带清空了 ✗
+     *
+     * 现在写入时**一律与磁盘上已有的角色合并**（按 tagId 去重，新数据优先），
+     * 也就是"想减少角色"只能走 removeManualRole / pruneManualRoles（它们用 raw 写）✓
+     */
+    const existing = readCharacterGroups();
+    const merged = mergeManualRoles(existing?.manualRoles ?? [], data.manualRoles ?? []);
+    fs.writeFileSync(storeFile(), JSON.stringify({ ...data, manualRoles: merged }), "utf-8");
+  } catch (error) {
+    log.warn(
+      { err: error instanceof Error ? error.message : String(error) },
+      "写入角色分组缓存失败（不影响本次结果展示）"
+    );
+  }
+}
+
+/** 合并两份角色列表：同 tagId 以 `incoming` 为准，保留两边独有的。 */
+function mergeManualRoles(
+  current: ManualCharacterRole[],
+  incoming: ManualCharacterRole[]
+): ManualCharacterRole[] {
+  if (current.length === 0) {
+    return incoming;
+  }
+  if (incoming.length === 0) {
+    return current;
+  }
+  const byId = new Map<number, ManualCharacterRole>();
+  for (const role of current) {
+    byId.set(role.tagId, role);
+  }
+  for (const role of incoming) {
+    byId.set(role.tagId, role);
+  }
+  return [...byId.values()];
+}
+
+/**
+ * **不做合并**的写入（只给"确实要删角色"的路径用：删除标签、自愈剔除幽灵角色）。
+ */
+function writeCharacterGroupsRaw(data: StoredCharacterGroups): void {
+  try {
     fs.writeFileSync(storeFile(), JSON.stringify(data), "utf-8");
   } catch (error) {
     log.warn(
@@ -141,12 +192,16 @@ export function writeCharacterGroups(data: StoredCharacterGroups): void {
  * 记下"某一组已经命名过了"。
  *
  * 优先按 `groupIndex` 定位；没有索引时退回按代表图匹配（防止界面顺序变化后标错）。
+ *
+ * `namedTags`（2026-11-14 会话#12）：多人图一次命名多个角色时，把这组用到的
+ * **全部**名字记下来；`tagId` / `tagName` 仍写第一个，兼容老的读取方。
  */
 export function markGroupNamed(
   groupIndex: number | null,
   representativeId: number | null,
   tagId: number,
-  tagName: string
+  tagName: string,
+  namedTags?: Array<{ tagId: number; tagName: string }>
 ): void {
   const data = readCharacterGroups();
   if (!data) {
@@ -169,19 +224,89 @@ export function markGroupNamed(
   }
   target.namedTagId = tagId;
   target.namedTagName = tagName;
+  if (namedTags && namedTags.length > 1) {
+    target.namedTagIds = namedTags.map((item) => item.tagId);
+    target.namedTagNames = namedTags.map((item) => item.tagName);
+  } else {
+    delete target.namedTagIds;
+    delete target.namedTagNames;
+  }
   writeCharacterGroups(data);
 }
 
-/** 清掉缓存（重新分析时覆盖，或用户想重来时用）。 */
+/**
+ * 清掉"分组缓存"（重新分析时用）。
+ *
+ * ⚠️ 自用（2026-11-11 用户报「我创建的角色都没了」）：
+ * 这里**绝对不能整份删文件** —— 「我创建的角色」（`manualRoles`）也存在同一个 json 里，
+ * 删文件会连角色一起删掉（这就是那次事故的真因：点「重新分析」→ clear → 重新分析写回
+ * `manualRoles: []`）。现在只把 `groups` 清空、保留角色 ✓
+ */
 export function clearCharacterGroups(): void {
   try {
     const file = storeFile();
-    if (fs.existsSync(file)) {
-      fs.rmSync(file, { force: true });
+    if (!fs.existsSync(file)) {
+      return;
     }
+    const existing = readCharacterGroups();
+    writeCharacterGroupsRaw({
+      createdAt: existing?.createdAt ?? Date.now(),
+      threshold: existing?.threshold ?? 0.85,
+      candidates: 0,
+      groups: [],
+      manualRoles: existing?.manualRoles ?? [],
+    });
   } catch {
     /* 清不掉也不影响 */
   }
+}
+
+/**
+ * 自用（2026-11-11 · 用户报「19 张里只命名了 1 张，剩 18 张同角色，但整组也一起消失了」）：
+ *
+ * 只命名**部分**照片时，不能把整组标成"已命名" —— 那样剩下没命名的照片
+ * 永远不会再出现在「发现没有标签的角色」列表里 ✗
+ *
+ * 所以：把这批**已命名**的 id 从组里摘掉，组继续留着（`namedTagId` 保持 null）；
+ * 只有整组都命名完了才算"这组完成"。
+ */
+export function reduceStoredGroupPhotos(
+  groupIndex: number | null,
+  representativeId: number | null,
+  namedPhotoIds: readonly number[]
+): { emptied: boolean; remaining: number } {
+  const data = readCharacterGroups();
+  if (!data) {
+    return { emptied: false, remaining: 0 };
+  }
+  let target: StoredCharacterGroup | undefined;
+  if (
+    groupIndex !== null &&
+    groupIndex >= 0 &&
+    groupIndex < data.groups.length
+  ) {
+    target = data.groups[groupIndex];
+  } else if (representativeId !== null) {
+    target = data.groups.find(
+      (group) => group.representativeId === representativeId
+    );
+  }
+  if (!target) {
+    return { emptied: false, remaining: 0 };
+  }
+  const named = new Set(namedPhotoIds);
+  const rest = target.photoIds.filter((id) => !named.has(id));
+  if (rest.length === 0) {
+    return { emptied: true, remaining: 0 };
+  }
+  target.photoIds = rest;
+  target.size = rest.length;
+  // 代表图被命名掉了就换一张，避免卡片封面指着"已经命名好的图"
+  if (named.has(target.representativeId) && rest[0] != null) {
+    target.representativeId = rest[0];
+  }
+  writeCharacterGroups(data);
+  return { emptied: false, remaining: rest.length };
 }
 
 /**
@@ -221,6 +346,20 @@ function withStore(mutate: (data: StoredCharacterGroups) => void): void {
   };
   mutate(data);
   writeCharacterGroups(data);
+}
+
+/** 同 `withStore`，但写盘**不合并**（只给"确实要减少角色"的路径用）。 */
+function withStoreRaw(mutate: (data: StoredCharacterGroups) => void): void {
+  const existing = readCharacterGroups();
+  const data: StoredCharacterGroups = existing ?? {
+    createdAt: Date.now(),
+    threshold: 0.85,
+    candidates: 0,
+    groups: [],
+    manualRoles: [],
+  };
+  mutate(data);
+  writeCharacterGroupsRaw(data);
 }
 
 /** 列出"手动创建的角色"（人物识别页面用）。 */
@@ -271,14 +410,14 @@ export function setManualRoleCover(
 
 /** 标签被删掉时同步移除（避免人物识别页面显示一个已经不存在的角色）。 */
 export function removeManualRole(tagId: number): void {
-  withStore((data) => {
+  withStoreRaw((data) => {
     data.manualRoles = data.manualRoles.filter((role) => role.tagId !== tagId);
   });
 }
 
 /** 批量剔除已经不存在的标签（读取时自愈，防止显示幽灵角色）。 */
 export function pruneManualRoles(existingTagIds: ReadonlySet<number>): void {
-  withStore((data) => {
+  withStoreRaw((data) => {
     data.manualRoles = data.manualRoles.filter((role) =>
       existingTagIds.has(role.tagId)
     );

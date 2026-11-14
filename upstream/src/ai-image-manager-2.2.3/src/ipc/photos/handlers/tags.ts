@@ -1,7 +1,7 @@
 import { ORPCError, os } from "@orpc/server";
 import { PRIVATE_BUILD } from "@/config/private-build";
 import { createLogger } from "@/utils/logger";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { getDatabase } from "@/db";
 import { folders, photos, photoTags, tags } from "@/db/schema";
@@ -19,6 +19,17 @@ import {
 } from "@/services/character-suggest";
 import { buildCcipVectors, cancelCcipVectorsBuild, getCcipBuildProgress } from "@/services/ai/ccip-embedder";
 import { clusterCharacterCandidates, getClusterProgress } from "@/services/character-cluster";
+import {
+  forceSinglePersonTags,
+  getPersonCountsByPhotoIds,
+  loadPersonCountTagIds,
+  splitPhotoIdsByPersonCount,
+} from "@/services/character-person-count";
+import {
+  readSingleNamedCache,
+  type SingleNamedCacheRow,
+  writeSingleNamedCache,
+} from "@/services/single-named-cache";
 import { clearUnnamedCharacterResults as clearUnnamedCharacterResultsService } from "@/services/character-result-cleanup";
 import { getCharacterSuggestProgress as getCharacterSuggestProgressService } from "@/services/character-suggest";
 import { setManualRoleCover as setManualRoleCoverInStore } from "@/services/character-group-store";
@@ -34,6 +45,7 @@ import {
   clearCharacterGroups,
   listManualRoles,
   markGroupNamed,
+  reduceStoredGroupPhotos,
   pruneManualRoles,
   readCharacterGroups,
   removeManualRole,
@@ -695,11 +707,27 @@ export const discoverUnnamedCharacterGroups = os
       }
     }
 
+    /*
+     * 多人图命名（2026-11-14 · 会话#12）：分组里有多少张多人图 = 界面"默认开多选"的依据。
+     * 一次把全部组的照片人数算完（按 900 分块查库），不要每组各查一遍。
+     */
+    const allGroupPhotoIds = topGroups.flatMap((group) => group.photoIds);
+    const personCounts = getPersonCountsByPhotoIds(allGroupPhotoIds);
+
     const groups = topGroups.map((group) => {
       const previewIds = [
         group.representativeId,
         ...group.photoIds.filter((id) => id !== group.representativeId),
-      ].slice(0, 8);
+      ].slice(0, 10);
+      let multiPhotoCount = 0;
+      let maxPersonCount = 1;
+      for (const photoId of group.photoIds) {
+        const count = personCounts.get(photoId) ?? 0;
+        if (count >= 2) {
+          multiPhotoCount += 1;
+        }
+        maxPersonCount = Math.max(maxPersonCount, count);
+      }
       return {
         // 完整成员 id：命名时要一次全打上标签，不能截断
         photoIds: group.photoIds,
@@ -711,6 +739,10 @@ export const discoverUnnamedCharacterGroups = os
           .filter((value): value is string => typeof value === "string"),
         namedTagId: null as number | null,
         namedTagName: null as string | null,
+        /** 组里有多少张多人图（≥2 人） */
+        multiPhotoCount,
+        /** 组里最多几个人（多选名字的上限） */
+        maxPersonCount,
       };
     });
 
@@ -896,15 +928,286 @@ export const getStoredCharacterGroups = os
     if (!stored) {
       return { groups: [], createdAt: null, threshold: null, candidates: 0 };
     }
+    const db = getDatabase();
+    /*
+     * 2026-11-14（会话#12）：`multiPhotoCount` / `maxPersonCount` 是这次才加进分组的，
+     * **磁盘上的老文件没有**。如果不在读取时补算，用户不点「重新分析」（聚类几分钟）
+     * 就永远看不到多名字界面 ✗ → 这里一次查库补上，代价很小（几十组 × 每张图一次查）。
+     */
+    const allPhotoIds = stored.groups.flatMap((group) => group.photoIds);
+    const personCounts = getPersonCountsByPhotoIds(allPhotoIds);
+    const groups = stored.groups.map((group) => {
+      let multiPhotoCount = 0;
+      let maxPersonCount = 1;
+      for (const photoId of group.photoIds) {
+        const count = personCounts.get(photoId) ?? 0;
+        if (count >= 2) {
+          multiPhotoCount += 1;
+        }
+        maxPersonCount = Math.max(maxPersonCount, count);
+      }
+      return { ...group, multiPhotoCount, maxPersonCount };
+    });
+
+    /*
+     * 预览缩略图补齐到 10 张（2026-11-14 · 会话#12）。
+     * 老文件里只存了 8 张（当年 `slice(0, 8)`），而界面上**单组一排 5 张、多组两排 10 张**，
+     * 不补的话多组只能显示 8 张、列数对不齐（用户截图反馈"怪怪的"）。
+     * 只给"不足 10 张"的组查一次库，按 photoIds 顺序取前 10 张。
+     */
+    const THUMB_PREVIEW = 10;
+    const missing = groups.filter(
+      (group) => (group.thumbnails?.length ?? 0) < THUMB_PREVIEW
+    );
+    if (missing.length > 0) {
+      const wanted: number[] = [];
+      const seen = new Set<number>();
+      for (const group of missing) {
+        for (const photoId of group.photoIds.slice(0, THUMB_PREVIEW)) {
+          if (!seen.has(photoId)) {
+            seen.add(photoId);
+            wanted.push(photoId);
+          }
+        }
+      }
+      const thumbById = new Map<number, string>();
+      for (let i = 0; i < wanted.length; i += 400) {
+        const rows = db
+          .select({
+            id: photos.id,
+            path: photos.path,
+            thumbnailPath: photos.thumbnailPath,
+          })
+          .from(photos)
+          .where(inArray(photos.id, wanted.slice(i, i + 400)))
+          .all();
+        for (const row of rows) {
+          const value = row.thumbnailPath || row.path;
+          if (value) {
+            thumbById.set(row.id, value);
+          }
+        }
+      }
+      for (const group of missing) {
+        group.thumbnails = group.photoIds
+          .slice(0, THUMB_PREVIEW)
+          .map((photoId) => thumbById.get(photoId))
+          .filter((value): value is string => typeof value === "string");
+      }
+    }
     return {
-      groups: stored.groups,
+      groups,
       createdAt: stored.createdAt,
       threshold: stored.threshold,
       candidates: stored.candidates,
     };
   });
 
-/** 自用新增（2026-10）：丢掉分组缓存（想重新分析时用）。 */
+/**
+ * 「多人图里只认出一个角色」的候选列表（2026-11-14 · 会话#12 新增）。
+ *
+ * 用户口径：人数≥2、但**只打了一个角色名**的图，很可能"第二个人没被认出来"，
+ * 值得单独挑出来给用户补名字（纯数据库查询，不需要任何模型）。
+ *
+ * 判定：`人数≥2`（多人标签，或 1girl+1boy 同时存在）+ `角色标签恰好 1 个`。
+ */
+export const listSingleNamedMultiPersonPhotos = os
+  .input(
+    z
+      .object({
+        limit: z.number().int().min(1).max(200).optional(),
+        offset: z.number().int().min(0).optional(),
+      })
+      .optional()
+  )
+  .handler(({ input }) => {
+    const db = getDatabase();
+    const limit = input?.limit ?? 60;
+    const offset = input?.offset ?? 0;
+
+    const rows = loadTagRows();
+    const root = rows.find(
+      (row) => row.parentId === null && row.name === CHARACTER_ROOT_TAG_NAME
+    );
+    if (!root) {
+      return { groups: [], limit, offset, totalGroups: 0 };
+    }
+
+    const tagIdByEnglish = loadPersonCountTagIds();
+    const MULTI_ENGLISH = [
+      "2girls",
+      "3girls",
+      "4girls",
+      "5girls",
+      "6+girls",
+      "2boys",
+      "3boys",
+      "4boys",
+      "5boys",
+      "6+boys",
+      "multiple_girls",
+      "multiple_boys",
+      "multiple_others",
+    ];
+    const multiIds = MULTI_ENGLISH.map((name) => tagIdByEnglish.get(name)).filter(
+      (id): id is number => typeof id === "number"
+    );
+    /*
+     * 「单人标签同时出现 ≥2 个」也算多人（`1girl+1boy`、`1girl+1other` 都算）。
+     * ⚠️ 只判 `1girl+1boy` 会漏掉 `1girl+1other` 这类（实测漏 179 张）。
+     */
+    const singleIds = ["1girl", "1boy", "1other"]
+      .map((name) => tagIdByEnglish.get(name))
+      .filter((id): id is number => typeof id === "number");
+    if (multiIds.length === 0) {
+      return { groups: [], limit, offset, totalGroups: 0 };
+    }
+
+    // 「有角色标签」的子查询（角色标签 = 「角色」根标签的直接子标签）
+    const charTagIds = db
+      .select({ id: tags.id })
+      .from(tags)
+      .where(eq(tags.parentId, root.id));
+
+    const photoHasTagIds = (ids: number[]) =>
+      db
+        .select({ id: photoTags.photoId })
+        .from(photoTags)
+        .where(inArray(photoTags.tagId, ids));
+
+    const hasMultiTag = inArray(photos.id, photoHasTagIds(multiIds));
+    // 两个以上"单人"标签同时存在（1girl+1boy / 1girl+1other …）
+    const hasTwoSingleTags =
+      singleIds.length >= 2
+        ? inArray(
+            photos.id,
+            db
+              .select({ id: photoTags.photoId })
+              .from(photoTags)
+              .where(inArray(photoTags.tagId, singleIds))
+              .groupBy(photoTags.photoId)
+              .having(sql`count(*) >= 2`)
+          )
+        : sql`0`;
+
+    // 角色标签**恰好 1 个**
+    const exactlyOneCharacter = inArray(
+      photos.id,
+      db
+        .select({ id: photoTags.photoId })
+        .from(photoTags)
+        .where(inArray(photoTags.tagId, charTagIds))
+        .groupBy(photoTags.photoId)
+        .having(sql`count(*) = 1`)
+    );
+
+    const where = and(
+      isNull(photos.deletedAt),
+      or(hasMultiTag, hasTwoSingleTags),
+      exactlyOneCharacter
+    );
+
+    /*
+     * 2026-11-14（会话#12 · 性能）：候选集**只算一次**放内存，翻页直接切片。
+     * 原来每次翻页要跑三遍重查询（取组 281ms + 数总数 279ms + 取照片 507ms ≈ 1.07 秒）。
+     * 任何标签写入都会调用 `invalidateTagSearch()`，那里会把这个缓存一起清掉。
+     */
+    let allRows = readSingleNamedCache();
+    if (!allRows) {
+      const raw = db
+        .select({
+          id: photos.id,
+          path: photos.path,
+          tagId: photoTags.tagId,
+          thumbnailPath: photos.thumbnailPath,
+        })
+        .from(photos)
+        .innerJoin(
+          photoTags,
+          and(
+            eq(photoTags.photoId, photos.id),
+            inArray(photoTags.tagId, charTagIds)
+          )
+        )
+        .where(where)
+        .all();
+      const counts = getPersonCountsByPhotoIds(raw.map((row) => row.id));
+      allRows = raw
+        .filter(
+          (row): row is typeof row & { tagId: number } => row.tagId != null
+        )
+        .map((row) => ({
+          path: row.path,
+          personCount: counts.get(row.id) ?? 0,
+          photoId: row.id,
+          tagId: row.tagId,
+          thumbnailPath: row.thumbnailPath ?? null,
+        }));
+      writeSingleNamedCache(allRows);
+    }
+
+    // 按角色分组，按张数从多到少；分页单位 = **组**
+    const byTag = new Map<number, SingleNamedCacheRow[]>();
+    for (const row of allRows) {
+      if (!byTag.has(row.tagId)) {
+        byTag.set(row.tagId, []);
+      }
+      byTag.get(row.tagId)?.push(row);
+    }
+    const groupEntries = [...byTag.entries()].sort(
+      (a, b) => b[1].length - a[1].length
+    );
+    const totalGroups = groupEntries.length;
+    const pageEntries = groupEntries.slice(offset, offset + limit);
+    const pageTagIds = pageEntries.map(([tagId]) => tagId);
+
+    const nameByTag = new Map<number, string>();
+    if (pageTagIds.length > 0) {
+      for (const tagRow of db
+        .select({ id: tags.id, name: tags.name })
+        .from(tags)
+        .where(inArray(tags.id, pageTagIds))
+        .all()) {
+        nameByTag.set(tagRow.id, tagRow.name);
+      }
+    }
+
+    return {
+      groups: pageEntries.map(([tagId, rows]) => ({
+        photos: [...rows]
+          .sort((a, b) => b.personCount - a.personCount)
+          .map((row) => ({
+            id: row.photoId,
+            path: row.path,
+            personCount: row.personCount,
+            thumbnailPath: row.thumbnailPath,
+          })),
+        tagId,
+        tagName: nameByTag.get(tagId) ?? "",
+      })),
+      limit,
+      offset,
+      totalGroups,
+    };
+  });
+
+/**
+ * 「其实只有一个人」：把选中的多人图的**人数标签**改成指定的单人标签
+ * （2026-11-14 · 会话#12）。性别由界面上的全局开关决定（男/女/其他），服务端不猜。
+ */
+export const setPhotosSinglePerson = os
+  .input(
+    z.object({
+      gender: z.enum(["1girl", "1boy", "1other"]),
+      photoIds: z.array(z.number().int().positive()).min(1).max(3000),
+    })
+  )
+  .handler(({ input }) => {
+    const changed = forceSinglePersonTags(input.photoIds, input.gender);
+    invalidateTagSearch();
+    return { changed };
+  });
+
 export const clearStoredCharacterGroups = os
   .input(z.object({}).optional())
   .handler(() => {
@@ -941,12 +1244,19 @@ export const getCharacterGroupPhotos = os
   .handler(({ input }) => {
     const db = getDatabase();
     const ids = [...new Set(input.photoIds)];
+    /*
+     * 2026-11-14（会话#12）：带上「这张图几个人」。
+     * 用户口径：展开列表里要能一眼看出哪张是多人图 → 缩略图右上角标人数。
+     * 一次查完（分块），不要每张图单独查。
+     */
+    const personCounts = getPersonCountsByPhotoIds(ids);
     const out: Array<{
       fileSize: number;
       filename: string;
       height: number;
       id: number;
       path: string;
+      personCount: number;
       thumbnailPath: string | null;
       width: number;
     }> = [];
@@ -976,6 +1286,7 @@ export const getCharacterGroupPhotos = os
           fileSize: row.fileSize ?? 0,
           width: row.width ?? 0,
           height: row.height ?? 0,
+          personCount: personCounts.get(row.id) ?? 0,
           thumbnailPath: row.thumbnailPath ?? null,
         });
       }
@@ -994,7 +1305,7 @@ export const searchCharacterTags = os
   .input(
     z.object({
       query: z.string().min(1).max(50),
-      limit: z.number().int().min(1).max(50).optional(),
+      limit: z.number().int().min(1).max(200).optional(),
     })
   )
   .handler(({ input }) => {
@@ -1018,7 +1329,7 @@ export const searchCharacterTags = os
       }
       return current?.name ?? "";
     };
-    const limit = input.limit ?? 20;
+    const limit = input.limit ?? 50;
     /*
      * 自用（2026-10-24 · 会话#10）：用户反馈「命名的列表应该只检索角色名的 tag」——
      * 命名框下面原来会把「通用」「作品系列」等分类里的同名标签也列出来（截图里
@@ -1026,7 +1337,12 @@ export const searchCharacterTags = os
      * 这里只保留「角色」分类子树下的标签。
      */
     const characterTagIds = new Set(collectDescendantTagIds(rows).ids);
-    const matches = rows
+    /*
+     * 自用（2026-11-11 · 会话#11）：「有些词结果很多的话他貌似不会全部显示」——
+     * 原来 slice 之后**不告诉界面一共命中多少**，用户以为"就这些" ✗
+     * 现在先算总数，回传 `total`，界面就能显示"还有 N 个，继续输入缩小范围" ✓
+     */
+    const sorted = rows
       .filter((row) => {
         if (!characterTagIds.has(row.id)) {
           return false;
@@ -1042,14 +1358,14 @@ export const searchCharacterTags = os
           return aStarts - bStarts;
         }
         return a.name.length - b.name.length;
-      })
-      .slice(0, limit)
-      .map((row) => ({
-        id: row.id,
-        name: row.name,
-        rootName: rootNameOf(row.id),
-      }));
-    return { matches };
+      });
+    const total = sorted.length;
+    const matches = sorted.slice(0, limit).map((row) => ({
+      id: row.id,
+      name: row.name,
+      rootName: rootNameOf(row.id),
+    }));
+    return { matches, total, limit };
   });
 
 /**
@@ -1066,6 +1382,22 @@ export const nameCharacterGroup = os
       name: z.string().min(1).max(50).optional(),
       /** 用户在检索建议里选中的**已有标签**：直接用它，不再新建 */
       tagId: z.number().int().positive().optional(),
+      /**
+       * 多人图命名（2026-11-14 · 会话#12）：一次写多个角色。
+       *
+       * 语义（用户口径）：**多人图写全部名字，单人图只写第一个**。
+       * 第一个 target 同时用于单人图，所以它相当于"主名字"。
+       */
+      targets: z
+        .array(
+          z.object({
+            name: z.string().min(1).max(50).optional(),
+            tagId: z.number().int().positive().optional(),
+          })
+        )
+        .min(1)
+        .max(6)
+        .optional(),
       photoIds: z.array(z.number().int().positive()).min(1).max(5000),
       confidence: z.number().min(0).max(1).optional(),
       /** 第几组（用于记住"这组已命名"，下次打开显示已命名状态） */
@@ -1078,7 +1410,16 @@ export const nameCharacterGroup = os
      * 经 oRPC 之后界面只显示 "Internal server error"（用户实测：「打不了标」）。
      * 改成 ORPCError，提示原样送到界面。
      */
-    if (input.tagId == null && !input.name) {
+    /*
+     * 多人图命名（2026-11-14 · 会话#12）：`targets` 是主入口，
+     * 老的 `name` / `tagId` 仍兼容（等价于只有 1 个 target）。
+     */
+    const targetInputs =
+      input.targets && input.targets.length > 0
+        ? input.targets
+        : [{ name: input.name, tagId: input.tagId }];
+    const primaryTarget = targetInputs[0] ?? {};
+    if (primaryTarget.tagId == null && !primaryTarget.name) {
       throw new ORPCError("BAD_REQUEST", {
         message: "要么选一个已有标签，要么输入新名字",
       });
@@ -1091,8 +1432,8 @@ export const nameCharacterGroup = os
     let tagName: string;
     let created = false;
 
-    if (input.tagId != null) {
-      const picked = rows.find((row) => row.id === input.tagId);
+    if (primaryTarget.tagId != null) {
+      const picked = rows.find((row) => row.id === primaryTarget.tagId);
       if (!picked) {
         throw new ORPCError("BAD_REQUEST", {
           message: "选中的标签不存在（可能已被删除），请重新选择",
@@ -1101,7 +1442,7 @@ export const nameCharacterGroup = os
       tagId = picked.id;
       tagName = picked.name;
     } else {
-      const wanted = (input.name ?? "").trim();
+      const wanted = (primaryTarget.name ?? "").trim();
       const existing = rows.find((row) => row.name === wanted);
       /*
        * 用户口径（2026-10）：**手动输入撞上同名标签时不要静默复用** ✗。
@@ -1147,14 +1488,60 @@ export const nameCharacterGroup = os
         ? null
         : Math.round(input.confidence * 10_000) / 10_000;
     const uniqueIds = [...new Set(input.photoIds)];
-    const values = uniqueIds.map((photoId) => ({
-      photoId,
-      tagId,
-      confidence,
-      isConfirmed: false,
-      origin: "auto" as const,
-      userConfirmed: false,
-    }));
+
+    /*
+     * 多人图命名（2026-11-14 · 会话#12）：
+     *   · 多人图 → 写**全部**名字；
+     *   · 单人图（含人数未知）→ 只写**第一个**名字。
+     * 这样"两人图"一次能命名两个角色，而单人图不会被多打 ✓
+     */
+    const personSplit = splitPhotoIdsByPersonCount(uniqueIds);
+
+    /** 第 2 个起的名字：规则同第一个（选已有标签 / 新建，撞名要报错） */
+    const extraTargets = targetInputs.slice(1).map((target, index) => {
+      const label = `第 ${index + 2} 个名字`;
+      if (target.tagId != null) {
+        const picked = rows.find((row) => row.id === target.tagId);
+        if (!picked) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: `${label}的标签不存在（可能已被删除），请重新选择`,
+          });
+        }
+        return { tagId: picked.id, tagName: picked.name, created: false };
+      }
+      const wanted = (target.name ?? "").trim();
+      if (!wanted) {
+        throw new ORPCError("BAD_REQUEST", { message: `${label}是空的` });
+      }
+      if (rows.find((row) => row.name === wanted)) {
+        throw new ORPCError("BAD_REQUEST", {
+          message:
+            `标签库里已经有「${wanted}」。如果就是这个角色，请从输入框下面的建议里点选；` +
+            `如果是同名的另一个角色，请换个名字。`,
+        });
+      }
+      const root = rows.find(
+        (row) => row.parentId === null && row.name === CHARACTER_ROOT_TAG_NAME
+      );
+      if (!root) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "标签库里没有「角色」这个分类，无法新建角色标签",
+        });
+      }
+      const newTag = db
+        .insert(tags)
+        .values({ name: wanted, parentId: root.id })
+        .returning({ id: tags.id })
+        .get();
+      if (!newTag?.id) {
+        throw new ORPCError("INTERNAL_SERVER_ERROR", {
+          message: `创建角色标签「${wanted}」失败`,
+        });
+      }
+      return { tagId: newTag.id, tagName: wanted, created: true };
+    });
+
+    const allTargets = [{ tagId, tagName, created }, ...extraTargets];
 
     const CHUNK = 200;
     /*
@@ -1165,33 +1552,85 @@ export const nameCharacterGroup = os
      * 所以这里累加真正的 changes，把"新增"和"本来就有"分开报 ✓。
      */
     let inserted = 0;
+    const appliedByTag: Array<{
+      tagId: number;
+      tagName: string;
+      created: boolean;
+      applied: number;
+      attempted: number;
+    }> = [];
     db.transaction(() => {
-      for (let i = 0; i < values.length; i += CHUNK) {
-        const result = db
-          .insert(photoTags)
-          .values(values.slice(i, i + CHUNK))
-          .onConflictDoNothing()
-          .run();
-        inserted += Number(result?.changes ?? 0);
+      for (const [index, target] of allTargets.entries()) {
+        // 第一个名字写全部照片；其余名字只写多人图（没有多人图就跳过）
+        const photoIdsForTarget = index === 0 ? uniqueIds : personSplit.multi;
+        if (photoIdsForTarget.length === 0) {
+          appliedByTag.push({ ...target, applied: 0, attempted: 0 });
+          continue;
+        }
+        const values = photoIdsForTarget.map((photoId) => ({
+          photoId,
+          tagId: target.tagId,
+          confidence,
+          isConfirmed: false,
+          origin: "auto" as const,
+          userConfirmed: false,
+        }));
+        let applied = 0;
+        for (let i = 0; i < values.length; i += CHUNK) {
+          const result = db
+            .insert(photoTags)
+            .values(values.slice(i, i + CHUNK))
+            .onConflictDoNothing()
+            .run();
+          applied += Number(result?.changes ?? 0);
+        }
+        inserted += applied;
+        appliedByTag.push({
+          ...target,
+          applied,
+          attempted: values.length,
+        });
       }
     });
     invalidateTagSearch();
 
-    // 记住这组已命名（下次打开对话框显示"已命名"，不会被当成没做过）
-    markGroupNamed(
+    /*
+     * 自用（2026-11-11 用户报「只命名了 1 张，剩 18 张同角色，但整组也一起消失了」）：
+     * 以前这里**无条件**把整组标成"已命名"，于是剩下没命名的照片再也不会出现在
+     * 「发现没有标签的角色」里 ✗
+     * 现在先看这组还剩多少没命名：还有剩 → 只把已命名的从组里摘掉，组继续留着 ✓
+     */
+    const reduced = reduceStoredGroupPhotos(
       input.groupIndex ?? null,
       uniqueIds[0] ?? null,
-      tagId,
-      tagName
+      uniqueIds
     );
+    const namedTagList = allTargets.map((target) => ({
+      tagId: target.tagId,
+      tagName: target.tagName,
+    }));
+    const namedAll = reduced.emptied || reduced.remaining === 0;
+    if (namedAll) {
+      // 整组都命名完了 → 记成"已命名"（下次打开显示已完成，不再出现）
+      markGroupNamed(
+        input.groupIndex ?? null,
+        uniqueIds[0] ?? null,
+        tagId,
+        tagName,
+        namedTagList
+      );
+    }
 
     /*
      * 用户口径（2026-10）：
      *   · **手动新建标签** → 这是"发现了一个新角色" → 记进人物识别页面 ✓；
      *   · **选已有标签导入** → 只是批量打标签，**不**在人物识别里多出一个角色 ✗。
      * 判据就用 `created`（是不是这次真的新建了标签）。
+     *
+     * 多人图命名（2026-11-14 · 会话#12）：一次可能新建好几个角色 →
+     * **逐个**登记，别只记第一个（否则"我创建的角色"里只出现一个）。
      */
-    if (created) {
+    if (allTargets.some((target) => target.created)) {
       const coverId = uniqueIds[0] ?? 0;
       const cover = coverId
         ? db
@@ -1203,32 +1642,44 @@ export const nameCharacterGroup = os
             .where(eq(photos.id, coverId))
             .get()
         : undefined;
-      addManualRole({
-        tagId,
-        tagName,
-        representativePhotoId: coverId,
-        thumbnailPath: cover?.thumbnailPath ?? cover?.path ?? null,
-        photoCount: values.length,
-        createdAt: Date.now(),
-      });
+      for (const applied of appliedByTag) {
+        if (!applied.created) {
+          continue;
+        }
+        addManualRole({
+          tagId: applied.tagId,
+          tagName: applied.tagName,
+          representativePhotoId: coverId,
+          thumbnailPath: cover?.thumbnailPath ?? cover?.path ?? null,
+          photoCount: applied.attempted,
+          createdAt: Date.now(),
+        });
+      }
     }
 
     return {
       tagId,
       tagName,
       created,
-      /** 真正新写入的条数 */
+      /** 真正新写入的条数（多个名字时是总和） */
       applied: inserted,
-      /** 组里一共涉及多少张（其中 `attempted - applied` 张本来就有该标签） */
-      attempted: values.length,
+      /** 尝试写入的条数（`attempted - applied` = 本来就有该标签的） */
+      attempted: appliedByTag.reduce((sum, item) => sum + item.attempted, 0),
+      /** 每个名字各自的写入情况（界面按这个名字报数字） */
+      tags: appliedByTag,
+      /** 这批照片里多人图 / 单人图的张数（多人图才写全部名字） */
+      multiCount: personSplit.multi.length,
+      singleCount: personSplit.single.length,
+      /** 人数未知（没有人数标签）的张数 */
+      unknownPersonCount: personSplit.unknown,
+      /** 这批照片里最多几个人（界面上限） */
+      maxPersonCount: personSplit.maxPersonCount,
+      /** 整组是否已全部命名（false = 还有照片留在「发现」列表里） */
+      namedAll,
+      /** 这组还剩多少张没命名 */
+      remaining: reduced.remaining,
     };
   });
-
-/**
- * 自用新增（2026-10）：人物识别页面用的「我手动创建的角色」列表。
- *
- * 读取时顺手**自愈**：标签如果已经被删掉，就从列表里剔除，避免显示幽灵角色。
- */
 export const listManualCharacterRoles = os
   .input(z.object({}).optional())
   .handler(() => {
@@ -1402,6 +1853,7 @@ export const addTag = os
       parentId: input.parentId || null,
     };
   });
+
 
 export const setPhotoTag = os
   .input(z.object({ photoId: z.number(), tagId: z.number() }))

@@ -162,9 +162,9 @@ git apply --whitespace=nowarn ../patches/next.patch
 
 | 版本 | 文件名 | 大约 |
 |---|---|---|
-| **NEXT**（本仓库，PixAI 打标） | `AI Anime Image Manager NEXT-2.2.3.6.msi` | 336 MB |
-| WD | `AI Anime Image Manager WD-2.2.3.4.msi` | 665 MB |
-| 本地版 | `AI Anime Image Manager-2.2.3.4.msi` | 665 MB |
+| **NEXT**（本仓库，PixAI 打标） | `AI Anime Image Manager NEXT-2.2.3.7.msi` | 336 MB |
+| WD | `AI Anime Image Manager WD-2.2.3.5.msi` | 665 MB |
+| 本地版 | `AI Anime Image Manager-2.2.3.5.msi` | 665 MB |
 
 都在 [Releases](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases) 的最新版页面（**只保留最新一个安装包**）；
 每个仓库根目录 `校验信息.md` 里有 **MD5 / SHA-256**，下完先核对。

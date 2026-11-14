@@ -13,6 +13,7 @@ import { faceActions } from "@/actions/faces";
 import { ipc } from "@/ipc/manager";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CharacterDiscoveryDialog } from "@/components/character-discovery-dialog";
+import { CharacterSingleNamedDialog } from "@/components/character-single-named-dialog";
 import {
   type CharacterMissingRow,
   CharacterMissingDialog,
@@ -155,6 +156,7 @@ export function PeoplePage() {
    */
   const [entryOpen, setEntryOpen] = useState(false);
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
+  const [singleNamedOpen, setSingleNamedOpen] = useState(false);
   const [missingOpen, setMissingOpen] = useState(false);
   const [missingRows, setMissingRows] = useState<CharacterMissingRow[]>([]);
   const [missingBusy, setMissingBusy] = useState(false);
@@ -403,6 +405,25 @@ export function PeoplePage() {
                 {t("peopleFindUnnamedCharactersHint")}
               </span>
             </button>
+            {/*
+              2026-11-14（会话#12）：第三个入口——**多人图里只认出一个角色**。
+              纯数据库查询（不需要模型），所以**不参与**打标/特征那道门禁。
+            */}
+            <button
+              className="flex w-full flex-col gap-0.5 rounded-[6px] px-2.5 py-2 text-left transition-colors hover:bg-muted"
+              onClick={() => {
+                setEntryOpen(false);
+                setSingleNamedOpen(true);
+              }}
+              type="button"
+            >
+              <span className="font-medium text-[12px] text-foreground">
+                {t("characterRecognitionSingleNamed")}
+              </span>
+              <span className="text-[11px] text-muted-foreground leading-snug">
+                {t("characterSingleNamedHint")}
+              </span>
+            </button>
           </PopoverContent>
         </Popover>
         {/*
@@ -490,6 +511,10 @@ export function PeoplePage() {
       <CharacterDiscoveryDialog
         onOpenChange={setDiscoveryOpen}
         open={discoveryOpen}
+      />
+      <CharacterSingleNamedDialog
+        onOpenChange={setSingleNamedOpen}
+        open={singleNamedOpen}
       />
       <CharacterMissingDialog
         analyzing={missingBusy}

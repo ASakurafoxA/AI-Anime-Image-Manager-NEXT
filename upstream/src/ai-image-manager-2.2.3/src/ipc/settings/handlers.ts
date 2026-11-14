@@ -46,6 +46,7 @@ import {
   parseCloseBehavior,
 } from "@/types/app-preferences";
 import { normalizeSequenceDetectionSettings } from "@/types/sequence-detection-settings";
+import { createLogger } from "@/utils/logger";
 import {
   getDataPath,
   isDefaultDataPath,
@@ -159,6 +160,59 @@ export const updateDuplicateSettings = os
     };
   });
 
+const log = createLogger("settings-handlers");
+
+/**
+ * 「序列建议」重建的**延后 + 合并**调度（2026-11-14 · 会话#12）。
+ *
+ * 背景（`待办清单.md` 的「高」第 1 条）：改「序列检测」设置时，
+ * 原来在**写事务里**同步跑 `refreshSequenceSuggestions()`（全库扫描，数秒~数分钟），
+ * 写锁一直不释放 → 界面未响应 + `SQLITE_BUSY` ✗
+ *
+ * 现在：
+ *   ① 设置本身用**短事务**立刻落盘（`setSetting` 自带）；
+ *   ② 重建建议延后 250ms 再跑，并**合并**连续拖动滑杆产生的多次保存；
+ *   ③ 上一轮还没跑完时再来的请求，只记一个"跑完再来一次"，不排队堆积。
+ */
+let sequenceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let sequenceRefreshRunning = false;
+let sequenceRefreshAgain = false;
+
+function scheduleSequenceSuggestionRefresh(): void {
+  if (sequenceRefreshTimer) {
+    clearTimeout(sequenceRefreshTimer);
+  }
+  sequenceRefreshTimer = setTimeout(() => {
+    sequenceRefreshTimer = null;
+    void runSequenceSuggestionRefresh();
+  }, 250);
+}
+
+async function runSequenceSuggestionRefresh(): Promise<void> {
+  if (sequenceRefreshRunning) {
+    sequenceRefreshAgain = true;
+    return;
+  }
+  sequenceRefreshRunning = true;
+  try {
+    // 让出一次事件循环：先把"设置已保存"的 IPC 响应送回界面
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    refreshSequenceSuggestions();
+    notifySequencesChanged(undefined, "settings");
+  } catch (error) {
+    log.warn(
+      { err: error instanceof Error ? error.message : String(error) },
+      "重建序列建议失败（设置已保存，不影响继续使用）"
+    );
+  } finally {
+    sequenceRefreshRunning = false;
+    if (sequenceRefreshAgain) {
+      sequenceRefreshAgain = false;
+      scheduleSequenceSuggestionRefresh();
+    }
+  }
+}
+
 export const setAppSetting = os
   .input(z.object({ key: z.string(), value: z.string() }))
   .handler(({ input }) => {
@@ -166,11 +220,12 @@ export const setAppSetting = os
       const normalized = normalizeSequenceDetectionSettings(
         JSON.parse(input.value)
       );
-      getDatabase().transaction(() => {
-        setSetting(input.key, JSON.stringify(normalized));
-        refreshSequenceSuggestions();
-      });
-      notifySequencesChanged(undefined, "settings");
+      /*
+       * ⚠️ 不要在写事务里跑全库扫描（见上面 scheduleSequenceSuggestionRefresh 的注释）。
+       * `setSetting` 自己就是一个短事务，写完立刻返回 ✓
+       */
+      setSetting(input.key, JSON.stringify(normalized));
+      scheduleSequenceSuggestionRefresh();
     } else {
       setSetting(input.key, input.value);
     }

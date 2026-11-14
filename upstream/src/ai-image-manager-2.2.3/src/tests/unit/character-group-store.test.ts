@@ -18,6 +18,7 @@ import {
   pruneManualRoles,
   readCharacterGroups,
   removeManualRole,
+  reduceStoredGroupPhotos,
   removeUnnamedGroups,
   renameManualRole,
   writeCharacterGroups,
@@ -107,10 +108,50 @@ describe("character-group-store", () => {
     expect(back?.threshold).toBe(0.85);
   });
 
-  it("清缓存后读不到", () => {
-    writeCharacterGroups(sample());
+  it("清缓存只清分组，不动「我创建的角色」", () => {
+    writeCharacterGroups({
+      ...sample(),
+      manualRoles: [
+        {
+          tagId: 777,
+          tagName: "风又音理",
+          representativePhotoId: 5,
+          thumbnailPath: null,
+          photoCount: 18,
+          createdAt: 1,
+        },
+      ],
+    });
     clearCharacterGroups();
-    expect(readCharacterGroups()).toBeNull();
+    const back = readCharacterGroups();
+    // 分组要清空（下次重新分析）
+    expect(back?.groups).toEqual([]);
+    /*
+     * 回归（2026-11-11 用户报「我创建的角色都没了」）：
+     * 以前 clear 是**删文件**，角色列表存在同一个文件里 → 点「重新分析」角色全丢 ✗
+     */
+    expect(back?.manualRoles.map((role) => role.tagId)).toEqual([777]);
+  });
+
+  it("写入时不会用空列表覆盖已有角色", () => {
+    writeCharacterGroups({
+      ...sample(),
+      manualRoles: [
+        {
+          tagId: 888,
+          tagName: "小丸",
+          representativePhotoId: 6,
+          thumbnailPath: null,
+          photoCount: 75,
+          createdAt: 1,
+        },
+      ],
+    });
+    // 模拟"重新分析"那条路径：它写回 manualRoles: []
+    writeCharacterGroups({ ...sample(), manualRoles: [] });
+    expect(readCharacterGroups()?.manualRoles.map((role) => role.tagId)).toEqual([
+      888,
+    ]);
   });
 });
 
@@ -238,5 +279,55 @@ describe("手动创建的角色（人物识别页面用）", () => {
 
   it("没有缓存文件时删除未命名结果不报错", () => {
     expect(removeUnnamedGroups()).toBe(0);
+  });
+});
+
+describe("部分命名（只命名了一部分照片）", () => {
+  it("把已命名的摘掉、组继续留着", () => {
+    writeCharacterGroups({
+      ...sample(),
+      groups: [
+        {
+          photoIds: [11, 12, 13, 14],
+          size: 4,
+          meanSimilarity: 0.75,
+          representativeId: 11,
+          thumbnails: [],
+          namedTagId: null,
+          namedTagName: null,
+        },
+      ],
+    });
+    // 只命名了 11 这一个
+    const result = reduceStoredGroupPhotos(0, 11, [11]);
+    expect(result).toEqual({ emptied: false, remaining: 3 });
+    const back = readCharacterGroups();
+    expect(back?.groups[0].photoIds).toEqual([12, 13, 14]);
+    expect(back?.groups[0].size).toBe(3);
+    // 代表图被命名掉了 → 换一张，别指向已命名的
+    expect(back?.groups[0].representativeId).toBe(12);
+    // 关键：**没有**被标成已命名（否则下次打开就消失了）
+    expect(back?.groups[0].namedTagId).toBeNull();
+  });
+
+  it("整组都命名完才算 emptied", () => {
+    writeCharacterGroups({
+      ...sample(),
+      groups: [
+        {
+          photoIds: [21, 22],
+          size: 2,
+          meanSimilarity: 0.8,
+          representativeId: 21,
+          thumbnails: [],
+          namedTagId: null,
+          namedTagName: null,
+        },
+      ],
+    });
+    expect(reduceStoredGroupPhotos(0, 21, [21, 22])).toEqual({
+      emptied: true,
+      remaining: 0,
+    });
   });
 });

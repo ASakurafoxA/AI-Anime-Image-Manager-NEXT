@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildCharacterCentroids,
   collectDescendantTagIds,
+  createCentroidAccumulator,
   mergeCandidateHits,
   type SeedPhoto,
 } from "@/services/character-suggest";
@@ -68,6 +69,75 @@ describe("buildCharacterCentroids", () => {
       { minSeedCount: 3 }
     );
     expect(centroids[0].seedCount).toBe(3);
+  });
+});
+
+describe("createCentroidAccumulator", () => {
+  /*
+   * 2026-11-14（会话#12 · 性能）：为了不把 19,458 条 × 768 维常驻内存（约 0.5 GB，
+   * 第二遍分析时 GC 抖动导致慢 28 倍），改成"分块读进来就累加"。
+   * 这里锁定**结果必须和 buildCharacterCentroids 完全一致**，否则等于换了算法。
+   */
+  const seeds: SeedPhoto[] = [
+    { photoId: 1, tagId: 10, tagName: "A" },
+    { photoId: 2, tagId: 10, tagName: "A" },
+    { photoId: 3, tagId: 10, tagName: "A" },
+    { photoId: 4, tagId: 11, tagName: "B" },
+    { photoId: 5, tagId: 11, tagName: "B" },
+  ];
+  const vectors = new Map<number, number[]>([
+    [1, v(1, 0)],
+    [2, v(3, 0)],
+    [3, v(5, 0)],
+    [4, v(0, 1)],
+    [5, v(0, 3)],
+  ]);
+  const tagIdsByPhoto = new Map<number, number[]>([
+    [1, [10]],
+    [2, [10]],
+    [3, [10]],
+    [4, [11]],
+    [5, [11]],
+  ]);
+  const tagNameById = new Map<number, string>([
+    [10, "A"],
+    [11, "B"],
+  ]);
+
+  it("给出与 buildCharacterCentroids 相同的结果（逐块喂也一致）", () => {
+    const expected = buildCharacterCentroids(seeds, vectors, {
+      minSeedCount: 3,
+    });
+    const accumulator = createCentroidAccumulator(tagIdsByPhoto, tagNameById, {
+      minSeedCount: 3,
+    });
+    // 故意一张一张喂，模拟"分块读取、读完即弃"
+    for (const [photoId, vector] of vectors) {
+      accumulator.add(new Map([[photoId, vector]]));
+    }
+    const got = accumulator.result();
+
+    expect(got.map((c) => c.tagId).sort()).toEqual(
+      expected.map((c) => c.tagId).sort()
+    );
+    expect(got).toHaveLength(1); // B 只有 2 张种子 → 被 minSeedCount 过滤
+    expect(got[0].seedCount).toBe(expected[0].seedCount);
+    for (let i = 0; i < got[0].centroid.length; i += 1) {
+      expect(got[0].centroid[i]).toBeCloseTo(expected[0].centroid[i], 10);
+    }
+  });
+
+  it("一张图属于两个角色时两边都累加，但只算一张已读", () => {
+    const accumulator = createCentroidAccumulator(
+      new Map([[7, [10, 11]]]),
+      tagNameById,
+      { minSeedCount: 1 }
+    );
+    accumulator.add(new Map([[7, v(1, 1)]]));
+    expect(accumulator.seen).toBe(1);
+    const got = accumulator.result();
+    expect(got.map((c) => c.tagId).sort()).toEqual([10, 11]);
+    expect(got.every((c) => c.seedCount === 1)).toBe(true);
   });
 });
 
