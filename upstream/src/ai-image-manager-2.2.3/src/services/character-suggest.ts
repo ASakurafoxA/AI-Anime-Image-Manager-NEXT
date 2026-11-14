@@ -31,10 +31,10 @@ import {
 } from "@/services/character-centroid-store";
 import { getDataPath } from "@/utils/data-path";
 import {
+  createCcipSearchSession,
   getCcipVectorCount,
   getCcipVectors,
   getPhotoVectors,
-  reopenCcipTable,
   searchByCcipVector,
   searchByPhotoVector,
 } from "@/services/ai/vector-db";
@@ -594,6 +594,11 @@ export function analyzeUnnamedCharacters(
   }
   analysisInFlight = runCharacterAnalysis(options).finally(() => {
     analysisInFlight = null;
+    /*
+     * 2026-11-14（会话#12）：这里**必须**把进度清掉。
+     * 之前只在函数末尾清 → 中途抛错/卡住时界面永远显示"分析中"（用户实测).
+     */
+    suggestProgress = null;
   });
   return analysisInFlight;
 }
@@ -689,6 +694,7 @@ async function runCharacterAnalysis(
   const maxLinkId = Number(linkStats?.maxId ?? 0);
   const ccipRows = await getCcipVectorCount();
   const centroidStore = readCentroidStore();
+  // 命中条件：CCIP 行数 + 角色标签关联数 + 最大关联 id 三者全对（角色标签一变就失效）
   const storeHit =
     centroidStore != null &&
     centroidStore.ccipRows === ccipRows &&
@@ -802,14 +808,14 @@ async function runCharacterAnalysis(
   const ranked = [...centroids].sort((a, b) => b.seedCount - a.seedCount);
   const considered = ranked.slice(0, MAX_CHARACTERS_PER_RUN);
   const searchStartedAt = performance.now();
-  if (featureAccess.source === "ccip") {
-    /*
-     * 2026-11-14（会话#12 · 补漏慢的真凶）：表句柄可能钉在"索引还没建成"的旧版本上，
-     * 那样每次近邻检索都退化成暴力扫描（离线 9ms/次 → app 里 800ms/次）。
-     * 批量检索前刷成最新句柄，索引才会被用上。
-     */
-    await reopenCcipTable();
-  }
+  /*
+   * 2026-11-14（会话#12 · 撤回）：
+   * 这里原来会调 `reopenCcipTable()` 刷新表句柄（为了绕开"句柄钉在旧索引版本"）。
+   * 但实测它在向量库维护任务（压缩 / 建索引）进行时会**阻塞主进程事件循环** ——
+   * 界面表现是"分析中一直转、旁边计时停在 1 秒"（IPC 轮询都停了），5 秒超时也救不了
+   * （原生调用把线程占住，定时器根本没机会跑）。
+   * 所以**不再在分析前刷新句柄**：启动时打开的句柄本身就是最新版本，够用。
+   */
   if (suggestProgress) {
     suggestProgress.seedsMs = Math.round(
       performance.now() - (seedsStartedAt ?? searchStartedAt)
@@ -822,7 +828,15 @@ async function runCharacterAnalysis(
    * 以前是**逐个角色串行**检索（最多 300 次向量查询）→ 实测要几十秒 ✗
    * 现在按 4 路并发检索，结果顺序不变（按 considered 的顺序收集）。
    */
-  const SEARCH_CONCURRENCY = 8;
+  /*
+   * 2026-11-14（会话#12）：批量检索走**独立连接**。
+   * 常驻句柄在 app 里 300ms/次（300 次要 90 秒），而独立连接实测 15ms/次。
+   */
+  const session = featureAccess.source === "ccip"
+    ? await createCcipSearchSession()
+    : null;
+  const searchFn = session?.search ?? search;
+  const SEARCH_CONCURRENCY = 3;
   const perTag: TagCandidateHits[] = [];
   let searchUnavailable = false;
   for (
@@ -831,9 +845,22 @@ async function runCharacterAnalysis(
     start += SEARCH_CONCURRENCY
   ) {
     const batch = considered.slice(start, start + SEARCH_CONCURRENCY);
-    const hitsPerCentroid = await Promise.all(
-      batch.map((centroid) => search(centroid.centroid, PER_CHARACTER_LIMIT))
-    );
+    /*
+     * 2026-11-14（会话#12）：单批加 60 秒看门狗。
+     * 维护任务（压缩/建索引）与检索撞车时，LanceDB 的查询可能长时间不返回，
+     * 表现为界面永远"分析中"。超时就当作"向量库暂时不可用"，让整轮尽快结束并清掉进度。
+     */
+    const hitsPerCentroid = await Promise.race([
+      Promise.all(
+        batch.map((centroid) => searchFn(centroid.centroid, PER_CHARACTER_LIMIT))
+      ),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 60_000)),
+    ]);
+    if (!hitsPerCentroid) {
+      console.warn("[CharacterSuggest] 检索批次超时 60s，提前结束本轮");
+      searchUnavailable = true;
+      break;
+    }
     if (suggestProgress) {
       suggestProgress.phase = "search";
       suggestProgress.searchMs = Math.round(
@@ -862,7 +889,11 @@ async function runCharacterAnalysis(
     if (searchUnavailable) {
       break;
     }
+    // 让出一拍，缩略图/IO 能插进来（用户实测：列表渲染时比对被饿死）
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
+
+  await session?.close();
 
   const proposals = mergeCandidateHits(perTag, options);
   const candidateCount = proposals.reduce(

@@ -2129,12 +2129,75 @@ export async function getCcipVectorCount(): Promise<number> {
  * 离线实测同一张表 **9 ms/次**，而 app 里补漏逐角色比对却要 **800 ms/次**（慢近百倍），
  * 症状就是这么来的。所以在跑批量检索前把句柄换成"最新版本"。
  */
+/**
+ * 给"批量近邻检索"开一条**独立连接**（2026-11-14 · 会话#12）。
+ *
+ * 背景：常驻连接在 app 里查 300 次要 90 秒（~300ms/次），而同一个库**新开连接**只要 15ms/次。
+ * 排查过：索引存在（vector_idx / IvfFlat）、checkoutLatest 刷新句柄也无效。
+ * 所以批量检索干脆用独立连接，命中率与离线实测一致；用完即关，不污染常驻连接。
+ */
+export async function createCcipSearchSession(): Promise<{
+  close: () => Promise<void>;
+  search: (
+    vector: number[] | Float64Array,
+    limit: number
+  ) => Promise<Array<{ photoId: number; similarity: number }> | null>;
+} | null> {
+  try {
+    const lancedb = await import("@lancedb/lancedb");
+    const conn = await lancedb.connect(path.join(getDataPath(), "vectors"));
+    const table = await conn.openTable(CCIP_TABLE_NAME);
+    return {
+      close: async () => {
+        try {
+          await conn.close();
+        } catch {
+          /* best-effort */
+        }
+      },
+      search: async (vector, limit) => {
+        try {
+          const rows = (await table
+            .vectorSearch(Array.from(vector))
+            .distanceType("l2")
+            .limit(limit)
+            .toArray()) as Record<string, unknown>[];
+          return rows
+            .map((row) => ({
+              photoId: row.photo_id as number,
+              similarity: Math.max(0, 1 - Number(row._distance ?? 0) / 2),
+            }))
+            .filter((hit) => Number.isFinite(hit.photoId));
+        } catch (err: unknown) {
+          console.warn("[AI] session search failed:", getErrorMessage(err));
+          return null;
+        }
+      },
+    };
+  } catch (err: unknown) {
+    console.warn("[AI] createCcipSearchSession failed:", getErrorMessage(err));
+    return null;
+  }
+}
+
 export async function reopenCcipTable(): Promise<boolean> {
   if (!vectordb) {
     return false;
   }
   try {
-    const table = await vectordb.openTable(CCIP_TABLE_NAME);
+    /*
+     * 2026-11-14（会话#12）：加超时保护。
+     * 实测过「重开表句柄」在维护任务（压缩/建索引）进行时可能长时间不返回，
+     * 结果补漏界面永远停在"分析中"。这里最多等 5 秒，超时就继续用旧句柄（宁可慢也不卡死）。
+     */
+    const table = await Promise.race([
+      vectordb.openTable(CCIP_TABLE_NAME),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+    ]);
+    if (!table) {
+      console.warn("[AI] reopenCcipTable timed out; keeping the old handle");
+      return false;
+    }
     setCcipTable(table);
     return true;
   } catch (err: unknown) {
