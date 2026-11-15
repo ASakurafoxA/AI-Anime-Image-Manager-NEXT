@@ -435,8 +435,13 @@ export function CharacterSingleNamedDialog({
                     key={group.tagId}
                   >
                     <div className="flex items-start gap-3">
-                      <div className="flex shrink-0 items-center gap-1">
-                        {group.photos.slice(0, 5).map((photo, thumbIndex) => {
+                      {/*
+                        2026-11-16（会话#13）：用户口径「把多人图补名的这里也做成每组两排缩略图」——
+                        从"一排 5 张"改成 **5 列 × 2 排（最多 10 张）**。
+                        后端本来就返回整组照片，不需要改接口。
+                      */}
+                      <div className="grid shrink-0 grid-cols-5 content-start gap-1">
+                        {group.photos.slice(0, 10).map((photo, thumbIndex) => {
                           const isPicked = chosen.has(photo.id);
                           /* 只有**没有展开选项**（≤5 张）时，这排小图才需要勾选圈（用户口径） */
                           const showCircle = group.photos.length <= 5;
@@ -474,28 +479,35 @@ export function CharacterSingleNamedDialog({
                             </div>
                           );
                         })}
-                        {group.photos.length > 5 && (
-                          <button
-                            className="ml-1 shrink-0 rounded-[4px] border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
-                            onClick={() =>
-                              setExpanded((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(group.tagId)) {
-                                  next.delete(group.tagId);
-                                } else {
-                                  next.add(group.tagId);
-                                }
-                                return next;
-                              })
-                            }
-                            type="button"
-                          >
-                            {isExpanded
-                              ? t("characterDiscoveryCollapse")
-                              : t("characterDiscoveryExpand")}
-                          </button>
-                        )}
                       </div>
+
+                      {/*
+                        2026-11-16（会话#13）：**「展开」按钮必须放在网格外面**。
+                        之前把它留在了缩略图容器里 —— 容器改成 `grid-cols-5` 之后它就成了
+                        第 6 个格子（第二排第一格），看着像"单独一行"。现在它是网格的兄弟，
+                        用 `self-center` 竖直居中，和用户给的参考图一致。
+                      */}
+                      {group.photos.length > 5 && (
+                        <button
+                          className="shrink-0 self-center rounded-[4px] border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+                          onClick={() =>
+                            setExpanded((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(group.tagId)) {
+                                next.delete(group.tagId);
+                              } else {
+                                next.add(group.tagId);
+                              }
+                              return next;
+                            })
+                          }
+                          type="button"
+                        >
+                          {isExpanded
+                            ? t("characterDiscoveryCollapse")
+                            : t("characterDiscoveryExpand")}
+                        </button>
+                      )}
 
                       <div className="min-w-0 flex-1">
                         {/* 标题 = 角色名（用户口径） */}

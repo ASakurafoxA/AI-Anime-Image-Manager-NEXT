@@ -158,6 +158,7 @@ import {
   renameManualCharacterRole,
   deleteManualCharacterRole,
   setManualRoleCover,
+  setManualRoleCoverBlur,
 } from "./handlers/tags";
 
 export const photos = {
@@ -186,6 +187,7 @@ export const photos = {
   renameManualCharacterRole,
   deleteManualCharacterRole,
   setManualRoleCover,
+  setManualRoleCoverBlur,
   backfillMissingThumbnails,
   batchGenerateTags,
   batchRemovePhotoTag,

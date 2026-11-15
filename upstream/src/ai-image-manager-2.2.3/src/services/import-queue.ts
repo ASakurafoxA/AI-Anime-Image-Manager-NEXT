@@ -10,6 +10,7 @@ import { invalidateIndexStatsCache } from "@/ipc/photos/handlers/stats";
 import { getAiControlState } from "@/services/ai/state";
 import { deletePhotoVectors, embedAllPhotos } from "@/services/ai-embedder";
 import { reloadFolderMatcher } from "@/services/folder-matcher";
+import { isMainThreadHeavyWorkRunning } from "@/services/main-thread-work";
 import {
   getIndexedRootFolders,
   scanFolder as scanFolderService,
@@ -467,6 +468,22 @@ export function scheduleStartupCatchUpScan(
   catchUpTimer = setTimeout(() => {
     catchUpTimer = null;
     void (async () => {
+      /*
+       * 2026-11-15（会话#13）：**角色识别正在跑就让路**。
+       *
+       * 用户实测（dev 版日志）：分析 13:32:25 开始，前 71 个角色都是快的；
+       * 13:32:39 本函数开始扫桌面那个文件夹；13:32:49 起每一批从 ~50ms 掉到
+       * 500~1000ms，直到扫完才恢复。补扫是"开机 25 秒后自动开始"，
+       * 正好撞上"开软件就进角色识别"的习惯。
+       * 让路 2 分钟后再试 —— 补扫本来就是机会性的，晚两分钟没有副作用。
+       */
+      if (isMainThreadHeavyWorkRunning()) {
+        console.log(
+          "[ImportQueue] 开机补扫：角色识别正在跑 → 让路，2 分钟后再试 ✓"
+        );
+        scheduleStartupCatchUpScan(120_000);
+        return;
+      }
       let roots: { id: number; path: string }[] = [];
       try {
         roots = getIndexedRootFolders();

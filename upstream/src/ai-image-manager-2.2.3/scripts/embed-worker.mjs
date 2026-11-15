@@ -273,12 +273,30 @@ async function handleEmbed(message) {
     if (aborted) {
       break;
     }
+    /*
+     * 2026-11-15（会话#13）：**把"解码失败"和"推理失败"分开** ✗→✓
+     *
+     * 旧代码在 DirectML 下把**任何**单张异常都当成 provider 故障 → `break` →
+     * 上层据此判"整池报废"、退回 CPU、还要清掉半成品进度。
+     * 用户实测：一张**截断的 HEIC**（`bad seek to N`，不是显卡问题）就毁掉了一整轮
+     * 9700 张的进度，退 CPU 重跑一遍又在同一张再炸一次。
+     * 解码/预处理错误只属于这一张图 → 记下失败继续；只有**推理**出错才可能是 EP 故障。
+     */
+    let floatData;
     try {
       let imageInput = photo.path;
       if (isRawFile(photo.path)) {
         imageInput = extractRawPreview(photo.path) || photo.path;
       }
-      const floatData = await preprocessImage(imageInput);
+      floatData = await preprocessImage(imageInput);
+    } catch (error) {
+      results.push({
+        id: photo.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+    try {
       const image = activeAdapter.image;
       const pixelValues = new ort.Tensor("float32", floatData, [
         1,

@@ -10,8 +10,8 @@
  *     名字/张数/按钮**一行内垂直居中**、位置规整 ✓。
  */
 import { useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Check, Image as ImageIcon, Pencil, X } from "lucide-react";
-import { useLayoutEffect, useRef, useState } from "react";
+import { ArrowLeft, Check, EyeOff, Image as ImageIcon, Pencil, X } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
@@ -24,6 +24,8 @@ import { toLocalMediaUrl } from "@/utils/local-media-url";
 
 export interface ManualRole {
   createdAt: number;
+  /** 封面是否模糊化（2026-11-15 · 右键「模糊化封面」） */
+  coverBlurred?: boolean;
   photoCount: number;
   representativePhotoId: number;
   tagId: number;
@@ -37,13 +39,25 @@ export interface ManualRolesSectionProps {
   roles: ManualRole[];
   /** 数据变化后让上层刷新列表 */
   onRenamed?: () => void;
+  /**
+   * 2026-11-15（会话#13）：展开/收起图集时通知上层。
+   * 上层用它在**顶部工具栏**里换成图集操作栏（用户口径：不要悬空控件）。
+   */
+  onExpandedChange?: (expanded: boolean) => void;
 }
 
 /** 与"设置"里同款的按钮样式（有边框、圆角、内边距）。 */
 const BUTTON_CLASS =
   "rounded-[6px] border border-border bg-card px-2.5 py-1 text-[12px] text-foreground transition-colors hover:bg-foreground/5 disabled:opacity-50";
 
-export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps) {
+/** 顶部工具栏里给图集操作栏预留的挂载点（people.tsx 渲染）。 */
+export const ALBUM_BAR_SLOT_ID = "people-album-bar-slot";
+
+export function ManualRolesSection({
+  roles,
+  onRenamed,
+  onExpandedChange,
+}: ManualRolesSectionProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   /*
@@ -53,6 +67,15 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
   const reduceMotion = useReducedMotion();
   const enterClass = reduceMotion ? "" : "album-view-enter";
   const menuClass = reduceMotion ? "" : "context-menu-pop";
+  /*
+   * 2026-11-15（会话#13）：封面的**模糊过渡动效**。
+   * 用户口径：「给模糊加个过渡动效，同时受设置里的动画效果开关管控」——
+   * 所以这里跟 `enterClass` / `menuClass` 用**同一个** `useReducedMotion()` 判定：
+   * 设置里关掉动画（或系统 prefers-reduced-motion）时，连过渡都不加，直接切换。
+   */
+  const blurTransitionClass = reduceMotion
+    ? ""
+    : " transition-[filter] duration-300 ease-out";
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
@@ -94,6 +117,18 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
   const [settingCover, setSettingCover] = useState(false);
   const coverMenuRef = useRef<HTMLDivElement>(null);
   const [coverMenuPos, setCoverMenuPos] = useState({ left: 8, top: 8 });
+  /*
+   * 2026-11-15（会话#13）：**角色卡片右键 → 模糊化封面**（用户口径）。
+   * 与上面「图集里设封面」的菜单分开：那个是按照片，这个是按角色（改 coverBlurred）。
+   */
+  const [roleMenu, setRoleMenu] = useState<{
+    role: ManualRole;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [blurBusy, setBlurBusy] = useState<number | null>(null);
+  const roleMenuRef = useRef<HTMLDivElement>(null);
+  const [roleMenuPos, setRoleMenuPos] = useState({ left: 8, top: 8 });
 
   /*
    * 自用（2026-11-08 · 会话#11 用户反馈）：右键「设为图集封面」的菜单跑到离鼠标很远的地方 ✗
@@ -125,6 +160,34 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
     setCoverMenuPos({ left, top });
   }, [coverMenu]);
 
+  // 角色卡片右键菜单：同样 portal 到 body + 夹进视口（理由见上）
+  useLayoutEffect(() => {
+    if (!roleMenu) {
+      return;
+    }
+    const margin = 8;
+    const width = roleMenuRef.current?.offsetWidth ?? 180;
+    const height = roleMenuRef.current?.offsetHeight ?? 44;
+    const left = Math.max(
+      margin,
+      Math.min(roleMenu.x, window.innerWidth - width - margin)
+    );
+    const top = Math.max(
+      margin,
+      Math.min(roleMenu.y, window.innerHeight - height - margin)
+    );
+    setRoleMenuPos({ left, top });
+  }, [roleMenu]);
+
+  /*
+   * 2026-11-15（会话#13）：展开/收起图集时通知上层 —— 上层据此把**顶部工具栏**
+   * 换成图集操作栏（用户口径：「返回角色列表」直接替换掉上面那个「角色识别」，
+   * 不要再加一个悬空控件）。
+   */
+  useEffect(() => {
+    onExpandedChange?.(expandedTagId !== null);
+  }, [expandedTagId, onExpandedChange]);
+
   async function setAsCover() {
     if (!coverMenu || settingCover) {
       return;
@@ -144,6 +207,35 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
       setSettingCover(false);
+    }
+  }
+
+  /**
+   * 2026-11-15（会话#13）：右键「模糊化封面 / 取消模糊」。
+   * 只改这条角色记录的 `coverBlurred`，然后让上层刷新列表。
+   */
+  async function toggleCoverBlur(role: ManualRole) {
+    if (blurBusy === role.tagId) {
+      return;
+    }
+    const next = role.coverBlurred !== true;
+    setBlurBusy(role.tagId);
+    try {
+      await faceActions.setManualRoleCoverBlur({
+        blurred: next,
+        tagId: role.tagId,
+      });
+      setRoleMenu(null);
+      toast.success(
+        t(next ? "manualRolesCoverBlurred" : "manualRolesCoverUnblurred", {
+          name: role.tagName,
+        })
+      );
+      onRenamed?.();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBlurBusy(null);
     }
   }
 
@@ -303,13 +395,14 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
     const list = photos[expandedRole.tagId] ?? [];
     const chosen = selection[expandedRole.tagId] ?? new Set<number>();
     const loadingThis = loadingId === expandedRole.tagId;
-    return (
-      <section
-        className={`${enterClass} mb-5`}
-        /* key 不同 → 切换时 React 重新挂载，入场动画才会**每次**播放 ✓ */
-        key={`album-${expandedRole.tagId}`}
-      >
-        <div className="mb-3 flex flex-wrap items-center gap-2">
+    /*
+     * 2026-11-15（会话#13）：**不再做悬空吸顶条**（用户反馈：间隔太大、还镂空）。
+     * 改成把这一栏**搬进页面顶部工具栏**：people.tsx 在同一排留了挂载点
+     * （`ALBUM_BAR_SLOT_ID`），展开图集时它替换掉原来的「角色识别」入口；
+     * 没有挂载点（例如单测环境）时退回渲染在列表上方，功能不缺。
+     */
+    const albumBar = (
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <button
             className="flex items-center gap-1 rounded-[6px] border border-border bg-card px-2.5 py-1.5 text-[12px] text-foreground transition-colors hover:bg-foreground/5"
             onClick={() => setExpandedTagId(null)}
@@ -366,7 +459,26 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
               </button>
             </>
           )}
-        </div>
+      </div>
+    );
+
+    const albumBarSlot =
+      typeof document === "undefined"
+        ? null
+        : document.getElementById(ALBUM_BAR_SLOT_ID);
+
+    return (
+      <section
+        className={`${enterClass} mb-5`}
+        /* key 不同 → 切换时 React 重新挂载，入场动画才会**每次**播放 ✓ */
+        key={`album-${expandedRole.tagId}`}
+      >
+        {albumBarSlot ? (
+          createPortal(albumBar, albumBarSlot)
+        ) : (
+          // 没有挂载点（单测 / 页面结构变化）时退回列表上方，功能不缺
+          <div className="mb-2">{albumBar}</div>
+        )}
 
         {loadingThis ? (
           <div className="flex items-center gap-2 py-6 text-[12px] text-muted-foreground">
@@ -508,6 +620,10 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
             <div
               className="overflow-hidden rounded-[10px] border border-border bg-card"
               key={role.tagId}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                setRoleMenu({ role, x: event.clientX, y: event.clientY });
+              }}
             >
               <div>
                 {/* 封面 + 右上角「展开图集」按钮（未展开时占满卡片宽度） */}
@@ -515,7 +631,15 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
                   {role.thumbnailPath ? (
                     <img
                       alt=""
-                      className="h-full w-full object-cover"
+                      className={`h-full w-full object-cover${blurTransitionClass} ${
+                        /*
+                         * 2026-11-15（会话#13）：
+                         *   · 模糊度用 blur-sm（用户口径：「太模糊了，改成鼠标放上去之后的那个模糊度」）；
+                         *   · **不再叠加 scale** —— 之前 blur 和 1.05 缩放一起收回，解除模糊时会"抽一下"；
+                         *   · 未模糊时显式写 `blur-none`，让 filter 始终有值、过渡可插值（否则从"有滤镜"跳到"无"）。
+                         */
+                        role.coverBlurred ? "blur-sm" : "blur-none"
+                      }`}
                       loading="lazy"
                       src={toLocalMediaUrl(role.thumbnailPath)}
                     />
@@ -607,6 +731,40 @@ export function ManualRolesSection({ roles, onRenamed }: ManualRolesSectionProps
           );
         })}
       </div>
+
+      {/*
+        2026-11-15（会话#13）：角色卡片右键 → 模糊化封面 / 取消模糊。
+        ⚠️ 必须挂在**卡片视图**这个 return 里（不是展开图集那个），否则右键后状态变了但菜单不渲染。
+      */}
+      {roleMenu &&
+        createPortal(
+          <>
+            <button
+              aria-label={t("close")}
+              className="fixed inset-0 z-[999] cursor-default"
+              onClick={() => setRoleMenu(null)}
+              type="button"
+            />
+            <div
+              className={`${menuClass} fixed z-[1000] min-w-[180px] overflow-hidden rounded-[8px] border border-border bg-popover p-1 shadow-xl`}
+              ref={roleMenuRef}
+              style={roleMenuPos}
+            >
+              <button
+                className="flex w-full items-center gap-2 rounded-[6px] px-2.5 py-2 text-left text-[12px] text-foreground hover:bg-muted disabled:opacity-50"
+                disabled={blurBusy === roleMenu.role.tagId}
+                onClick={() => void toggleCoverBlur(roleMenu.role)}
+                type="button"
+              >
+                <EyeOff className="h-3.5 w-3.5" />
+                {roleMenu.role.coverBlurred
+                  ? t("manualRolesUnblurCover")
+                  : t("manualRolesBlurCover")}
+              </button>
+            </div>
+          </>,
+          document.body
+        )}
 
       {lightbox && (
         <PhotoLightbox

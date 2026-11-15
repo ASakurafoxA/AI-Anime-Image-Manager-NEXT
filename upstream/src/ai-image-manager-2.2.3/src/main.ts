@@ -66,6 +66,10 @@ import {
   setupSendToShortcut,
 } from "@/services/sendto-integration";
 import { getSetting } from "@/services/settings-manager";
+import {
+  noteLocalMediaRequest,
+  readLocalMediaStats,
+} from "@/services/main-thread-work";
 import { generateThumbnail, getThumbnailDir } from "@/services/thumbnailer";
 import {
   getTrackedChildProcessCount,
@@ -181,7 +185,16 @@ fs.writeFileSync(
 );
 
 app.on("child-process-gone", (_event, details) => {
-  if (details.reason === "clean-exit") {
+  /*
+   * 2026-11-16（会话#13）：**退出过程中不记故障**。
+   *
+   * 用户实测：故障面板常年挂着 2~3 条「网络服务子进程 killed / crashed」，
+   * 实际上全是**关软件 / 注销**那一刻 Chromium 收走子进程的正常收尾：
+   *   · killed 1073807364  = 0x40010004（Chromium 主动结束子进程用的码）
+   *   · crashed -1073741205 = 0xC000026B（STATUS_DLL_INIT_FAILED_LOGOFF，注销打断）
+   * 它们不是故障，记下来只会把真故障埋掉（待办「现在做」第 2 条）。
+   */
+  if (isQuitting || details.reason === "clean-exit") {
     return;
   }
   const message = `${details.type} process exited: ${details.reason} (${details.exitCode})`;
@@ -1589,6 +1602,8 @@ async function renderLocalMedia(resolved: string): Promise<Response> {
   }
   const ext = path.extname(resolved).toLowerCase();
   const buffer = await fs.promises.readFile(resolved);
+  // 2026-11-15（会话#13）：排查用 —— 记一次缩略图/原图请求（只计数，不影响响应）
+  noteLocalMediaRequest(buffer.length);
   if (BROWSER_COMPATIBLE_EXTENSIONS.has(ext)) {
     return new Response(buffer, {
       headers: {
@@ -1707,6 +1722,29 @@ app.whenReady().then(async () => {
     setupSendToShortcut();
 
     log.info("Window ready — starting background services...");
+
+    /*
+     * 临时排查开关（2026-11-15 · 会话#13）：**只给 dev 用，诊断完删除**。
+     * 设 `AIM_DEV_AUTO_ANALYZE=1` 时，启动 12 秒后自动跑一次「给已有角色补漏」
+     * （`dryRun: true`，不写库），用来在没人点击的情况下复现"比对慢"。
+     */
+    if (!app.isPackaged && process.env.AIM_DEV_AUTO_ANALYZE === "1") {
+      setTimeout(() => {
+        void (async () => {
+          try {
+            const { analyzeUnnamedCharacters } = await import(
+              "@/services/character-suggest"
+            );
+            const result = await analyzeUnnamedCharacters({ dryRun: true });
+            log.info(
+              `[DevProbe] auto analyze finished（角色 ${result.characterCount} / 候选 ${result.candidateCount}）`
+            );
+          } catch (error) {
+            log.warn({ err: error }, "[DevProbe] auto analyze failed");
+          }
+        })();
+      }, 12_000);
+    }
 
     // ── Step 3: Non-blocking background initialization ───────────────
     // GPU detection is now handled on-demand by the Onboarding overlay

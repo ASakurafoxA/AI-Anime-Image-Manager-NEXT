@@ -32,7 +32,10 @@ import {
 } from "@/services/single-named-cache";
 import { clearUnnamedCharacterResults as clearUnnamedCharacterResultsService } from "@/services/character-result-cleanup";
 import { getCharacterSuggestProgress as getCharacterSuggestProgressService } from "@/services/character-suggest";
-import { setManualRoleCover as setManualRoleCoverInStore } from "@/services/character-group-store";
+import {
+  setManualRoleCover as setManualRoleCoverInStore,
+  setManualRoleCoverBlur as setManualRoleCoverBlurInStore,
+} from "@/services/character-group-store";
 import { resolveCharacterFeatureStatus } from "@/services/ccip-model";
 import { getDataPath } from "@/utils/data-path";
 import path from "node:path";
@@ -54,6 +57,7 @@ import {
 } from "@/services/character-group-store";
 import { getFolderSubtreeIds } from "@/services/folder-hierarchy";
 import {
+  clearFolderScopedTagCountCache,
   persistTagCounts,
   readPersistedTagCounts,
   readTagCountCache,
@@ -860,15 +864,78 @@ export const removeTagFromPhotos = os
       tagId: z.number().int().positive(),
     })
   )
-  .handler(({ input }) => {
+  .handler(async ({ input }) => {
     const db = getDatabase();
     const ids = [...new Set(input.photoIds)];
     let removed = 0;
     const CHUNK = 400;
-    db.transaction(() => {
-      for (let i = 0; i < ids.length; i += CHUNK) {
-        const slice = ids.slice(i, i + CHUNK);
-        const result = db
+    /*
+     * 2026-11-15（会话#13）：用户实测「退回未命名的时候也会卡着主进程」——
+     * 和 nameCharacterGroup（打标）一模一样的两个毛病：
+     *   ① 整个删除包在一个同步事务里（最多 3000 张），中间不让出主线程；
+     *   ② 删完 `invalidateTagSearch()` → 侧栏下次取标签要跑 3~9 秒的**同步**全量统计。
+     * 处理方式也照打标：切小事务 + 块间让出；并按"真正被删掉的关联"给徽标缓存做减法。
+     * 另外原来拼缩略图是**每张图查一次库**（N+1），这里改成一次查完。
+     */
+    const countsBeforePatch = (() => {
+      try {
+        return readTagCountCache(null, getTagSearchRevision());
+      } catch {
+        return null;
+      }
+    })();
+    let parentOfTag: Map<number, number | null> | null = null;
+    if (countsBeforePatch) {
+      try {
+        const tagRows = db
+          .select({ id: tags.id, parentId: tags.parentId })
+          .from(tags)
+          .all();
+        parentOfTag = new Map(tagRows.map((row) => [row.id, row.parentId]));
+      } catch {
+        parentOfTag = null;
+      }
+    }
+    const removedByAncestor = new Map<number, Set<number>>();
+    const noteRemoved = (photoIds: number[]) => {
+      if (!(parentOfTag && photoIds.length > 0)) {
+        return;
+      }
+      let current: number | null = input.tagId;
+      let guard = 0;
+      while (current != null && guard < 16) {
+        let bucket = removedByAncestor.get(current);
+        if (!bucket) {
+          bucket = new Set<number>();
+          removedByAncestor.set(current, bucket);
+        }
+        for (const photoId of photoIds) {
+          bucket.add(photoId);
+        }
+        current = parentOfTag.get(current) ?? null;
+        guard += 1;
+      }
+    };
+
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const slice = ids.slice(i, i + CHUNK);
+      let actuallyLinked: number[] = [];
+      if (parentOfTag) {
+        const existing = db
+          .select({ photoId: photoTags.photoId })
+          .from(photoTags)
+          .where(
+            and(
+              eq(photoTags.tagId, input.tagId),
+              inArray(photoTags.photoId, slice),
+              eq(photoTags.userConfirmed, false)
+            )
+          )
+          .all();
+        actuallyLinked = existing.map((row) => Number(row.photoId));
+      }
+      const result = db.transaction(() =>
+        db
           .delete(photoTags)
           .where(
             and(
@@ -878,26 +945,56 @@ export const removeTagFromPhotos = os
               eq(photoTags.userConfirmed, false)
             )
           )
-          .run();
-        removed += Number(result?.changes ?? 0);
-      }
-    });
+          .run()
+      );
+      removed += Number(result?.changes ?? 0);
+      noteRemoved(actuallyLinked);
+      // 让出一拍：长删除不会整段占住主线程
+      await new Promise((resolve) => setImmediate(resolve));
+    }
     invalidateTagSearch();
+    if (countsBeforePatch && removedByAncestor.size > 0) {
+      try {
+        const patched = new Map(countsBeforePatch);
+        for (const [tagIdKey, photoIdSet] of removedByAncestor) {
+          patched.set(
+            tagIdKey,
+            Math.max(0, (patched.get(tagIdKey) ?? 0) - photoIdSet.size)
+          );
+        }
+        clearFolderScopedTagCountCache();
+        writeTagCountCache(null, getTagSearchRevision(), patched);
+      } catch {
+        /* 补数失败就退回"下次重算"，不影响正确性 */
+      }
+    }
 
     // 把这批图作为新的"待命名组"放回缓存，用户回列表就能看到
     const stored = readCharacterGroups();
     if (stored) {
-      const thumbnails = ids
-        .slice(0, 8)
-        .map((id) =>
-          db
-            .select({ thumbnailPath: photos.thumbnailPath, path: photos.path })
-            .from(photos)
-            .where(eq(photos.id, id))
-            .get()
-        )
-        .map((row) => row?.thumbnailPath ?? row?.path ?? null)
-        .filter((value): value is string => typeof value === "string");
+      // 缩略图一次查完（原来是每张图一次查询）
+      const thumbnails: string[] = [];
+      const previewIds = ids.slice(0, 8);
+      if (previewIds.length > 0) {
+        const rows = db
+          .select({
+            id: photos.id,
+            thumbnailPath: photos.thumbnailPath,
+            path: photos.path,
+          })
+          .from(photos)
+          .where(inArray(photos.id, previewIds))
+          .all();
+        const pathById = new Map(
+          rows.map((row) => [row.id, row.thumbnailPath ?? row.path])
+        );
+        for (const photoId of previewIds) {
+          const value = pathById.get(photoId);
+          if (typeof value === "string") {
+            thumbnails.push(value);
+          }
+        }
+      }
       stored.groups = [
         {
           photoIds: ids,
@@ -1404,7 +1501,7 @@ export const nameCharacterGroup = os
       groupIndex: z.number().int().min(0).optional(),
     })
   )
-  .handler(({ input }) => {
+  .handler(async ({ input }) => {
     /*
      * 自用（2026-10-23 · 会话#10）：这里的报错以前全是普通 Error，
      * 经 oRPC 之后界面只显示 "Internal server error"（用户实测：「打不了标」）。
@@ -1559,40 +1656,124 @@ export const nameCharacterGroup = os
       applied: number;
       attempted: number;
     }> = [];
-    db.transaction(() => {
-      for (const [index, target] of allTargets.entries()) {
-        // 第一个名字写全部照片；其余名字只写多人图（没有多人图就跳过）
-        const photoIdsForTarget = index === 0 ? uniqueIds : personSplit.multi;
-        if (photoIdsForTarget.length === 0) {
-          appliedByTag.push({ ...target, applied: 0, attempted: 0 });
-          continue;
-        }
-        const values = photoIdsForTarget.map((photoId) => ({
-          photoId,
-          tagId: target.tagId,
-          confidence,
-          isConfirmed: false,
-          origin: "auto" as const,
-          userConfirmed: false,
-        }));
-        let applied = 0;
-        for (let i = 0; i < values.length; i += CHUNK) {
-          const result = db
-            .insert(photoTags)
-            .values(values.slice(i, i + CHUNK))
-            .onConflictDoNothing()
-            .run();
-          applied += Number(result?.changes ?? 0);
-        }
-        inserted += applied;
-        appliedByTag.push({
-          ...target,
-          applied,
-          attempted: values.length,
-        });
+    /*
+     * 2026-11-15（会话#13）：**写入不再"一个长事务占住主线程"，并且顺带把侧栏徽标
+     * 改成"增量补数"**（用户实测：打完标整个界面停住）。
+     *   · 每 200 行一个小事务，块间 `setImmediate` 让出一拍 → 界面 / IPC 能插进来；
+     *   · 记录"这次真正新增了哪些 (标签, 照片)"，打完直接补进徽标缓存，
+     *     这样侧栏不必再跑一次全量统计（那条同步 SQL 实测 3~9 秒）。
+     * 缓存不存在 / 结构异常时自动退回老行为（下次按需重算），不影响正确性。
+     */
+    const countsBeforePatch = (() => {
+      try {
+        return readTagCountCache(null, getTagSearchRevision());
+      } catch {
+        return null;
       }
-    });
+    })();
+    let parentOfTag: Map<number, number | null> | null = null;
+    if (countsBeforePatch) {
+      try {
+        const tagRows = db
+          .select({ id: tags.id, parentId: tags.parentId })
+          .from(tags)
+          .all();
+        parentOfTag = new Map(tagRows.map((row) => [row.id, row.parentId]));
+      } catch {
+        parentOfTag = null;
+      }
+    }
+    const deltaByTag = new Map<number, Set<number>>();
+    const noteAddedPhotos = (targetTagId: number, photoIds: number[]) => {
+      if (!(parentOfTag && photoIds.length > 0)) {
+        return;
+      }
+      // 标签自己 + 所有祖先都要 +1（祖先的徽标是"子树去重计数"）
+      let current: number | null = targetTagId;
+      let guard = 0;
+      while (current != null && guard < 16) {
+        let bucket = deltaByTag.get(current);
+        if (!bucket) {
+          bucket = new Set<number>();
+          deltaByTag.set(current, bucket);
+        }
+        for (const photoId of photoIds) {
+          bucket.add(photoId);
+        }
+        current = parentOfTag.get(current) ?? null;
+        guard += 1;
+      }
+    };
+
+    for (const [index, target] of allTargets.entries()) {
+      // 第一个名字写全部照片；其余名字只写多人图（没有多人图就跳过）
+      const photoIdsForTarget = index === 0 ? uniqueIds : personSplit.multi;
+      if (photoIdsForTarget.length === 0) {
+        appliedByTag.push({ ...target, applied: 0, attempted: 0 });
+        continue;
+      }
+      const values = photoIdsForTarget.map((photoId) => ({
+        photoId,
+        tagId: target.tagId,
+        confidence,
+        isConfirmed: false,
+        origin: "auto" as const,
+        userConfirmed: false,
+      }));
+      let applied = 0;
+      for (let i = 0; i < values.length; i += CHUNK) {
+        const slice = values.slice(i, i + CHUNK);
+        const chunkPhotoIds = slice.map((row) => row.photoId);
+        let newlyAdded: number[] = [];
+        if (parentOfTag) {
+          const existing = db
+            .select({ photoId: photoTags.photoId })
+            .from(photoTags)
+            .where(
+              and(
+                eq(photoTags.tagId, target.tagId),
+                inArray(photoTags.photoId, chunkPhotoIds)
+              )
+            )
+            .all();
+          const existingIds = new Set(
+            existing.map((row) => Number(row.photoId))
+          );
+          newlyAdded = chunkPhotoIds.filter(
+            (photoId) => !existingIds.has(photoId)
+          );
+        }
+        const result = db.transaction(() =>
+          db.insert(photoTags).values(slice).onConflictDoNothing().run()
+        );
+        applied += Number(result?.changes ?? 0);
+        noteAddedPhotos(target.tagId, newlyAdded);
+        // 让出一拍：长写入不会整段占住主线程
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      inserted += applied;
+      appliedByTag.push({
+        ...target,
+        applied,
+        attempted: values.length,
+      });
+    }
     invalidateTagSearch();
+    if (countsBeforePatch && deltaByTag.size > 0) {
+      try {
+        const patched = new Map(countsBeforePatch);
+        for (const [tagIdKey, photoIdSet] of deltaByTag) {
+          patched.set(
+            tagIdKey,
+            (patched.get(tagIdKey) ?? 0) + photoIdSet.size
+          );
+        }
+        clearFolderScopedTagCountCache();
+        writeTagCountCache(null, getTagSearchRevision(), patched);
+      } catch {
+        /* 补数失败就退回"下次重算"，不影响正确性 */
+      }
+    }
 
     /*
      * 自用（2026-11-11 用户报「只命名了 1 张，剩 18 张同角色，但整组也一起消失了」）：
@@ -1749,6 +1930,23 @@ export const setManualRoleCover = os
       input.photoId,
       input.thumbnailPath ?? null
     );
+    return { updated };
+  });
+
+/**
+ * 自用（2026-11-15 · 会话#13）：**把角色卡片封面模糊化 / 取消模糊**。
+ * 用户口径：「给创建的角色相册增加右键选择模糊化封面的功能」。
+ * 只是人物页卡片的显示开关，不动照片、不动标签、不影响展开图集里的原图。
+ */
+export const setManualRoleCoverBlur = os
+  .input(
+    z.object({
+      blurred: z.boolean(),
+      tagId: z.number().int().positive(),
+    })
+  )
+  .handler(({ input }) => {
+    const updated = setManualRoleCoverBlurInStore(input.tagId, input.blurred);
     return { updated };
   });
 

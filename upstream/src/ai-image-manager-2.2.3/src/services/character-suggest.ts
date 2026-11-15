@@ -21,6 +21,8 @@
  */
 
 import { inArray, isNull, sql } from "drizzle-orm";
+import { app } from "electron";
+import { monitorEventLoopDelay, PerformanceObserver } from "node:perf_hooks";
 import path from "node:path";
 import { getDatabase } from "@/db";
 import { photoTags, photos, tags } from "@/db/schema";
@@ -29,7 +31,13 @@ import {
   readCentroidStore,
   writeCentroidStore,
 } from "@/services/character-centroid-store";
+import {
+  beginMainThreadHeavyWork,
+  endMainThreadHeavyWork,
+  readLocalMediaStats,
+} from "@/services/main-thread-work";
 import { getDataPath } from "@/utils/data-path";
+import { createCcipSearchWorkerSession } from "@/services/ai/ccip-search-worker";
 import {
   createCcipSearchSession,
   getCcipVectorCount,
@@ -42,6 +50,78 @@ import {
   resolveCharacterFeatureStatus,
   type CharacterFeatureStatus,
 } from "@/services/ccip-model";
+
+/**
+ * 排查用日志（2026-11-15 · 会话#13）：**只在 dev 版输出**。
+ *
+ * 用户口径「日志只放 dev 版本」：打包版不写这些行，免得发布包日志被刷屏、
+ * 也免得别人拿着安装版来对排查数据。
+ */
+function devLog(message: string): void {
+  if (!app.isPackaged) {
+    console.log(message);
+  }
+}
+
+/*
+ * 2026-11-15（会话#13）：**GC 计时器**（只在 dev 版）。
+ *
+ * 离线实测同一批查询只要 10ms，应用里却要 300~2200ms，且越来越慢、最后直接卡住。
+ * 除了"主线程被别的活堵住"，另一种可能是**垃圾回收抖动**：
+ * 每次查询都会把 300 行 × 768 维向量materialize 成 JS 对象（约 1MB），
+ * 300 个角色就是上百次、上亿个数字 → 频繁 major GC 会让主线程整段停住。
+ * 这里只累计 GC 总时长，配合每批的「主线程延迟」就能分清到底是"别人占着"还是"自己在回收"。
+ */
+let gcTotalMs = 0;
+let gcObserverStarted = false;
+
+/*
+ * 2026-11-15（会话#13）：**事件循环停顿监视器**（只在 dev 版）。
+ *
+ * 现场：worker 自报每次查询 10~13ms，主进程侧却要等 1757~5624ms；
+ * 而"每批开头"的 setTimeout(0) 只等 1~67ms —— 说明停顿发生在**发送之后**，
+ * 那个探针测不到。这里用 perf_hooks 的记录直方图，逐批读出最大停顿。
+ */
+let loopDelayHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
+
+function ensureLoopMonitor(): void {
+  if (loopDelayHistogram) {
+    return;
+  }
+  try {
+    loopDelayHistogram = monitorEventLoopDelay({ resolution: 20 });
+    loopDelayHistogram.enable();
+  } catch {
+    loopDelayHistogram = null;
+  }
+}
+
+/** 读一次"自上次调用以来的最大事件循环停顿（毫秒）"，然后清零。 */
+function takeLoopStallMs(): number {
+  if (!loopDelayHistogram) {
+    return 0;
+  }
+  const maxMs = Math.round(Number(loopDelayHistogram.max) / 1e6);
+  loopDelayHistogram.reset();
+  return maxMs;
+}
+
+function ensureGcObserver(): void {
+  if (gcObserverStarted) {
+    return;
+  }
+  gcObserverStarted = true;
+  try {
+    const observer = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        gcTotalMs += entry.duration;
+      }
+    });
+    observer.observe({ entryTypes: ["gc"] });
+  } catch {
+    /* 取不到就当作 0，不影响分析 */
+  }
+}
 
 /**
  * 角色识别的特征源解析（自用 2026-10）。
@@ -589,10 +669,18 @@ export function analyzeUnnamedCharacters(
   options: AnalyzeCharacterOptions = {}
 ): Promise<CharacterAnalysisResult> {
   if (analysisInFlight) {
-    console.log("[CharacterSuggest] 已有一轮分析在跑，复用这一次的结果");
+    devLog("[CharacterSuggest] 已有一轮分析在跑，复用这一次的结果");
     return analysisInFlight;
   }
+  /*
+   * 2026-11-15（会话#13）：**分析一开始就占「主进程重活」标记**。
+   * 后台的孤儿记录检查 / 缩略图缓存统计 / 向量库维护据此让路，
+   * 免得刚开软件就点识别时，两边抢同一块盘把比对拖慢十几倍（用户实测）。
+   * 结束（含抛错）一定清掉，否则后台维护会一直被挡住。
+   */
+  beginMainThreadHeavyWork();
   analysisInFlight = runCharacterAnalysis(options).finally(() => {
+    endMainThreadHeavyWork();
     analysisInFlight = null;
     /*
      * 2026-11-14（会话#12）：这里**必须**把进度清掉。
@@ -606,6 +694,8 @@ export function analyzeUnnamedCharacters(
 async function runCharacterAnalysis(
   options: AnalyzeCharacterOptions = {}
 ): Promise<CharacterAnalysisResult> {
+  ensureGcObserver();
+  ensureLoopMonitor();
   // 先定特征源：首选 CCIP；缺失则按用户口径抛错（不静默回退）。
   const { loadVectors, search, status: featureAccess } =
     await resolveCharacterFeatureAccess();
@@ -701,12 +791,34 @@ async function runCharacterAnalysis(
     centroidStore.linkCount === linkCount &&
     centroidStore.maxLinkId === maxLinkId;
 
+  /*
+   * 2026-11-15（会话#13）：**进度必须在这里初始化**，不能只放在"重算质心"那条分支里。
+   *
+   * 11-14 加了质心磁盘缓存之后，「命中缓存」这条路会跳过下面的分支 →
+   * `suggestProgress` 一直是 null → `getCharacterSuggestProgress` 返回 0 毫秒、
+   * phase 恒为 idle → 界面永远显示「已用 1 秒」（用户实测截图），
+   * 而且「读取 / 比对」两个分段数永远不出现。
+   * 放在分支之前，三条路（磁盘缓存 / 内存缓存 / 重算）都能报进度。
+   */
+  suggestProgress = {
+    done: 0,
+    elapsedMs: 0,
+    phase: "seeds",
+    seedsMs: 0,
+    searchMs: 0,
+    startedAt: Date.now(),
+    total: namedIds.size,
+  };
+
   let centroids: CharacterCentroid[];
   let seedPhotoCount: number;
+  /** 本次质心从哪来的：disk = 磁盘缓存 / memory = 内存缓存 / recompute = 重新读特征 */
+  let centroidSource: "disk" | "memory" | "recompute" = "recompute";
   const seedsStartedAt = performance.now();
   const minSeedCount = options.minSeedCount ?? DEFAULTS.minSeedCount;
   if (storeHit && centroidStore) {
     // 磁盘缓存命中：直接由"每个角色的向量和"算出质心，完全不读特征
+    centroidSource = "disk";
     centroids = [];
     seedPhotoCount = 0;
     for (const row of centroidStore.rows) {
@@ -725,24 +837,16 @@ async function runCharacterAnalysis(
         centroid: normalize(mean),
       });
     }
-    console.log(
+    devLog(
       `[CharacterSuggest] 命中质心磁盘缓存（${centroids.length} 个角色），跳过特征读取`
     );
   } else if (cacheHit && centroidCache) {
+    centroidSource = "memory";
     centroids = centroidCache.centroids;
     seedPhotoCount = centroidCache.seedPhotos;
-    console.log("[CharacterSuggest] 命中特征中心缓存，跳过种子向量读取");
+    devLog("[CharacterSuggest] 命中特征中心缓存，跳过种子向量读取");
   } else {
     const seedPhotoIds = [...namedIds];
-    suggestProgress = {
-      done: 0,
-      elapsedMs: 0,
-      phase: "seeds",
-      seedsMs: 0,
-      searchMs: 0,
-      startedAt: Date.now(),
-      total: seedPhotoIds.length,
-    };
     /*
      * 2026-11-14（会话#12 · 性能）：**流式累加，不再保存全部种子向量**。
      *
@@ -805,6 +909,10 @@ async function runCharacterAnalysis(
       version: 1,
     });
   }
+  const seedsMs = Math.round(performance.now() - seedsStartedAt);
+  devLog(
+    `[CharacterSuggest] 质心就绪｜来源=${centroidSource}｜角色=${centroids.length}｜种子图=${seedPhotoCount}｜读取=${seedsMs}ms`
+  );
   const ranked = [...centroids].sort((a, b) => b.seedCount - a.seedCount);
   const considered = ranked.slice(0, MAX_CHARACTERS_PER_RUN);
   const searchStartedAt = performance.now();
@@ -817,9 +925,7 @@ async function runCharacterAnalysis(
    * 所以**不再在分析前刷新句柄**：启动时打开的句柄本身就是最新版本，够用。
    */
   if (suggestProgress) {
-    suggestProgress.seedsMs = Math.round(
-      performance.now() - (seedsStartedAt ?? searchStartedAt)
-    );
+    suggestProgress.seedsMs = seedsMs;
   }
 
   // 按角色检索最像的图，只保留「未命名」的
@@ -832,30 +938,117 @@ async function runCharacterAnalysis(
    * 2026-11-14（会话#12）：批量检索走**独立连接**。
    * 常驻句柄在 app 里 300ms/次（300 次要 90 秒），而独立连接实测 15ms/次。
    */
-  const session = featureAccess.source === "ccip"
-    ? await createCcipSearchSession()
-    : null;
+  /*
+   * 2026-11-15（会话#13）：**优先用独立进程查**（三级降级）。
+   *
+   * 实测同一条查询：应用主进程 650~2000ms，而新进程 7~10ms；已逐一排除
+   * 索引/全表扫描/Electron 运行时/双连接/真实质心向量/libuv 线程池/单核/GC/主线程。
+   * 所以比对整体搬进 worker。三级顺序：
+   *   ① 独立进程（首选，实测就是 10ms 级，卡住还能被杀）
+   *   ② 进程内独立连接（11-14 的老方案）
+   *   ③ 常驻句柄（最后兜底）
+   */
+  const workerSession =
+    featureAccess.source === "ccip" ? await createCcipSearchWorkerSession() : null;
+  const session =
+    workerSession ??
+    (featureAccess.source === "ccip" ? await createCcipSearchSession() : null);
+  devLog(
+    `[CharacterSuggest] 检索连接=${
+      workerSession ? "独立进程" : session ? "独立连接" : "常驻（前两级都没建立）"
+    }`
+  );
   const searchFn = session?.search ?? search;
   const SEARCH_CONCURRENCY = 3;
   const perTag: TagCandidateHits[] = [];
   let searchUnavailable = false;
+  /*
+   * 2026-11-15（会话#13）：记「最慢一批」和慢批次数。
+   * 慢的现场是"某一批突然 1 秒以上、下一批又回到十几毫秒"——只有分批量出来，
+   * 才分得清是撞上了别的活（后台统计 / 维护 / 缩略图），还是索引本身变慢。
+   */
+  let slowestBatchMs = 0;
+  let slowBatchCount = 0;
+  /** 整轮里主线程延迟的最大值（配合慢批次判断"是查询慢还是主线程堵"） */
+  let slowestTickMs = 0;
+  /*
+   * 2026-11-15（会话#13）：**worker 在时一次跑完**。
+   *
+   * 现场实测：worker 收到消息 0~1ms、算完 10ms，但主进程"读回包"一次要 2.4~7.2 秒，
+   * 逐批往返 139 次 → 4 分钟。整批只发一次后，总耗时与往返次数无关，
+   * 即使单次回程仍要几秒，整轮也只是"几秒"。
+   */
+  if (workerSession) {
+    if (suggestProgress) {
+      suggestProgress.phase = "search";
+      suggestProgress.total = considered.length;
+    }
+    const perTagAll = await workerSession.searchAll(
+      considered.map((centroid) => Array.from(centroid.centroid)),
+      considered.map((centroid) => ({
+        tagId: centroid.tagId,
+        tagName: centroid.tagName,
+        seedCount: centroid.seedCount,
+      })),
+      [...unnamedIds],
+      PER_CHARACTER_LIMIT
+    );
+    if (!perTagAll) {
+      searchUnavailable = true;
+    } else {
+      perTag.push(...perTagAll);
+      if (suggestProgress) {
+        suggestProgress.done = considered.length;
+      }
+    }
+  }
+  // 没有 worker（降级路径）时才逐批查；worker 路径已经在上面的 searchAll 里跑完
+  if (!workerSession) {
   for (
     let start = 0;
     start < considered.length;
     start += SEARCH_CONCURRENCY
   ) {
     const batch = considered.slice(start, start + SEARCH_CONCURRENCY);
+    const batchStartedAt = performance.now();
     /*
      * 2026-11-14（会话#12）：单批加 60 秒看门狗。
      * 维护任务（压缩/建索引）与检索撞车时，LanceDB 的查询可能长时间不返回，
      * 表现为界面永远"分析中"。超时就当作"向量库暂时不可用"，让整轮尽快结束并清掉进度。
      */
+    const queriesStartedAt = performance.now();
+    const cpuStartedAt = process.cpuUsage();
+    const gcBefore = gcTotalMs;
+    const mediaBefore = readLocalMediaStats();
+    /*
+     * 2026-11-15（会话#13）：**事件循环延迟探针**。
+     *
+     * 离线实测同一张表：用索引 11ms、强制全表扫描也只要 53ms；而应用里同一批
+     * 3 个角色要 500~2200ms，且"其中查询"占满整批。两种可能：
+     *   ① 原生查询本身在应用里变慢；
+     *   ② 查询很快，主线程被别的活（缩略图请求、补扫、后台任务）占住，
+     *      Promise 的回调排队才回到 JS —— 那整批耗时也会算进"查询"里。
+     * 这里在发查询**之前**排一个 setTimeout(0)：JS 空闲的话它 1~2ms 就触发；
+     * 若它等到几百毫秒才触发，说明主线程确实被堵，②成立。
+     */
+    const tickStartedAt = performance.now();
+    let tickDelayMs = 0;
+    const tickDone = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        tickDelayMs = performance.now() - tickStartedAt;
+        resolve();
+      }, 0);
+    });
     const hitsPerCentroid = await Promise.race([
       Promise.all(
         batch.map((centroid) => searchFn(centroid.centroid, PER_CHARACTER_LIMIT))
       ),
       new Promise<null>((resolve) => setTimeout(() => resolve(null), 60_000)),
     ]);
+    await tickDone;
+    const queriesMs = performance.now() - queriesStartedAt;
+    const cpuDelta = process.cpuUsage(cpuStartedAt);
+    const cpuMs = Math.round((cpuDelta.user + cpuDelta.system) / 1000);
     if (!hitsPerCentroid) {
       console.warn("[CharacterSuggest] 检索批次超时 60s，提前结束本轮");
       searchUnavailable = true;
@@ -886,14 +1079,37 @@ async function runCharacterAnalysis(
         hits: hits.filter((hit) => unnamedIds.has(hit.photoId)),
       });
     }
+    const batchMs = performance.now() - batchStartedAt;
+    slowestBatchMs = Math.max(slowestBatchMs, batchMs);
+    slowestTickMs = Math.max(slowestTickMs, tickDelayMs);
+    const gcMs = Math.round(gcTotalMs - gcBefore);
+    const loopStallMs = takeLoopStallMs();
+    const mediaAfter = readLocalMediaStats();
+    const mediaRequests = mediaAfter.requests - mediaBefore.requests;
+    const mediaMB =
+      Math.round(((mediaAfter.bytes - mediaBefore.bytes) / 1_048_576) * 10) / 10;
+    if (batchMs >= 500) {
+      slowBatchCount += 1;
+      devLog(
+        `[CharacterSuggest] 慢批次：${Math.round(batchMs)}ms（其中查询 ${Math.round(queriesMs)}ms、CPU ${cpuMs}ms、主线程延迟 ${Math.round(tickDelayMs)}ms、主线程最大停顿 ${loopStallMs}ms、GC ${gcMs}ms、缩略图请求 ${mediaRequests} 次/${mediaMB}MB）/ ${batch.length} 个角色（从第 ${start} 个起）`
+      );
+    }
     if (searchUnavailable) {
       break;
     }
     // 让出一拍，缩略图/IO 能插进来（用户实测：列表渲染时比对被饿死）
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
+  }
 
   await session?.close();
+
+  const searchMs = Math.round(performance.now() - searchStartedAt);
+  devLog(
+    `[CharacterSuggest] 比对完成｜角色=${considered.length}｜比对=${searchMs}ms｜最慢一批=${Math.round(slowestBatchMs)}ms｜慢批次=${slowBatchCount}｜主线程最大延迟=${Math.round(slowestTickMs)}ms｜连接=${
+      workerSession ? "独立进程（整批一次）" : session ? "独立连接" : "常驻"
+    }`
+  );
 
   const proposals = mergeCandidateHits(perTag, options);
   const candidateCount = proposals.reduce(

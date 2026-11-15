@@ -85,6 +85,9 @@ export const faceActions = {
     photoId: number;
     thumbnailPath?: string | null;
   }) => ipc.client.photos.setManualRoleCover(input),
+  /** 角色卡片封面模糊化 / 取消模糊（2026-11-15 · 右键菜单） */
+  setManualRoleCoverBlur: (input: { blurred: boolean; tagId: number }) =>
+    ipc.client.photos.setManualRoleCoverBlur(input),
   /** 多人图里**只认出一个角色**的候选（纯查询，不需要模型） */
   listSingleNamedMultiPersonPhotos: (input: {
     limit?: number;

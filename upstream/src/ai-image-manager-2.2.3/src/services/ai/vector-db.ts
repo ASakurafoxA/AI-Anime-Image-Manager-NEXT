@@ -20,6 +20,7 @@ import { getDatabase } from "@/db";
 import { appSettings, photos } from "@/db/schema";
 import { getDataPath } from "@/utils/data-path";
 import { APP_DISPLAY_NAME } from "@/config/private-build";
+import { isMainThreadHeavyWorkRunning } from "@/services/main-thread-work";
 import { MIN_VECTORS_FOR_INDEX } from "./constants";
 import { getAiControlState } from "./state";
 import { getActiveEmbeddingAdapter } from "./model-adapter";
@@ -316,11 +317,13 @@ const NEGLIGIBLE_MAINTENANCE_VERSIONS = 8;
 /**
  * 自用：跑一次 worker 维护并记日志（耗时与碎片数都来自 worker ✓）。
  *
- * 四道守卫，缺一不可：
+ * 五道守卫，缺一不可：
  *  ① 正在建向量 / 打标 → 不跑（两条链都在写同一张表，实测会把速度从 40+ 拖到 16 张/秒 ✗）。
  *  ② 上一次还没跑完 → 不重入。
  *  ③ 向量库没就绪 → 不跑。
  *  ④ 版本数太少（没什么可清）→ 不跑（省一次子进程 ✓）。
+ *  ⑤ **角色识别分析正在跑 → 不跑**（2026-11-15 · 会话#13）：压缩要读写 ccip 表，
+ *     与分析那 300 次近邻查询用的是同一块盘；用户实测撞上时单次查询会慢十几倍 ✗。
  */
 async function runMaintenanceInWorker(reason: string): Promise<void> {
   if (maintenanceRunning) {
@@ -332,6 +335,12 @@ async function runMaintenanceInWorker(reason: string): Promise<void> {
   if (getAiControlState() !== "idle") {
     log.info(
       `[AI] Maintenance deferred while AI is busy (${getAiControlState()}) — ${reason}`
+    );
+    return;
+  }
+  if (isMainThreadHeavyWorkRunning()) {
+    log.info(
+      `[AI] Maintenance deferred while character analysis is running — ${reason}`
     );
     return;
   }
@@ -695,12 +704,44 @@ async function initializeVectorDB(): Promise<void> {
         existingRowCount
       );
       setVectorCompatibility(compatibility.status);
+      /*
+       * 2026-11-15（会话#13）：**缺指纹但维度一致 → 补写指纹接手，不重建** ✗→✓
+       *
+       * 指纹的含义只是"这堆向量是哪个模型算的"；本版本只有 Chinese-CLIP 是 512 维，
+       * 维度一致就足以判断"没换模型"。旧代码在这里直接 throw → 上层 rebuild →
+       * 把 19.9 万张的 `isAiProcessed` 全清 0；而重建要跑 4~5 小时，
+       * **跑到一半重启又会因"没指纹"再重建一次** → 每开一次软件白烧一轮 GPU。
+       * 现在补写指纹接着用；真正的维度不符仍走重建。
+       */
+      let effectiveStatus = compatibility.status;
       if (
         existingRowCount > 0 &&
-        !isVectorCompatibilitySearchable(compatibility.status)
+        compatibility.status === "missing-fingerprint" &&
+        vectorDimensions ===
+          getActiveEmbeddingAdapter().embeddingSpace.dimensions
+      ) {
+        /*
+         * 2026-11-15（会话#13）：**缺指纹但维度一致 → 补写指纹接手，不重建**。
+         * 指纹只是在说"这堆向量是哪个模型算的"；维度一致即可判断没换模型
+         * （本版本只有 Chinese-CLIP 是 512 维，其它模型的表各自独立）。
+         * 旧代码在这里直接 throw → 上层 rebuild → 把 19.9 万张的 `isAiProcessed`
+         * 全清 0；而重建要跑 4~5 小时，**跑到一半重启又会因"没指纹"再重建**
+         * → 每开一次软件白烧一轮 GPU（用户实测 3 小时两次全量重嵌）。
+         * 记账口径用 `legacy-adoption`：我们接手的正是一份"来源无法校验"的旧库。
+         */
+        await persistActiveVectorFingerprint("legacy-adoption");
+        effectiveStatus = "legacy-compatible";
+        setVectorCompatibility(effectiveStatus);
+        console.log(
+          "[AI] Missing fingerprint but dimensions match — adopted existing vector store (no rebuild)"
+        );
+      }
+      if (
+        existingRowCount > 0 &&
+        !isVectorCompatibilitySearchable(effectiveStatus)
       ) {
         throw new Error(
-          `Vector store is incompatible with active embedding model (${compatibility.status}); rebuild required`
+          `Vector store is incompatible with active embedding model (${effectiveStatus}); rebuild required`
         );
       }
 
@@ -860,7 +901,16 @@ async function initializeVectorDB(): Promise<void> {
 
   const newTable = await db.createEmptyTable("photo_embeddings", schema);
   setPhotoTable(newTable);
-  setVectorCompatibility("empty");
+  /*
+   * 2026-11-15（会话#13）：**建表后立刻落指纹**。
+   *
+   * 指纹说的是"这张表是哪个模型建的"，不是"整库是否跑完"（后者由 `isAiProcessed` 追踪）。
+   * 以前只在"整库跑完（processed === total）"时才写 → 19.9 万张跑到一半重启就永远没指纹 →
+   * 下次启动判 missing-fingerprint → 再重建 → 死循环（用户实测每开一次白烧 4~5 小时）。
+   * 空表天然就是"当前模型建的"，此刻写是准确的；跑到一半的表也只含当前模型的向量。
+   */
+  await persistActiveVectorFingerprint("fresh-build");
+  setVectorCompatibility("empty"); // 保持原来的可观测状态（空表）
   console.log(
     `[AI] Created photo_embeddings table (FixedSizeList<Float32>[${vectorDimensions}], ${model.displayName})`
   );
@@ -2147,6 +2197,28 @@ export async function createCcipSearchSession(): Promise<{
     const lancedb = await import("@lancedb/lancedb");
     const conn = await lancedb.connect(path.join(getDataPath(), "vectors"));
     const table = await conn.openTable(CCIP_TABLE_NAME);
+    /*
+     * 2026-11-15（会话#13）：排查用（只在 dev 版输出）。
+     * 用户真机复现：应用里同一条查询要 650~2000ms，而离线新建连接只要 10ms。
+     * 这里把"这条连接看到的表状态"打出来 —— 版本号 / 行数 / 索引。
+     * 如果版本号或索引跟离线不一致，就说明是"句柄看到的库不一样"，不是查询本身慢。
+     */
+    if (!app.isPackaged) {
+      try {
+        const [version, rows, indices] = await Promise.all([
+          table.version(),
+          table.countRows(),
+          table.listIndices(),
+        ]);
+        const indexText =
+          indices.map((idx) => `${idx.name}/${idx.indexType}`).join(",") || "无索引";
+        console.log(
+          `[AI] 检索会话就绪｜版本=${version}｜行数=${rows}｜索引=${indexText}`
+        );
+      } catch {
+        /* 排查日志失败不影响检索 */
+      }
+    }
     return {
       close: async () => {
         try {

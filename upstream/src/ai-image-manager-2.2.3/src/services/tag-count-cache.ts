@@ -122,6 +122,21 @@ export function clearTagCountCache(): void {
   cacheEntries.clear();
 }
 
+/**
+ * 只清「按文件夹」的缓存，保留全局（`folderId = null`）那一份。
+ *
+ * 2026-11-15（会话#13）：打标之后我们只用"新增照片数"给全局那份做了增量补数，
+ * 按文件夹的视图口径不同（子树范围不一样），没法这样补 → 直接丢掉，下次按需重算。
+ * 用 `clearTagCountCache()` 会把刚补好的全局那份一起清掉，反而又触发一次全量统计。
+ */
+export function clearFolderScopedTagCountCache(): void {
+  for (const [key, entry] of [...cacheEntries.entries()]) {
+    if (entry.folderId !== null) {
+      cacheEntries.delete(key);
+    }
+  }
+}
+
 function snapshotFilePath(): string {
   return path.join(getDataPath(), SNAPSHOT_FILE);
 }

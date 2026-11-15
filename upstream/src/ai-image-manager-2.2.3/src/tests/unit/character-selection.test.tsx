@@ -39,6 +39,7 @@ vi.mock("@/actions/faces", () => ({
     nameCharacterGroup: vi.fn(),
     searchCharacterTags: vi.fn(),
     setManualRoleCover: vi.fn(),
+    setManualRoleCoverBlur: vi.fn(),
   },
 }));
 

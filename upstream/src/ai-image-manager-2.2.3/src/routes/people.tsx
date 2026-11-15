@@ -19,6 +19,7 @@ import {
   CharacterMissingDialog,
 } from "@/components/character-missing-dialog";
 import {
+  ALBUM_BAR_SLOT_ID,
   ManualRolesSection,
   type ManualRole,
 } from "@/components/manual-roles-section";
@@ -164,6 +165,11 @@ export function PeoplePage() {
   const [missingDone, setMissingDone] = useState<Record<number, boolean>>({});
   const [confirmClearUnnamed, setConfirmClearUnnamed] = useState(false);
   const [clearingUnnamed, setClearingUnnamed] = useState(false);
+  /*
+   * 2026-11-15（会话#13）：展开角色图集时，顶部工具栏换「返回角色列表 / 名字 / 张数 / 全选」。
+   * 用户口径：不要悬空控件，直接替换掉上面那个「角色识别」同排元素。
+   */
+  const [albumBarOpen, setAlbumBarOpen] = useState(false);
 
   async function handleBuildFeatures() {
     if (featureBusy || featureRunning) {
@@ -238,12 +244,24 @@ export function PeoplePage() {
         photoIds: targetIds,
       })) as { applied?: number; attempted?: number };
       setMissingDone((prev) => ({ ...prev, [row.tagId]: true }));
-      toast.success(
-        t("characterSuggestionAppliedToast", {
-          applied: result.applied ?? 0,
-          attempted: result.attempted ?? targetIds.length,
-        })
-      );
+      const appliedCount = result.applied ?? 0;
+      /*
+       * 2026-11-15（会话#13）：**新增 0 不等于出错**。
+       * 这份列表是上一次分析的快照，打标不会自动刷新；用户会以为"反复打标都没生效"。
+       * 所以这里说清原因，并指向弹窗右上角的「刷新列表」。
+       */
+      if (appliedCount === 0) {
+        toast.info(
+          t("characterSuggestionAppliedNone", { count: targetIds.length })
+        );
+      } else {
+        toast.success(
+          t("characterSuggestionAppliedToast", {
+            applied: appliedCount,
+            attempted: result.attempted ?? targetIds.length,
+          })
+        );
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
@@ -354,6 +372,14 @@ export function PeoplePage() {
 
       {/* 工具栏：一个「角色识别」入口 + 两项菜单（2026-10-23 合并入口） */}
       <div className="flex flex-wrap items-center gap-2 border-border border-b px-4 py-2 sm:px-6">
+        {/*
+          2026-11-15（会话#13）：**挂载点必须常驻 DOM**（未展开时 `hidden`）。
+          之前是"展开才渲染挂载点"，而 ManualRolesSection 是在**渲染时**查 DOM 的 ——
+          那一刻父组件还没提交，查不到目标 → 退回"渲染在列表上方"，
+          表现就是用户看到的「位置不一样 + 跟着列表滚」。
+          展开时把原来的「角色识别」入口整块藏起来，实现"整排替换"。
+        */}
+        <div className={albumBarOpen ? "hidden" : "contents"}>
         <Popover onOpenChange={setEntryOpen} open={entryOpen}>
           <PopoverTrigger asChild>
             <button
@@ -475,12 +501,21 @@ export function PeoplePage() {
             )}
           </>
         )}
+        </div>
+        {/* 图集操作栏的常驻挂载点（未展开时 hidden，见上面注释） */}
+        <div
+          className={
+            albumBarOpen ? "flex min-w-0 flex-1 items-center gap-2" : "hidden"
+          }
+          id={ALBUM_BAR_SLOT_ID}
+        />
       </div>
 
       {/* 内容：「我创建的角色」；没有角色时给一句引导 */}
       <div className="min-w-0 flex-1 overflow-y-auto p-4 sm:p-6" ref={scrollRef}>
         {manualRoles.length > 0 ? (
           <ManualRolesSection
+            onExpandedChange={setAlbumBarOpen}
             onRenamed={() =>
               void queryClient.invalidateQueries({
                 queryKey: ["faces", "manual-roles"],

@@ -84,6 +84,8 @@ vi.mock("@/components/character-missing-dialog", () => ({
 }));
 
 vi.mock("@/components/manual-roles-section", () => ({
+  // 2026-11-15（会话#13）：people.tsx 也 import 了这个常量（图集操作栏挂载点）
+  ALBUM_BAR_SLOT_ID: "people-album-bar-slot",
   ManualRolesSection: () => <div data-testid="manual-roles" />,
 }));
 

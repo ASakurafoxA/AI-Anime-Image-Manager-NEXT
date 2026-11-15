@@ -50,6 +50,12 @@ export interface ManualCharacterRole {
   thumbnailPath: string | null;
   photoCount: number;
   createdAt: number;
+  /**
+   * 封面是否模糊化（2026-11-15 · 会话#13）。
+   * 用户口径：右键卡片可以把这个角色的封面打码（NSFW 角色在总览里不想被一眼看到）。
+   * 只影响人物页卡片的显示，不动照片、不动标签。
+   */
+  coverBlurred?: boolean;
 }
 
 export interface StoredCharacterGroups {
@@ -102,6 +108,7 @@ export function readCharacterGroups(): StoredCharacterGroups | null {
                 typeof role.photoCount === "number" ? role.photoCount : 0,
               createdAt:
                 typeof role.createdAt === "number" ? role.createdAt : 0,
+              coverBlurred: role.coverBlurred === true,
             }))
         : [],
       groups: raw.groups.map((group) => ({
@@ -403,6 +410,28 @@ export function setManualRoleCover(
       }
       touched = true;
       return { ...role, representativePhotoId, thumbnailPath };
+    });
+  });
+  return touched;
+}
+
+/**
+ * 2026-11-15（会话#13）：**把角色卡片封面模糊化 / 取消模糊**。
+ * 用户口径：右键卡片可以打码，NSFW 角色在总览里不想被一眼看到。
+ * 只改 `manualRoles` 这一条记录，不碰照片、不碰标签，也不影响「展开图集」里的原图。
+ */
+export function setManualRoleCoverBlur(
+  tagId: number,
+  blurred: boolean
+): boolean {
+  let touched = false;
+  withStore((data) => {
+    data.manualRoles = data.manualRoles.map((role) => {
+      if (role.tagId !== tagId) {
+        return role;
+      }
+      touched = true;
+      return { ...role, coverBlurred: blurred };
     });
   });
   return touched;

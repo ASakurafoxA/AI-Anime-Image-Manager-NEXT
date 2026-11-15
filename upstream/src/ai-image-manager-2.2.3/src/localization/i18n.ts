@@ -1080,6 +1080,11 @@ i18n.use(initReactI18next).init({
         manualRolesRename: "改名",
         manualRolesSetCover: "设为图集封面",
         manualRolesCoverUpdated: "已设为图集封面",
+        /* 2026-11-15（会话#13）：角色卡片右键 → 模糊化封面 */
+        manualRolesBlurCover: "模糊化封面",
+        manualRolesUnblurCover: "取消模糊化",
+        manualRolesCoverBlurred: "已模糊化「{{name}}」的封面",
+        manualRolesCoverUnblurred: "已取消「{{name}}」封面的模糊",
         manualRolesBackToList: "返回角色列表",
         manualRolesEntryHint: "点封面右上角的「展开图集」= 进入这个角色的图集",
         manualRolesExpand: "展开图集",
@@ -1842,6 +1847,12 @@ i18n.use(initReactI18next).init({
         characterSuggestionApplied: "已打标",
         characterSuggestionAppliedToast: "已写入 {{applied}} 张（这组共 {{attempted}} 张）",
         characterSuggestionEmpty: "没有发现漏标的图",
+        /*
+         * 2026-11-15（会话#13）：用户实测「反复打标都提示新增 0」——
+         * 列表是上一次分析的快照，打标不会自动刷新；这两句把原因说清楚并给出入口。
+         */
+        characterSuggestionAppliedNone:
+          "这 {{count}} 张本来就有这个标签（新增 0 张）。列表是上一次分析的结果；关掉弹窗、重新点一次「给已有角色补漏」就能刷新。",
         characterSuggestionDescription: "共 {{characters}} 个角色、{{count}} 张图疑似漏标",
         characterDiscoveryApply: "命名",
         peopleFindUnnamedCharactersHint:
@@ -3747,6 +3758,10 @@ i18n.use(initReactI18next).init({
         manualRolesBackToList: "Back to roles",
         manualRolesSetCover: "Set as album cover",
         manualRolesCoverUpdated: "Album cover updated",
+        manualRolesBlurCover: "Blur cover",
+        manualRolesUnblurCover: "Remove cover blur",
+        manualRolesCoverBlurred: "Blurred the cover of {{name}}",
+        manualRolesCoverUnblurred: "Removed the blur on {{name}}'s cover",
         manualRolesEntryHint:
           "Click “Expand gallery” on a cover to open that character’s album",
         manualRolesNoPhotos: "No images under this role yet.",
@@ -4564,6 +4579,8 @@ i18n.use(initReactI18next).init({
         characterSuggestionApplied: "Tagged",
         characterSuggestionAppliedToast: "Tagged {{applied}} of {{attempted}} photos",
         characterSuggestionEmpty: "No missing photos found",
+        characterSuggestionAppliedNone:
+          "All {{count}} photos already have this tag (0 new). The list is a snapshot of the last analysis — close this dialog and click \"Find missing tags\" again to refresh.",
         characterSuggestionDescription: "{{characters}} characters, {{count}} photos look untagged",
         characterDiscoveryApply: "Name",
         peopleFindUnnamedCharactersHint:

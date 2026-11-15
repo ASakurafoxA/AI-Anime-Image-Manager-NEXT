@@ -3,6 +3,7 @@ import { getAiControlState } from "@/services/ai/state";
 import { shutdownTextWorker } from "@/services/ai/text-worker-client";
 import { shutdownTranslationWorker } from "@/services/ai/translation-worker-client";
 import { hasActiveDuplicateScan } from "@/services/duplicate-scan-runtime";
+import { isMainThreadHeavyWorkRunning } from "@/services/main-thread-work";
 import { getSetting, setSetting } from "@/services/settings-manager";
 import {
   closeVectorDB,
@@ -277,8 +278,21 @@ const ORPHAN_SCAN_SETTING_KEY = "maintenance.lastFileOrphanScanAt";
 const THUMBNAIL_CHECK_SETTING_KEY = "maintenance.lastThumbnailCheckAt";
 const BUSY_RETRY_DELAY_MS = 10 * 60 * 1000;
 
-/** 自用：现在是不是有"重活"在跑（查重 / 打标 / 建向量）—— 这种时候后台维护要主动让路 ✓ */
+/**
+ * 自用：现在是不是有"重活"在跑（查重 / 打标 / 建向量 / **角色识别分析**）
+ * —— 这种时候后台维护要主动让路 ✓
+ */
 function isHeavyWorkRunning(): boolean {
+  /*
+   * 2026-11-15（会话#13）：
+   * **角色识别分析也加进来**。它和查重/打标一样是"长时间占主进程 + 读同一块图库盘"，
+   * 却一直不在让路名单里 —— 用户实测「刚开软件就点补漏」会撞上开机补扫、
+   * 孤儿记录检查（3~7.6 秒）、缩略图缓存统计（5~16 秒），比对从 1 秒掉到十几秒 ✗。
+   * 标记由 `services/main-thread-work.ts` 维护，分析一开始就置上、结束（含异常）就清掉。
+   */
+  if (isMainThreadHeavyWorkRunning()) {
+    return true;
+  }
   try {
     if (hasActiveDuplicateScan()) {
       return true;
