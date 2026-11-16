@@ -1,7 +1,7 @@
 # 模型文件怎么拿
 
 本仓库**不含模型权重**：GitHub 单文件硬上限 **100 MB**，而这里最大的几个（WD14 的 `model.onnx` 361 MB、
-中文 CLIP 的 `model_quantized.onnx` 182 MB、PixAI 的 onnx 1.86 GB、CCIP 的 366 MB）都放不下，
+中文 CLIP 的 `model_quantized.onnx` 182 MB、PixAI 的 onnx **解压后 1.86 GB**、CCIP 的 **解压后 366 MB**）都放不下，
 即便塞进 Git LFS，免费额度（1 GB 存储 / 1 GB 月流量）也会被一次 clone 用光。
 所以仓库里只放**来源链接 + SHA256**，模型自己下（或走 Releases / 网盘）。
 
@@ -32,7 +32,7 @@
 > - **中文 CLIP 与 WD14 已随安装包提供**（本地版/WD 的 MSI 里两者都在；NEXT 的打标用 PixAI，WD14 不需要）。
 >   只有从源码自己构建、或者要换模型时，才需要按上表手动补。
 > - 本版只需要三类模型：**中文 CLIP**（语义搜索，随包）、**WD14 或 PixAI**（打标）、**CCIP**（角色识别，可选）✓
-> - **CCIP 是可选模型**，三个版本共用同一个包 `CCIP模型-20261018.zip`（339 MB，含 `model_feat.onnx` + `metrics.json`），
+> - **CCIP 是可选模型**，三个版本共用同一个包 `CCIP模型-20261018.zip`（**压缩包 339 MB / 解压后 366 MB**，含 `model_feat.onnx` + `metrics.json`），
 >   网盘：<https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>　提取码：`6666`　→ 解压到 `<图库>\models\ccip\` ✓
 >   没有它角色识别会自动禁用并提示，其它功能不受影响。
 
