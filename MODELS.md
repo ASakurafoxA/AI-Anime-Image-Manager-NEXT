@@ -92,3 +92,29 @@ Get-FileHash "<刚下载的文件>" -Algorithm SHA256
 >
 > ⚠️ 别和 CCIP 那个链接搞混：CCIP 是 <https://pan.baidu.com/s/1ZBRJIwIB7g1vuiTfoed4fA?pwd=6666>（339 MB，放 `<图库>\models\ccip\`）。
 > 其余模型（中文 CLIP / WD14）都可以直接走官方源，不必放网盘。
+
+---
+
+## CCIP 模型（角色识别）怎么放
+
+> 给每张图算 **768 维角色特征**，只服务「角色识别」三个功能；**不参与打标**，也不影响浏览 / 搜索 / 查重 / 局域网。
+> 三个版本共用同一个包，放一次即可；打标模型（PixAI / WD14）是另一份，见上面的表。
+
+1. 下载 `CCIP-Model-20261018.zip`（**压缩包 339 MB / 解压后 366 MB**；Releases 最新版附件，或 README 里的网盘）。
+2. 解压到 `<图库>\models\`，最终必须是这个结构：
+
+```
+<图库>\models\ccip\model_feat.onnx      (365.8 MB)
+<图库>\models\ccip\metrics.json
+```
+
+3. 重启软件（不用重装、不用重新打标）。第一次用之前先点「获取全库角色特征」。
+
+**放对了的表现**：角色识别页右上角显示「当前使用 CCIP 模型」，两颗识别按钮可点（另需全库打标完成）。
+
+**放错 / 没放**：页面顶部红字「未检测到 CCIP 模型」，按钮变灰，其它功能完全正常。
+常见原因：多套了一层目录（`ccip\CCIP-Model-…\model_feat.onnx`）、zip 没解压、没重启、设置里把「角色识别优先使用 CCIP」关了。
+
+**校验**：`Get-Item "<图库>\models\ccip\model_feat.onnx"` 应约 **365.8 MB**；zip 的 SHA256 开头 `8681DB57…`。
+
+**许可**：`deepghs/ccip_onnx` 声明 **MIT**。

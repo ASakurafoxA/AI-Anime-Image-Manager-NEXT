@@ -138,7 +138,7 @@ git apply --whitespace=nowarn ../patches/next.patch
 - **中文 CLIP（语义搜图）已随安装包提供**，不用单独下。
 - 两个模型**不能互相替代**：PixAI 负责"打标签"，CCIP 负责"认角色"；WD / 本地版用包内的 WD14 打标，**不需要** PixAI。
 - 参考：WD14 上游 <https://huggingface.co/SmilingWolf/wd-vit-tagger-v3>；中文 CLIP 上游 <https://huggingface.co/Xenova/chinese-clip-vit-base-patch16>
-- 放法细节：[CCIP模型安装说明.md](CCIP模型安装说明.md)、[MODELS.md](MODELS.md)
+- 放法细节：[MODELS.md](MODELS.md) 的「CCIP 模型（角色识别）怎么放」一节
 
 ## 构建
 
@@ -146,7 +146,7 @@ git apply --whitespace=nowarn ../patches/next.patch
 npm install
 # 1) 打包（解出完整的运行目录）
 node node_modules/@electron-forge/cli/dist/electron-forge.js package --platform win32 --arch x64
-# 2) 打 MSI（自写 WiX 源，参数见 仓库维护规范.md）
+# 2) 打 MSI（自写 WiX 源；具体参数由维护者本地保存）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-msi-wix.ps1 `
   -ProductName "AI Anime Image Manager NEXT" -ExeName "ai-anime-image-manager-next.exe" -UpgradeCode "2636577f-93de-46c0-8217-f4a360fa2ebf"
 # 版本号默认每次构建自增（要固定再加 -Version 2.2.3.80）
