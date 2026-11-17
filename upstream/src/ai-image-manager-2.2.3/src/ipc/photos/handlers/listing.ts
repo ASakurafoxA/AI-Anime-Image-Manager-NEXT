@@ -17,6 +17,7 @@ import {
 import { app, clipboard } from "electron";
 import type { z } from "zod";
 import { getDatabase } from "@/db";
+import { adoptRelocatedFolderPath } from "@/services/folder-relocation";
 import {
   advancedExifData,
   exifData,
@@ -101,6 +102,19 @@ export const scanFolder = os.input(FolderSchema).handler(({ input }) => {
       throw new ORPCError("BAD_REQUEST", {
         message: `Folder does not exist or is not a directory: ${resolved}`,
       });
+    }
+
+    /*
+     * 2026-11-18（用户口径）：**重新拖入文件夹时，先尝试把"同名且内容几乎一样"的旧记录认回来**。
+     * 拖入走的是 enqueueImport，不经过 indexer 的 scanFolder，所以认回必须放在这里。
+     */
+    try {
+      adoptRelocatedFolderPath(getDatabase(), resolved);
+    } catch (adoptError) {
+      console.warn(
+        "[import] 重新添加时的认回检查失败（按新文件夹处理）：",
+        adoptError instanceof Error ? adoptError.message : String(adoptError)
+      );
     }
 
     const task = enqueueImport(resolved);

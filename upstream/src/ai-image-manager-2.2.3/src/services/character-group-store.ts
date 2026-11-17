@@ -75,8 +75,30 @@ function storeFile(): string {
 
 /** 读取上次的分组结果（没有或损坏都返回 null，调用方回退到"需要重新分析"）。 */
 export function readCharacterGroups(): StoredCharacterGroups | null {
+  const file = storeFile();
+  const parsed = parseStoreFile(file);
+  if (parsed) {
+    return parsed;
+  }
+  /*
+   * 2026-11-18：主文件读不出来（半截 / 被截断）时，退回上一份 `.bak`。
+   * 这样即使某次写盘崩了，用户也不会看到"我创建的角色全没了"。
+   */
+  const backup = parseStoreFile(`${file}.bak`);
+  if (backup) {
+    log.warn("角色分组缓存损坏，已从 .bak 恢复（下次写入会重建主文件）");
+    try {
+      writeFileAtomic(file, JSON.stringify(backup));
+    } catch {
+      /* 恢复失败也不影响本次读取 */
+    }
+    return backup;
+  }
+  return null;
+}
+
+function parseStoreFile(file: string): StoredCharacterGroups | null {
   try {
-    const file = storeFile();
     if (!fs.existsSync(file)) {
       return null;
     }
@@ -131,10 +153,43 @@ export function readCharacterGroups(): StoredCharacterGroups | null {
     };
   } catch (error) {
     log.warn(
-      { err: error instanceof Error ? error.message : String(error) },
+      { err: error instanceof Error ? error.message : String(error), file },
       "读取角色分组缓存失败（当作没有缓存）"
     );
     return null;
+  }
+}
+
+/**
+ * 2026-11-18（会话#14）：**原子写**。
+ *
+ * 用户报过两次「我创建的角色都没了」。除了之前修过的"整份重写把角色冲掉"，
+ * 还有一个更隐蔽的：这里原来是 `writeFileSync(目标)` **直接覆盖** ——
+ * 写到一半崩溃/断电/被杀进程，json 就变成半截（或被截断成空文件），
+ * 下次读不出来 → 角色列表凭空消失。
+ *
+ * 现在：先写同目录的临时文件，再 `renameSync` 原子替换（同一卷内 rename 是原子的），
+ * 并保留上一份为 `.bak` 兜底。任何一步失败都不会破坏原文件。
+ */
+function writeFileAtomic(target: string, text: string): void {
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, text, "utf-8");
+  try {
+    if (fs.existsSync(target)) {
+      try {
+        fs.copyFileSync(target, `${target}.bak`);
+      } catch {
+        /* 备份失败不影响主流程 */
+      }
+    }
+    fs.renameSync(tmp, target);
+  } catch (error) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* ignore */
+    }
+    throw error;
   }
 }
 
@@ -151,7 +206,7 @@ export function writeCharacterGroups(data: StoredCharacterGroups): void {
      */
     const existing = readCharacterGroups();
     const merged = mergeManualRoles(existing?.manualRoles ?? [], data.manualRoles ?? []);
-    fs.writeFileSync(storeFile(), JSON.stringify({ ...data, manualRoles: merged }), "utf-8");
+    writeFileAtomic(storeFile(), JSON.stringify({ ...data, manualRoles: merged }));
   } catch (error) {
     log.warn(
       { err: error instanceof Error ? error.message : String(error) },
@@ -186,7 +241,7 @@ function mergeManualRoles(
  */
 function writeCharacterGroupsRaw(data: StoredCharacterGroups): void {
   try {
-    fs.writeFileSync(storeFile(), JSON.stringify(data), "utf-8");
+    writeFileAtomic(storeFile(), JSON.stringify(data));
   } catch (error) {
     log.warn(
       { err: error instanceof Error ? error.message : String(error) },

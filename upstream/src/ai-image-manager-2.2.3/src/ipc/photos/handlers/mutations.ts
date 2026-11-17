@@ -48,6 +48,7 @@ import {
   notifySequencesChanged,
 } from "@/services/photo-sequences";
 import { invalidateSmartAlbumCache } from "@/services/smart-album-engine";
+import { ORPHAN_MISSING_BATCH_ID } from "@/services/orphan-missing-marker";
 import {
   cleanOrphanThumbnails as cleanOrphanThumbnailsService,
   clearThumbnailDiskCache,
@@ -851,7 +852,9 @@ export const listDeletedPhotos = os
 
     // Expired records stay visible until their file operation succeeds. This
     // lets users retry failures instead of silently losing them from the UI.
-    const trashCondition = sql`${photos.deletedAt} IS NOT NULL`;
+    // 2026-11-18：孤儿对账把"文件不在了"的记录标成 ORPHAN_MISSING_BATCH_ID（不是真删除，
+    // 等扫描认亲恢复）—— 这些不进回收站，否则用户会看到一堆"删不掉的幽灵图"。
+    const trashCondition = sql`${photos.deletedAt} IS NOT NULL AND (${photos.deletionBatchId} IS NULL OR ${photos.deletionBatchId} <> ${ORPHAN_MISSING_BATCH_ID})`;
     const conditions = [trashCondition];
     if (input.query) {
       const escapedQuery = input.query.replace(/[\\%_]/g, "\\$&");

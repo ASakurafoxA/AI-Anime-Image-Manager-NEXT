@@ -266,6 +266,11 @@ async function handleTag(message) {
     if (aborted) {
       break;
     }
+    /*
+     * 2026-11-18：与 PixAI worker 同一处理 —— **单张读图/解码失败不再中断整轮**。
+     * 只有推理阶段（run / post）失败才当 provider 故障；错误信息带 `#照片id`。
+     */
+    let phase = "load";
     try {
       const floats = await preprocessImage(await resolveImageInput(photo.path));
       const input = new ortNs.Tensor("float32", floats, [
@@ -274,7 +279,9 @@ async function handleTag(message) {
         IMAGE_SIZE,
         3,
       ]);
+      phase = "run";
       const outputs = await session.run({ [inputName]: input });
+      phase = "post";
 
       const scores = outputs[tagOutputName]?.data;
       if (!scores || scores.length !== vocab.length) {
@@ -330,13 +337,14 @@ async function handleTag(message) {
       }
       results.push(entry);
     } catch (error) {
-      if (activeProvider === "dml") {
-        providerError = error instanceof Error ? error.message : String(error);
+      const text = error instanceof Error ? error.message : String(error);
+      if (activeProvider === "dml" && phase !== "load") {
+        providerError = text;
         break;
       }
       results.push({
         id: photo.id,
-        error: error instanceof Error ? error.message : String(error),
+        error: `#${photo.id} ${text}`,
       });
     }
   }

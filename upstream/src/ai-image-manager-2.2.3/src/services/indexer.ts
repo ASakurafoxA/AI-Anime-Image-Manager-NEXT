@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import chokidar, { type FSWatcher } from "chokidar";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import PQueue from "p-queue";
 import sharp from "sharp";
 import { getDatabase } from "@/db";
@@ -26,6 +26,10 @@ import { extractRawPreview, isRawFile, readRawDimensions } from "./raw-preview";
 import { computePHash } from "./phash";
 import { invalidatePhashIndex } from "./phash-index";
 import { deletePhotoThumbnails, generateThumbnail } from "./thumbnailer";
+import { ORPHAN_MISSING_BATCH_ID } from "./orphan-missing-marker";
+import { adoptRelocatedFolderPath, relocateSameNameFolders } from "./folder-relocation";
+
+type DatabaseClient = ReturnType<typeof getDatabase>;
 
 const log = createLogger("indexer");
 const FOCAL_RANGE_RE = /^\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?$/;
@@ -298,6 +302,26 @@ function createWatcher(
   };
   watchers.set(key, context);
   try {
+    /*
+     * 2026-11-18（会话#14）：**外部改名/移动文件夹后的自愈**。
+     *
+     * 用户在资源管理器里把 `截图` 改名成 `截图11` 时：旧路径被删（unlinkDir），
+     * 新路径**不在任何 watcher 里** → 新文件不会被索引，旧记录还指着老路径
+     * （表现为：文件夹名不更新、缩略图还在、打开大图"文件不存在"）。
+     *
+     * 这里在"文件夹真的没了"时，延迟 1.5 秒对**最近的还存在父目录**做一次重扫：
+     * 重扫会发现新目录并触发"认亲"（按文件名+大小+修改时间），
+     * 把旧记录迁到新路径 —— 标签/相册/收藏全部保留。
+     */
+    watcher.on("unlinkDir", (dirPath: string) => {
+      if (isWatcherPathSuppressed(dirPath)) {
+        return;
+      }
+      if (fs.existsSync(dirPath)) {
+        return;
+      }
+      scheduleFolderRescan(dirPath);
+    });
     // Bind this before any event-specific handlers so native async errors
     // cannot escape during watcher startup.
     watcher.on("error", (error) => handleWatcherError(context, error));
@@ -329,6 +353,103 @@ function watcherPathKey(folderPath: string): string {
  * 也只影响这一小段时间，不会把监听**永久**弄坏 ✓。
  */
 const suppressedWatcherPaths = new Map<string, number>();
+
+/**
+ * 2026-11-18（会话#14）：**整目录 unlink 突发检测**（数据安全）。
+ *
+ * 用户在资源管理器里移动/重命名一个文件夹时，chokidar 会对旧路径下每个文件发 unlink；
+ * 旧代码会把这些照片**逐条硬删**（标签/相册/收藏级联丢失）→ 整批数据蒸发。
+ * 这里按"同一文件夹 2 秒内 ≥30 条 unlink"判定为整目录移动，跳过这批硬删除
+ * （真正被删的照片留给 `cleanupOrphanedRecords` 对账）。
+ *
+ * 只影响"突发的整目录事件"，单条 unlink（正常删图）行为完全不变。
+ */
+const UNLINK_BURST_WINDOW_MS = 2000;
+const UNLINK_BURST_THRESHOLD = 30;
+/**
+ * 2026-11-18：外部改名/移动文件夹后，延迟重扫最近的还存在父目录（见 unlinkDir 处理）。
+ * 用模块级定时器 + 防抖，避免一次改名触发几十次重扫。
+ */
+const FOLDER_RESCAN_DEBOUNCE_MS = 1500;
+let folderRescanTimer: ReturnType<typeof setTimeout> | null = null;
+
+function nearestExistingAncestor(targetPath: string): string | null {
+  let current = targetPath;
+  for (let depth = 0; depth < 30; depth += 1) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+    if (fs.existsSync(current)) {
+      return current;
+    }
+  }
+  return null;
+}
+
+function scheduleFolderRescan(removedPath: string): void {
+  if (folderRescanTimer) {
+    clearTimeout(folderRescanTimer);
+  }
+  folderRescanTimer = setTimeout(() => {
+    folderRescanTimer = null;
+    /*
+     * 2026-11-18：先尝试**同名换路径**的自动迁移（用户口径：改名请在软件里改，
+     * 但"名字不变、只挪了位置"希望自动找回）。迁移成功就不用重扫；
+     * 迁移不了只记一条提示（不盲目扫描父目录 —— 那个范围可能大得离谱）。
+     */
+    try {
+      const migrated = relocateSameNameFolders(getDatabase());
+      if (migrated.length > 0) {
+        log.info(
+          { migrated },
+          "检测到同名文件夹换了路径：已自动迁移（标签/相册/收藏保留）"
+        );
+        return;
+      }
+    } catch (error) {
+      log.warn({ err: error }, "同名文件夹迁移检查失败（不影响已有数据）");
+    }
+    log.warn(
+      { removedPath },
+      "文件夹路径已不存在，且找不到同名的新位置 → 保持「缺失」；把新位置重新添加/扫描可认回（标签保留）"
+    );
+  }, FOLDER_RESCAN_DEBOUNCE_MS);
+}
+const unlinkBurst = new Map<
+  string,
+  { count: number; startedAt: number; warned: boolean }
+>();
+
+function isUnlinkBurst(dir: string): boolean {
+  const now = Date.now();
+  /*
+   * 2026-11-18：这个表只增不减（每个目录一条），图库几万个目录时会一直涨。
+   * 超过上限直接清空即可 —— 它只是"2 秒内的突发计数"，丢了最多漏判一次，
+   * 不影响正确性（老实删除由 unlink 主流程负责）。
+   */
+  if (unlinkBurst.size > 5000) {
+    unlinkBurst.clear();
+  }
+  const entry = unlinkBurst.get(dir);
+  if (!entry || now - entry.startedAt > UNLINK_BURST_WINDOW_MS) {
+    unlinkBurst.set(dir, { count: 1, startedAt: now, warned: false });
+    return false;
+  }
+  entry.count += 1;
+  if (entry.count < UNLINK_BURST_THRESHOLD) {
+    return false;
+  }
+  if (!entry.warned) {
+    entry.warned = true;
+    log.warn(
+      { dir, count: entry.count },
+      "Watcher: 同一文件夹 unlink 突发（疑似整目录被移动/改名），已跳过这批硬删除，交给孤儿对账"
+    );
+  }
+  return true;
+}
 
 /** 登记要屏蔽的路径（默认 15 秒；覆盖 rename + 数据库迁移 + chokidar 的延迟投递）。 */
 export function suppressWatcherPaths(
@@ -629,6 +750,114 @@ async function preparePhotoRecord(
   return { photoRecord, stat, phash };
 }
 
+/**
+ * 2026-11-18（会话#14）：**认亲** —— 扫描/添加时发现"换了个位置的老照片"。
+ *
+ * 场景（用户实测口径）：在资源管理器里移动/重命名文件或文件夹，
+ * 以前 = 旧记录被删（标签/相册/收藏级联丢失）+ 新位置当成新图重新导入（新 id）。
+ *
+ * 现在：插入前先用「文件名 + 大小 + 修改时间（±5 秒）」找一条**旧路径已经不存在**的记录，
+ * 找到就把这条记录的 path/folderId 改过去 —— 标签、相册、收藏、向量、缩略图全部保留。
+ *
+ * 保守规则（宁可认不出，绝不认错）：
+ *   · 只在候选**唯一**时认亲；多个候选（如重复图）一律不认，走正常插入；
+ *   · 候选的旧路径必须确实不存在（`fs.existsSync` 为 false）；
+ *   · 候选可以是"活着的记录"，也可以是孤儿对账标成"缺失"的记录（会顺手恢复）。
+ */
+function adoptMovedPhoto(
+  db: DatabaseClient,
+  filePath: string,
+  folderId: number | null,
+  signature: {
+    filename: string;
+    fileSize: number | null;
+    fileDate: number | null;
+  }
+): number | null {
+  const FILE_DATE_TOLERANCE_MS = 5000;
+  const sizeCondition =
+    signature.fileSize === null
+      ? isNull(photos.fileSize)
+      : eq(photos.fileSize, signature.fileSize);
+  const candidates = db
+    .select({
+      id: photos.id,
+      path: photos.path,
+      fileDate: photos.fileDate,
+      deletedAt: photos.deletedAt,
+      deletionBatchId: photos.deletionBatchId,
+      folderId: photos.folderId,
+    })
+    .from(photos)
+    .where(
+      and(
+        eq(photos.filename, signature.filename),
+        sizeCondition,
+        ne(photos.path, filePath)
+      )
+    )
+    .all();
+
+
+  const matches = candidates.filter((row) => {
+    // 只认"活着的记录"或"被标成缺失的记录"；真正进回收站的记录不动
+    const adoptable =
+      row.deletedAt === null ||
+      row.deletionBatchId === ORPHAN_MISSING_BATCH_ID;
+    if (!adoptable) {
+      return false;
+    }
+    if (
+      row.fileDate !== null &&
+      signature.fileDate !== null &&
+      Math.abs(row.fileDate - signature.fileDate) > FILE_DATE_TOLERANCE_MS
+    ) {
+      return false;
+    }
+    return !fs.existsSync(row.path);
+  });
+
+  if (matches.length !== 1) {
+    return null;
+  }
+  const target = matches[0];
+  try {
+    db.transaction(() => {
+      db.update(photos)
+        .set({
+          path: filePath,
+          folderId,
+          deletedAt: null,
+          deletionBatchId: null,
+        })
+        .where(eq(photos.id, target.id))
+        .run();
+      // 新旧两个文件夹的张数都重算（认亲只改归属，不改照片本身）
+      for (const id of [target.folderId, folderId]) {
+        if (typeof id === "number") {
+          db.update(folders)
+            .set({
+              photoCount: sql`(select count(*) from photos where folder_id = ${id} and deleted_at is null)`,
+            })
+            .where(eq(folders.id, id))
+            .run();
+        }
+      }
+    });
+  } catch (error) {
+    log.warn(
+      { err: error, photoId: target.id, to: filePath },
+      "认亲失败（不影响正常导入）"
+    );
+    return null;
+  }
+  log.info(
+    { photoId: target.id, from: target.path, to: filePath },
+    "照片换了位置：已认亲（标签/相册/收藏全部保留）"
+  );
+  return target.id;
+}
+
 async function indexSingleFile(
   filePath: string,
   folderId: number | null
@@ -676,6 +905,20 @@ async function indexSingleFile(
   }
 
   const { photoRecord, stat, phash } = prepared;
+
+  /*
+   * 2026-11-18：**先认亲，再插入**。
+   * 扫描到"新路径"时，先看它是不是某个旧记录的"换了位置的同一张图"；
+   * 命中就迁移那条记录（标签/相册/收藏全保留），不再新建。
+   */
+  const adoptedId = adoptMovedPhoto(db, filePath, folderId, {
+    filename: photoRecord.filename,
+    fileSize: photoRecord.fileSize ?? null,
+    fileDate: photoRecord.fileDate ?? null,
+  });
+  if (adoptedId !== null) {
+    return adoptedId;
+  }
 
   // A scan or another overlapping watcher may have inserted this path while
   // metadata/thumbnail preparation yielded. Reuse its row instead of racing it.
@@ -731,6 +974,18 @@ export async function scanFolder(
   const db = getDatabase();
   if (activeScanToken !== null) {
     throw new Error("A folder scan is already in progress");
+  }
+  /*
+   * 2026-11-18（用户口径）：**重新拖入/重新扫描时，先把"同名且内容几乎一样"的旧记录认回来**。
+   *
+   * 典型场景：文件夹挪到了库外（`...\NEXT\截图` → `F:\截图`），库内搜索不到；
+   * 用户把这个文件夹重新加进来时，如果旧记录还标着"缺失"，这里先把路径迁移过去
+   * （标签/相册/收藏保留），后面的扫描就会把这些照片当成"已存在"，不会重复插入。
+   */
+  try {
+    adoptRelocatedFolderPath(db, folderPath);
+  } catch (error) {
+    log.warn({ err: error, folderPath }, "重新添加时的认回检查失败（按新文件夹处理）");
   }
   const scanToken = { cancelled: false };
   activeScanToken = scanToken;
@@ -1124,6 +1379,26 @@ export async function scanFolder(
             photoIds.push(indexed.id);
             return false;
           }
+          /*
+           * 2026-11-18：**扫描时也认亲**。
+           * 软件关着时移动过文件 → 旧记录已被标成"缺失"或还在原处；
+           * 这里按「文件名 + 大小 + 修改时间」把它找回来，改成新路径，
+           * 标签/相册/收藏全部保留，不再新建一条。
+           */
+          const adopted = adoptMovedPhoto(
+            db,
+            record.photoRecord.path,
+            record.photoRecord.folderId ?? null,
+            {
+              filename: record.photoRecord.filename,
+              fileSize: record.photoRecord.fileSize ?? null,
+              fileDate: record.photoRecord.fileDate ?? null,
+            }
+          );
+          if (adopted !== null) {
+            photoIds.push(adopted);
+            return false;
+          }
           return true;
         });
         if (batch.length === 0) {
@@ -1227,13 +1502,20 @@ export async function scanFolder(
     // 24,723 张图就是 2 万多次同步 stat + 同步 SQL → 事件循环同样被占死 ✓。
     // 现在：每 500 张让出一次事件循环，并且「取消」能立刻中断这一段 ✓。
     const stalePhotoIds: number[] = [];
+    /** 2026-11-18：本轮被标成"缺失"的张数（不再直接删，见下面的说明）。 */
+    let markedMissing = 0;
     let staleChecked = 0;
     for (const [_dirPath, fid] of dirToFolderId) {
       if (scanToken.cancelled) {
         break;
       }
       const dbPhotos = db
-        .select({ id: photos.id, path: photos.path })
+        .select({
+          id: photos.id,
+          path: photos.path,
+          deletedAt: photos.deletedAt,
+          deletionBatchId: photos.deletionBatchId,
+        })
         .from(photos)
         .where(eq(photos.folderId, fid))
         .all();
@@ -1245,9 +1527,22 @@ export async function scanFolder(
           await new Promise<void>((r) => setImmediate(r));
         }
         if (!fs.existsSync(p.path)) {
-          db.delete(exifData).where(eq(exifData.photoId, p.id)).run();
-          db.delete(photos).where(eq(photos.id, p.id)).run();
-          stalePhotoIds.push(p.id);
+          /*
+           * 2026-11-18：**不再直接删**（否则移动/改名后标签会在下一次扫描时蒸发）。
+           * 只把"文件不在了"标记出来：
+           *   · 已经是标记状态的不用重复处理；
+           *   · 交给下一次扫描的认亲恢复，或回收站 30 天过期清理。
+           */
+          if (p.deletionBatchId === ORPHAN_MISSING_BATCH_ID) {
+            continue;
+          }
+          db.update(photos)
+            .set({
+              deletedAt: Date.now(),
+              deletionBatchId: ORPHAN_MISSING_BATCH_ID,
+            })
+            .where(eq(photos.id, p.id))
+            .run();
           const idx = photoIds.indexOf(p.id);
           if (idx >= 0) {
             photoIds.splice(idx, 1);
@@ -1256,7 +1551,7 @@ export async function scanFolder(
           if (newIdx >= 0) {
             newPhotoIds.splice(newIdx, 1);
           }
-          log.info({ path: p.path }, "Removed stale record");
+          log.info({ path: p.path }, "Marked stale record as missing");
         }
       }
     }
@@ -1265,6 +1560,7 @@ export async function scanFolder(
         log.warn({ err }, "Failed to remove stale photo vectors");
       });
     }
+    void stalePhotoIds;
 
     const folderIds = Array.from(new Set(dirToFolderId.values()));
     const folderPhotoCounts = new Map<number, number>();
@@ -1572,6 +1868,33 @@ export function startWatching(
           if (!isCurrentWatcher(context)) {
             return;
           }
+          /*
+           * 2026-11-18（会话#14）：**防误删保护**（数据安全，同步执行、不改变事件顺序）。
+           *
+           * 旧行为：收到 unlink 就把照片行硬删，标签 / 相册 / 收藏跟着级联丢失。
+           * 但 unlink 并不等于"用户删了它"：
+           *   · 文件被别的进程短暂占用 / 正在被覆盖时也会触发；
+           *   · **用户在资源管理器里移动或重命名整个文件夹**时，chokidar 会对旧路径下
+           *     每个文件发 unlink（软件自己的改名有屏蔽窗口，外部操作没有）→ 整批标签蒸发。
+           *
+           * 这里只加两道**轻量**判断（兜底还有 `cleanupOrphanedRecords` 对账）：
+           *   ① 文件其实还在 → 噪音，跳过；
+           *   ② 同一文件夹 2 秒内出现 ≥30 条 unlink → 判定为"整目录被移走/改名"，
+           *      本次不硬删（只记一条警告），避免整批丢标签。
+           * ⚠️ 不用 `await` 延迟：那会打乱 unlink / add 的先后（移动文件会变成先 add 后删）。
+           */
+          if (fs.existsSync(filePath)) {
+            watcherStats.skipped++;
+            log.warn(
+              { filePath },
+              "Watcher: unlink 事件但文件仍在，已忽略（临时占用/覆盖）"
+            );
+            return;
+          }
+          if (isUnlinkBurst(path.dirname(filePath))) {
+            watcherStats.skipped++;
+            return;
+          }
           const photo = db
             .select({ id: photos.id, folderId: photos.folderId })
             .from(photos)
@@ -1580,15 +1903,23 @@ export function startWatching(
             )
             .get();
           if (photo) {
-            db.delete(exifData).where(eq(exifData.photoId, photo.id)).run();
-            db.delete(photos).where(eq(photos.id, photo.id)).run();
-            deletePhotoThumbnails(filePath);
-            deletePhotoVectors([photo.id]).catch((err) =>
-              log.error(
-                { err, photoId: photo.id },
-                "Watcher: vector cleanup failed on unlink"
-              )
-            );
+            /*
+             * 2026-11-18（会话#14）：**标"缺失"，不再直接删**。
+             *
+             * 移动文件时 chokidar 先发 unlink（旧路径）再发 add（新路径）。
+             * 旧代码在这里立刻删记录 → add 只能新建一条（新 id，标签/相册/收藏全丢）。
+             * 现在只标记（和孤儿对账同一套）：
+             *   · add 到达时，认亲能按「文件名 + 大小 + 修改时间」把它找回来（id 不变）；
+             *   · 真删除（没有 add）就一直保持"缺失"（图库里看不见），30 天后由回收站过期清理；
+             *   · 不用定时器延后删除 —— 那条路会引入"删除先于认亲"的竞态（实测踩过）。
+             */
+            db.update(photos)
+              .set({
+                deletedAt: Date.now(),
+                deletionBatchId: ORPHAN_MISSING_BATCH_ID,
+              })
+              .where(eq(photos.id, photo.id))
+              .run();
 
             if (photo.folderId) {
               db.update(folders)
@@ -1811,17 +2142,23 @@ export async function cleanupOrphanedRecords(): Promise<{
     .all();
 
   let removed = 0;
-  const removedPhotoIds: number[] = [];
   const folderUpdates = new Map<number, number>();
 
   for (const photo of allPhotos) {
     if (!fs.existsSync(photo.path)) {
-      // Clean up orphaned thumbnail files before removing DB records
-      deletePhotoThumbnails(photo.path);
-
-      db.delete(exifData).where(eq(exifData.photoId, photo.id)).run();
-      db.delete(photos).where(eq(photos.id, photo.id)).run();
-      removedPhotoIds.push(photo.id);
+      /*
+       * 2026-11-18：**只标记"缺失"，不删除记录**（见 orphan-missing-marker.ts）。
+       * 用户的移动/改名在软件关闭时不会产生任何事件；如果这里直接删，
+       * 标签/相册/收藏会在"下次启动"就被永久清掉，之后再扫描也救不回来。
+       * 现在保留记录与标签，等扫描认亲恢复；30 天后回收站的过期清理会顺手清掉。
+       */
+      db.update(photos)
+        .set({
+          deletedAt: Date.now(),
+          deletionBatchId: ORPHAN_MISSING_BATCH_ID,
+        })
+        .where(eq(photos.id, photo.id))
+        .run();
 
       if (photo.folderId) {
         folderUpdates.set(
@@ -1832,12 +2169,6 @@ export async function cleanupOrphanedRecords(): Promise<{
 
       removed++;
     }
-  }
-
-  if (removedPhotoIds.length > 0) {
-    await deletePhotoVectors(removedPhotoIds).catch((err) => {
-      log.warn({ err }, "Failed to remove orphaned photo vectors");
-    });
   }
 
   for (const [folderId, count] of folderUpdates) {
@@ -1865,7 +2196,6 @@ export async function cleanupOrphanedRecordsAsync(
     .all();
 
   let removed = 0;
-  const removedPhotoIds: number[] = [];
   const folderUpdates = new Map<number, number>();
   const BATCH_SIZE = 200;
 
@@ -1873,12 +2203,14 @@ export async function cleanupOrphanedRecordsAsync(
     const batch = allPhotos.slice(i, i + BATCH_SIZE);
     for (const photo of batch) {
       if (!fs.existsSync(photo.path)) {
-        // Clean up orphaned thumbnail files before removing DB records
-        deletePhotoThumbnails(photo.path);
-
-        db.delete(exifData).where(eq(exifData.photoId, photo.id)).run();
-        db.delete(photos).where(eq(photos.id, photo.id)).run();
-        removedPhotoIds.push(photo.id);
+        // 2026-11-18：只标记缺失，不删记录（理由同同步版）
+        db.update(photos)
+          .set({
+            deletedAt: Date.now(),
+            deletionBatchId: ORPHAN_MISSING_BATCH_ID,
+          })
+          .where(eq(photos.id, photo.id))
+          .run();
 
         if (photo.folderId) {
           folderUpdates.set(
@@ -1898,17 +2230,53 @@ export async function cleanupOrphanedRecordsAsync(
     );
   }
 
-  if (removedPhotoIds.length > 0) {
-    await deletePhotoVectors(removedPhotoIds).catch((err) => {
-      log.warn({ err }, "Failed to remove orphaned photo vectors");
-    });
-  }
-
   for (const [folderId, count] of folderUpdates) {
     db.update(folders)
       .set({ photoCount: sql`MAX(0, photo_count - ${count})` })
       .where(eq(folders.id, folderId))
       .run();
+  }
+
+  /*
+   * 2026-11-18（会话#14）：把"整个文件夹不见了（被改名/移动）"**明确说出来**。
+   *
+   * 不做自动迁移（在父目录里猜哪个是新文件夹，猜错会把两个文件夹合并，风险大于收益），
+   * 只记一条能照做的提示：把新位置重新添加/扫描一次，扫描时的"认亲"会按
+   * 文件名 + 大小 + 修改时间把照片认回原记录，标签/相册/收藏都保留。
+   */
+  try {
+    const allFolders = db
+      .select({
+        id: folders.id,
+        path: folders.path,
+        displayName: folders.displayName,
+      })
+      .from(folders)
+      .all();
+    for (const folder of allFolders) {
+      if (!folder.path || fs.existsSync(folder.path)) {
+        continue;
+      }
+      const pending = db
+        .select({ n: sql`count(*)` })
+        .from(photos)
+        .where(
+          and(
+            eq(photos.folderId, folder.id),
+            sql`${photos.deletionBatchId} = ${ORPHAN_MISSING_BATCH_ID}`
+          )
+        )
+        .get();
+      const pendingCount = Number(pending?.n ?? 0);
+      if (pendingCount > 0) {
+        log.warn(
+          { folderId: folder.id, path: folder.path, photos: pendingCount },
+          `文件夹「${folder.displayName ?? folder.path}」已不在磁盘上（可能被改名/移动），其中 ${pendingCount} 张照片已标为"缺失"。把新位置重新添加/扫描一次即可自动认回（标签会保留）`
+        );
+      }
+    }
+  } catch {
+    /* 只是提示，失败不影响清理 */
   }
 
   return { checked: allPhotos.length, removed };

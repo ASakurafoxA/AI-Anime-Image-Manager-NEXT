@@ -75,6 +75,24 @@ let initPromise: Promise<void> | null = null;
 let resolvedModelsDir = "";
 let resolvedUseGpu = false;
 let shuttingDown = false;
+/**
+ * 2026-11-18（会话#14）：与 PixAI 客户端同步修的两个坑 ——
+ *  ① 推理阶段崩了（provider-error / init-error）时旧代码只把 `ready` 置 false，
+ *     worker 进程还活着 → `initPromise` 仍是已完成的 Promise → `initWd14Tagger()`
+ *     被 `if (initPromise) return initPromise` 短路 → **永远"未就绪"**，直到重启应用；
+ *  ② 「下一次 init 自动降级 CPU」原本也没有落地。
+ * 现在：provider 失败 → 杀掉 worker（走 exit 处理器重置状态）+ 记住要降级 CPU。
+ */
+let lastInitWasProviderError = false;
+let consecutiveInitFailures = 0;
+let lastInitFailureText: string | null = null;
+const MAX_REINIT_ATTEMPTS = 3;
+/** 实际发给 worker 的 GPU 设定：崩过一次之后这里是 false（自动降级 CPU）。 */
+let effectiveUseGpu = false;
+/** 记住 init 时的 deviceId，重新拉起时要用同一个。 */
+let resolvedDeviceId: number | null = null;
+/** 每次 provider 失败 +1；批次 catch 据此判断"是不是推理失败"。 */
+let providerFailureSeq = 0;
 
 function findWorkerScript(): string {
   const fileName = "wd14-tagger-worker.mjs";
@@ -172,7 +190,20 @@ function spawnSlot(index: number): WorkerSlot {
     }
     if (message.type === "init-error" || message.type === "provider-error") {
       slot.ready = false;
+      lastInitWasProviderError = true;
+      if (message.type === "provider-error") {
+        providerFailureSeq += 1;
+      }
       failSlot(index, new Error(message.error ?? "WD14 worker error"));
+      /*
+       * 2026-11-18：必须杀掉 worker —— 否则 initPromise 仍是旧 Promise、
+       * 下一次 init 被短路，tagging 就永久停在"未就绪"（要重启应用才好）。
+       */
+      try {
+        slot.process.kill();
+      } catch {
+        /* 进程可能已退出 */
+      }
     }
   });
 
@@ -219,8 +250,17 @@ export async function initWd14Tagger(
   if (initPromise) {
     return initPromise;
   }
+  // 参数变了 = 调用方想重新试一次，清掉"上次崩过"的记忆
+  if (modelsDir !== resolvedModelsDir || useGpu !== resolvedUseGpu) {
+    lastInitWasProviderError = false;
+  }
   resolvedModelsDir = modelsDir;
   resolvedUseGpu = useGpu;
+  resolvedDeviceId = deviceId;
+  effectiveUseGpu = useGpu && !lastInitWasProviderError;
+  if (useGpu && !effectiveUseGpu) {
+    log.warn("WD14：上一次推理崩溃过，本次 init 自动改用 CPU");
+  }
   shuttingDown = false;
 
   initPromise = (async () => {
@@ -238,7 +278,7 @@ export async function initWd14Tagger(
         deviceId: deviceId ?? undefined,
         modelsDir,
         type: "init",
-        useGPU: useGpu,
+        useGPU: effectiveUseGpu,
       });
     }
     await Promise.all(slots.map((slot) => waitForReady(slot, 120_000)));
@@ -293,19 +333,50 @@ async function acquireSlot(timeoutMs = 60_000): Promise<WorkerSlot> {
 }
 
 /**
- * 对一批照片打标签。
- *
- * ⚠️ 一定要传**缩略图路径**而不是原图：项目缩略图是 512px（`thumbnailer.ts`），
- * 而 WD14 只需要 448px —— 用缩略图可避免重读 200 GB 原图。
+ * 2026-11-18：确保有可用 worker；没有就**有上限、有退避**地重新拉起。
+ * 与 PixAI 客户端同一套策略（0.5s / 1s / 2s，最多 3 次）。
  */
-export async function tagPhotoBatch(
-  photos: Wd14TagRequest[],
-  options: Wd14TagOptions = {}
-): Promise<Wd14PhotoResult[]> {
-  if (photos.length === 0) {
-    return [];
+async function ensureWd14Ready(): Promise<void> {
+  if (isWd14TaggerReady()) {
+    return;
   }
-  const slot = await acquireSlot();
+  if (shuttingDown) {
+    throw new Error("WD14 tagger 正在关闭");
+  }
+  if (!resolvedModelsDir) {
+    throw new Error("WD14 tagger 未初始化（先调用 initWd14Tagger）");
+  }
+  if (consecutiveInitFailures >= MAX_REINIT_ATTEMPTS) {
+    throw new Error(
+      `WD14 tagger 连续 ${consecutiveInitFailures} 次启动失败，本轮不再重试：${
+        lastInitFailureText ?? "未知原因"
+      }`
+    );
+  }
+  const waitMs = 500 * 2 ** consecutiveInitFailures;
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+  log.warn(
+    { attempt: consecutiveInitFailures + 1, maxAttempts: MAX_REINIT_ATTEMPTS },
+    "WD14 tagger 未就绪，重新拉起 worker"
+  );
+  try {
+    await initWd14Tagger(resolvedModelsDir, resolvedUseGpu, resolvedDeviceId);
+    consecutiveInitFailures = 0;
+    lastInitFailureText = null;
+  } catch (error) {
+    consecutiveInitFailures += 1;
+    lastInitFailureText =
+      error instanceof Error ? error.message : String(error);
+    throw error instanceof Error ? error : new Error(String(error));
+  }
+}
+
+/** 给某个槽位发一批，等结果（超时杀 worker）。 */
+function sendBatch(
+  slot: WorkerSlot,
+  photos: Wd14TagRequest[],
+  options: Wd14TagOptions
+): Promise<Wd14PhotoResult[]> {
   return new Promise<Wd14PhotoResult[]>((resolve, reject) => {
     const timer = setTimeout(() => {
       slotPending.delete(slot.index);
@@ -324,6 +395,43 @@ export async function tagPhotoBatch(
       includeEmbedding: Boolean(options.includeEmbedding),
     });
   });
+}
+
+/**
+ * 对一批照片打标签。
+ *
+ * ⚠️ 一定要传**缩略图路径**而不是原图：项目缩略图是 512px（`thumbnailer.ts`），
+ * 而 WD14 只需要 448px —— 用缩略图可避免重读 200 GB 原图。
+ */
+export async function tagPhotoBatch(
+  photos: Wd14TagRequest[],
+  options: Wd14TagOptions = {}
+): Promise<Wd14PhotoResult[]> {
+  if (photos.length === 0) {
+    return [];
+  }
+  await ensureWd14Ready();
+  const slot = await acquireSlot();
+  const seqBefore = providerFailureSeq;
+  try {
+    return await sendBatch(slot, photos, options);
+  } catch (error) {
+    /*
+     * 2026-11-18：DML 推理失败 → **同一轮内**降级 CPU 重试一次
+     * （原来只记日志"下次 init 降级"，实际没有下一次）。
+     */
+    const providerFailed = providerFailureSeq !== seqBefore;
+    if (!(providerFailed && effectiveUseGpu)) {
+      throw error;
+    }
+    log.warn("WD14 推理失败 → 本轮改用 CPU 重试一次（不再拖到下次启动）");
+    lastInitWasProviderError = true;
+    consecutiveInitFailures = 0;
+    shutdownWd14Tagger();
+    await initWd14Tagger(resolvedModelsDir, resolvedUseGpu, resolvedDeviceId);
+    const retrySlot = await acquireSlot();
+    return await sendBatch(retrySlot, photos, options);
+  }
 }
 
 /** 请求中止当前批次（worker 会在当前图片处理完后停止）。 */

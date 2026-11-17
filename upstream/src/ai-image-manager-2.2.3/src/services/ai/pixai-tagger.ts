@@ -931,7 +931,12 @@ async function processBatchParallel(
   rows: PhotoRow[],
   tagIds: Map<string, number>,
   workers: number
-): Promise<{ written: number; failed: number; errorIds: number[] }> {
+): Promise<{
+  written: number;
+  failed: number;
+  errorIds: number[];
+  providerFailure: boolean;
+}> {
   // 以"当前还活着"的 worker 数为准：中途挂了一个也不会让另一条 lane 等 60s 超时
   const alive = Math.min(workers, getPixaiWorkerCount());
   const lanes = Math.max(1, Math.min(alive, rows.length));
@@ -953,6 +958,7 @@ async function processBatchParallel(
           written: 0,
           failed: part.length,
           errorIds: part.map((row) => row.id),
+          providerFailure: true,
         };
       })
     )
@@ -961,13 +967,20 @@ async function processBatchParallel(
     written: results.reduce((sum, item) => sum + item.written, 0),
     failed: results.reduce((sum, item) => sum + item.failed, 0),
     errorIds: results.flatMap((item) => item.errorIds),
+    /* 任意一条 lane 是批次级失败 → 整批按"不该跳过"处理 */
+    providerFailure: results.some((item) => item.providerFailure),
   };
 }
 
 async function processBatch(
   rows: PhotoRow[],
   tagIds: Map<string, number>
-): Promise<{ written: number; failed: number; errorIds: number[] }> {
+): Promise<{
+  written: number;
+  failed: number;
+  errorIds: number[];
+  providerFailure: boolean;
+}> {
   const requests = rows
     .map((row) => {
       const source = row.thumbnailPath || row.path;
@@ -976,7 +989,7 @@ async function processBatch(
     .filter((item): item is { id: number; path: string } => item !== null);
 
   if (requests.length === 0) {
-    return { written: 0, failed: 0, errorIds: [] };
+    return { written: 0, failed: 0, errorIds: [], providerFailure: false };
   }
 
   // 没拿到可用路径的照片也算失败：否则它们会"静默消失"在进度里
@@ -1010,6 +1023,8 @@ async function processBatch(
       written: 0,
       failed: rows.length,
       errorIds: rows.map((row) => row.id),
+      /* 批次级失败（provider / 超时 / 初始化）—— 只有这种才该"停下并保留游标" */
+      providerFailure: true,
     };
   }
 
@@ -1085,6 +1100,7 @@ async function processBatch(
     written,
     failed: Math.max(errorIds.length, failedSize),
     errorIds,
+    providerFailure: false,
   };
 }
 
@@ -1257,6 +1273,28 @@ export async function runPixaiTagging(
            */
           if (cancelRequested) {
             break;
+          }
+          /*
+           * 2026-11-18（用户实测：「一张读不到的图把整轮打标判死」）：
+           * 只有**批次级失败**（provider / 超时 / 初始化，client 抛错）才停在这里。
+           * 如果 8 张全是**单张失败**（文件被删 / 损坏 / 解不开），停在这里会让整库
+           * 永远卡在这一批（每次重跑又停）→ 这时按"跳过这批、推进游标"处理，
+           * id 已经记进 errorIds（界面按 failed 统计）。
+           */
+          if (!batch.providerFailure) {
+            failed += rows.length;
+            cursor = rows[rows.length - 1].id;
+            setSetting(CURSOR_KEY, String(cursor));
+            processedThisRun += rows.length;
+            options.onProgress?.({ done, failed, tagged, total });
+            log.warn(
+              {
+                photoIds: rows.map((row) => row.id),
+                cursor,
+              },
+              "整批都是单张打标失败（文件/解码问题），已跳过这批并推进游标"
+            );
+            continue;
           }
           stalledAt = rows[0].id;
           failed += rows.length;

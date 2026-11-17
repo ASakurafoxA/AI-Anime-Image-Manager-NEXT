@@ -423,8 +423,7 @@ function spawnSlot(index: number): WorkerSlot {
       return;
     }
     if (message.type === "provider-error") {
-      // DML 在推理中崩了：worker 自己选择**不**把整批当结果发回来，而是报错。
-      // 这里要做的：标记不可用 + 把错误**报出去**（不静默）。
+      // 推理阶段崩了（DML）：标记不可用 + 把错误**报出去**（不静默）。
       slot.ready = false;
       lastInitWasProviderError = true;
       const error = new Error(
@@ -434,9 +433,21 @@ function spawnSlot(index: number): WorkerSlot {
       );
       log.error(
         { index, provider: message.provider },
-        "PixAI 推理失败，下一次 init 将自动降级 CPU"
+        "PixAI 推理失败"
       );
       failSlot(index, error);
+      /*
+       * 2026-11-18：**必须把 worker 杀掉**。
+       * 原来只把 ready 置 false，进程还活着 → `initPromise` 仍是已完成的旧 Promise，
+       * `initPixaiTagger()` 被 `if (initPromise) return initPromise` 短路，
+       * 于是永远"未就绪"，每批都重拉一次 → 实测刷出 1600+ 条「未就绪，自动重新拉起」。
+       * 杀掉后 `handleWorkerExit` 会重置 initPromise / 清空槽位，下一次 init 才真的重新 fork。
+       */
+      try {
+        slot.process.kill();
+      } catch {
+        /* 进程可能已退出 */
+      }
       return;
     }
     if (message.type === "init-error") {
@@ -660,37 +671,68 @@ async function acquireSlot(timeoutMs = 60_000): Promise<WorkerSlot> {
   }
 }
 
+/** 连续"拉起失败"次数；到上限就停止重试（2026-11-18）。 */
+let consecutiveInitFailures = 0;
+let lastInitFailureText: string | null = null;
+const MAX_REINIT_ATTEMPTS = 3;
+
 /**
- * 对一批照片打标签。
+ * 确保有可用 worker；没有就**有上限、有退避**地重新拉起。
  *
- * 崩溃自愈：如果 worker 已经在推理中崩掉了（`isPixaiTaggerReady()` 为 false）
- * 而 `modelsDir` 已经被缓存，这里会**先自动重新拉起**再取槽位 —— 上层不需要
- * 为了"绕开"崩溃而写重试逻辑。
+ * 2026-11-18（用户实测：日志里「PixAI tagger 未就绪，自动重新拉起 worker」刷了 1600+ 条）：
+ * 原来每批都立刻重拉、且不计数 —— worker 起不来时会疯狂刷日志，把真正的原因淹掉。
+ * 现在：0.5s / 1s / 2s 退避，连续 3 次失败就抛出**明确错误**，让本轮打标干净地停下。
  */
-export async function tagPhotoBatchPixai(
-  photos: PixaiTagRequest[],
-  options: PixaiTagOptions = {}
-): Promise<PixaiPhotoResult[]> {
-  if (photos.length === 0) {
-    return [];
+async function ensureTaggerReady(): Promise<void> {
+  if (isPixaiTaggerReady()) {
+    return;
   }
-  if (!isPixaiTaggerReady()) {
-    if (shuttingDown) {
-      throw new Error("PixAI tagger 正在关闭");
-    }
-    if (!resolvedModelsDir) {
-      throw new Error("PixAI tagger 未初始化（先调用 initPixaiTagger）");
-    }
-    // 走到这里说明 worker 崩过（或上一批超时被杀）—— 重新拉起，不静默失败
-    log.warn("PixAI tagger 未就绪，自动重新拉起 worker");
+  if (shuttingDown) {
+    throw new Error("PixAI tagger 正在关闭");
+  }
+  if (!resolvedModelsDir) {
+    throw new Error("PixAI tagger 未初始化（先调用 initPixaiTagger）");
+  }
+  if (consecutiveInitFailures >= MAX_REINIT_ATTEMPTS) {
+    throw new Error(
+      `PixAI tagger 连续 ${consecutiveInitFailures} 次启动失败，本轮不再重试：${
+        lastInitFailureText ?? "未知原因"
+      }`
+    );
+  }
+  const waitMs = 500 * 2 ** consecutiveInitFailures;
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+  log.warn(
+    {
+      attempt: consecutiveInitFailures + 1,
+      maxAttempts: MAX_REINIT_ATTEMPTS,
+      waitMs,
+    },
+    "PixAI tagger 未就绪，重新拉起 worker"
+  );
+  try {
     await initPixaiTagger(
       resolvedModelsDir,
       resolvedUseGpu,
       getDmlDeviceId(),
       resolveWorkerDevices()
     );
+    consecutiveInitFailures = 0;
+    lastInitFailureText = null;
+  } catch (error) {
+    consecutiveInitFailures += 1;
+    lastInitFailureText =
+      error instanceof Error ? error.message : String(error);
+    throw error instanceof Error ? error : new Error(String(error));
   }
-  const slot = await acquireSlot();
+}
+
+/** 给某个槽位发一批，等结果（超时杀 worker）。 */
+function sendBatch(
+  slot: WorkerSlot,
+  photos: PixaiTagRequest[],
+  options: PixaiTagOptions
+): Promise<PixaiPhotoResult[]> {
   return new Promise<PixaiPhotoResult[]>((resolve, reject) => {
     const timer = setTimeout(() => {
       slotPending.delete(slot.index);
@@ -723,6 +765,49 @@ export async function tagPhotoBatchPixai(
       );
     }
   });
+}
+
+/**
+ * 对一批照片打标签。
+ *
+ * 崩溃自愈：如果 worker 已经在推理中崩掉了（`isPixaiTaggerReady()` 为 false），
+ * 这里会先**有上限地**重新拉起；如果是 DML 推理失败，本轮内**真的**改用 CPU 重试一次。
+ */
+export async function tagPhotoBatchPixai(
+  photos: PixaiTagRequest[],
+  options: PixaiTagOptions = {}
+): Promise<PixaiPhotoResult[]> {
+  if (photos.length === 0) {
+    return [];
+  }
+  await ensureTaggerReady();
+  const slot = await acquireSlot();
+  try {
+    return await sendBatch(slot, photos, options);
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error);
+    /*
+     * 2026-11-18：**同轮内真的降级 CPU 重试一次**。
+     * 原来只写日志「下一次 init 将自动降级 CPU」，但那一轮直接判死（用户实测 0 成功就停）。
+     * 只对"推理失败"这么做；读图/解码失败已经在 worker 里按单张处理，不会走到这里。
+     */
+    const isProviderFailure = text.includes("provider 错误");
+    if (!(isProviderFailure && effectiveUseGpu)) {
+      throw error;
+    }
+    log.warn("PixAI 推理失败 → 本轮改用 CPU 重试一次（不再拖到下次启动）");
+    lastInitWasProviderError = true;
+    consecutiveInitFailures = 0;
+    shutdownPixaiTagger();
+    await initPixaiTagger(
+      resolvedModelsDir ?? "",
+      resolvedUseGpu,
+      getDmlDeviceId(),
+      resolveWorkerDevices()
+    );
+    const retrySlot = await acquireSlot();
+    return await sendBatch(retrySlot, photos, options);
+  }
 }
 
 /**

@@ -105,7 +105,7 @@ git apply --whitespace=nowarn ../patches/next.patch
 
 ## 最近更新
 
-**当前版本 `2.2.3.80`（2026-11-16）**：角色识别入口合并成一个下拉（发现新角色 / 给已有角色补漏 / 多人图只认出一个角色）；
+**当前版本 `2.2.3.81`（2026-11-16）**：角色识别入口合并成一个下拉（发现新角色 / 给已有角色补漏 / 多人图只认出一个角色）；
 多人图补名改成两排缩略图；角色封面可右键模糊化；图集操作栏搬到页面顶部；
 补漏的逐角色比对搬进独立进程（300 个角色 **24.5 秒 → 1.5 秒**）。
 
@@ -119,9 +119,9 @@ git apply --whitespace=nowarn ../patches/next.patch
 
 | 版本 | 文件名 | 大约 |
 |---|---|---|
-| **NEXT**（本仓库，PixAI 打标） | `AI Anime Image Manager NEXT-2.2.3.80.msi` | 336 MB |
-| WD | `AI Anime Image Manager WD-2.2.3.80.msi` | 665 MB |
-| 本地版 | `AI Anime Image Manager-2.2.3.80.msi` | 665 MB |
+| **NEXT**（本仓库，PixAI 打标） | `AI Anime Image Manager NEXT-2.2.3.81.msi` | 336 MB |
+| WD | `AI Anime Image Manager WD-2.2.3.81.msi` | 665 MB |
+| 本地版 | `AI Anime Image Manager-2.2.3.81.msi` | 665 MB |
 
 都在 [Releases](https://github.com/ASakurafoxA/AI-Anime-Image-Manager-NEXT/releases) 的最新版页面（**只保留最新一个安装包**）；
 每个仓库根目录 `校验信息.md` 里有 **MD5 / SHA-256**，下完先核对。
@@ -149,7 +149,7 @@ node node_modules/@electron-forge/cli/dist/electron-forge.js package --platform 
 # 2) 打 MSI（自写 WiX 源；具体参数由维护者本地保存）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-msi-wix.ps1 `
   -ProductName "AI Anime Image Manager NEXT" -ExeName "ai-anime-image-manager-next.exe" -UpgradeCode "2636577f-93de-46c0-8217-f4a360fa2ebf"
-# 版本号默认每次构建自增（要固定再加 -Version 2.2.3.80）
+# 版本号默认每次构建自增（要固定再加 -Version 2.2.3.81）
 ```
 
 > 产物在 `msi-out/`。**不要**用 `make --targets @electron-forge/maker-wix`：它打出来的包

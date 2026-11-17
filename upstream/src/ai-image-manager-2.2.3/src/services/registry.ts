@@ -1,4 +1,5 @@
 import { closeDatabase, getDatabase, initDatabase } from "@/db";
+import { relocateSameNameFolders } from "@/services/folder-relocation";
 import { getAiControlState } from "@/services/ai/state";
 import { shutdownTextWorker } from "@/services/ai/text-worker-client";
 import { shutdownTranslationWorker } from "@/services/ai/translation-worker-client";
@@ -383,6 +384,28 @@ registry.register({
           return;
         }
         const orphanStartedAt = Date.now();
+        /*
+         * 2026-11-18（会话#14）：**先认"同名换路径"的文件夹，再对账**。
+         *
+         * 用户口径：改名请在软件里改；但"名字不变、只挪了位置"希望自动找回来。
+         * 这一步只做保守迁移（同名 + 文件签名匹配率 ≥80% + 候选唯一），
+         * 命中就把路径前缀改过去（标签/相册/收藏不动）；迁移不了的仍走孤儿对账标"缺失"。
+         */
+        try {
+          const relocated = relocateSameNameFolders(getDatabase());
+          if (relocated.length > 0) {
+            console.log(
+              `[perf] 同名文件夹迁移：${relocated
+                .map((item) => `${item.from} → ${item.to}`)
+                .join("；")}`
+            );
+          }
+        } catch (error) {
+          console.warn(
+            "[perf] 同名文件夹迁移检查失败：",
+            error instanceof Error ? error.message : String(error)
+          );
+        }
         cleanupOrphanedRecordsAsync()
           .then(({ removed, checked }) => {
             setSetting(ORPHAN_SCAN_SETTING_KEY, String(Date.now()));

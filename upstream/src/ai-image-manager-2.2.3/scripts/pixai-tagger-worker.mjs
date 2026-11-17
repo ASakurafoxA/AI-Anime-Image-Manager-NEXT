@@ -264,6 +264,18 @@ async function handleTag(message) {
     if (aborted) {
       break;
     }
+    /*
+     * 2026-11-18：**单张图的读取 / 解码失败不再中断整轮打标**（用户实测 bug）。
+     *
+     * 之前：DML 分支把 catch 到的**任何**错误都当成 provider 故障 → break →
+     * 整批 0 成功、本轮打标直接停（12-17 16:31 实测：8 张里有一张文件不在，
+     * sharp 抛 `Input file is missing: <路径>`，整轮就死了，还留着
+     * "下一次 init 将自动降级 CPU" 这句空承诺）。
+     * 现在用 `phase` 区分：只有卡在推理（run / post）才算 provider 故障；
+     * 读不到图 / 解不开图 → 记在这张照片上，**继续处理后面的**。
+     * 错误信息带上 `#照片id`，日志脱敏了路径也能定位是哪一张。
+     */
+    let phase = "load";
     try {
       const floats = await preprocessImage(await resolveImageInput(photo.path));
       const input = new ortNs.Tensor("float32", floats, [
@@ -272,7 +284,9 @@ async function handleTag(message) {
         IMAGE_SIZE,
         IMAGE_SIZE,
       ]);
+      phase = "run";
       const outputs = await session.run({ [inputName]: input });
+      phase = "post";
 
       const logits = outputs[logitsOutputName]?.data;
       if (!logits || logits.length !== vocab.length) {
@@ -324,13 +338,15 @@ async function handleTag(message) {
       }
       results.push(entry);
     } catch (error) {
-      if (activeProvider === "dml") {
-        providerError = error instanceof Error ? error.message : String(error);
+      const text = error instanceof Error ? error.message : String(error);
+      // 只有"推理阶段"失败才当 provider 故障（DML 崩了）；读图失败只是这一张的问题
+      if (activeProvider === "dml" && phase !== "load") {
+        providerError = text;
         break;
       }
       results.push({
         id: photo.id,
-        error: error instanceof Error ? error.message : String(error),
+        error: `#${photo.id} ${text}`,
       });
     }
   }

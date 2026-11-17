@@ -86,6 +86,13 @@ interface PhotoLightboxProps {
 const SLIDESHOW_DELAYS = [3000, 5000, 10_000] as const;
 const MAX_ZOOM = 8;
 const ZOOM_STEP = 1.2;
+/**
+ * 2026-11-18（会话#14）：⋯ 菜单里"相册 / 幻灯片"这两项在自用版被构建开关关掉了，
+ * 但下面那条分隔线是**无条件**渲染的 → 菜单顶部留下一条空的分隔线（用户截图）。
+ * 这里把两个开关提出来，分隔线只在"上面确实有项目"时才画。
+ */
+const SHOW_LIGHTBOX_ALBUM_ITEM = !PRIVATE_BUILD.hidePhotoMenuExtras;
+const SHOW_LIGHTBOX_SLIDESHOW_ITEM = !PRIVATE_BUILD.slimLightboxSlideshow;
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -172,6 +179,9 @@ export const PhotoLightbox = memo(function PhotoLightbox({
   const [sourceKey, setSourceKey] = useState(0);
   const [controlsVisible, setControlsVisible] = useState(true);
   const [infoVisible, setInfoVisible] = useState(false);
+  /** 2026-11-18：面板正在播"收回"动画（见 closeInfoPanel）。 */
+  const [infoClosing, setInfoClosing] = useState(false);
+  const infoCloseTimer = useRef<number | null>(null);
   const [thumbnailsVisible, setThumbnailsVisible] = useState(false);
 
   const [moreOpen, setMoreOpen] = useState(false);
@@ -329,25 +339,69 @@ export const PhotoLightbox = memo(function PhotoLightbox({
     updateZoom(clamp(image.naturalWidth / image.clientWidth, 1, MAX_ZOOM));
   }, [updateZoom]);
 
-  const toggleInfo = useCallback(() => {
-    const nextVisible = !infoVisible;
-    setInfoVisible(nextVisible);
-    if (nextVisible) {
-      setThumbnailsVisible(false);
+  /**
+   * 2026-11-18（用户口径：「关闭也要动画」）：
+   * 面板卸载后布局会立刻回弹（图片区瞬间变宽）→ 看起来又是"瞬移"。
+   * 所以先播 260ms 的收回动画，再真正卸载；关掉「动画效果」时直接卸载。
+   *
+   * ⚠️ 必须定义在 toggleInfo **之前**：toggleInfo 的依赖数组在渲染时就会求值，
+   * 放到后面会踩 const 的暂时性死区（TDZ）。
+   */
+  const closeInfoPanel = useCallback(() => {
+    if (!infoVisible) {
+      return;
     }
+    const finish = () => {
+      setInfoClosing(false);
+      setInfoVisible(false);
+      if (!(sequencePlayback || autoPlay)) {
+        saveLightboxPanelMode("off");
+      }
+    };
+    if (reduceMotion) {
+      finish();
+      return;
+    }
+    setInfoClosing(true);
+    if (infoCloseTimer.current !== null) {
+      window.clearTimeout(infoCloseTimer.current);
+    }
+    infoCloseTimer.current = window.setTimeout(() => {
+      infoCloseTimer.current = null;
+      finish();
+    }, 260);
+  }, [autoPlay, infoVisible, reduceMotion, sequencePlayback]);
+
+  // 卸载时清掉"收回动画"的定时器，避免卸载后 setState
+  useEffect(() => {
+    return () => {
+      if (infoCloseTimer.current !== null) {
+        window.clearTimeout(infoCloseTimer.current);
+        infoCloseTimer.current = null;
+      }
+    };
+  }, []);
+
+  const toggleInfo = useCallback(() => {
+    if (infoVisible) {
+      // 关闭 → 播收回动画（见 closeInfoPanel）
+      closeInfoPanel();
+      return;
+    }
+    setInfoVisible(true);
+    setInfoClosing(false);
+    setThumbnailsVisible(false);
     if (!(sequencePlayback || autoPlay)) {
-      saveLightboxPanelMode(nextVisible ? "info" : "off");
+      saveLightboxPanelMode("info");
     }
     setPlaying(false);
     setMoreOpen(false);
-  }, [autoPlay, infoVisible, sequencePlayback]);
-
-  const closeInfoPanel = useCallback(() => {
-    setInfoVisible(false);
-    if (!(sequencePlayback || autoPlay)) {
-      saveLightboxPanelMode("off");
-    }
-  }, [autoPlay, sequencePlayback]);
+  }, [
+    autoPlay,
+    closeInfoPanel,
+    infoVisible,
+    sequencePlayback,
+  ]);
 
   const toggleThumbnails = useCallback(() => {
     if (photos.length <= 1) {
@@ -884,7 +938,7 @@ export const PhotoLightbox = memo(function PhotoLightbox({
                 >
                   {/* 自用版：去掉「添加到相册」（与右键菜单、多选操作栏保持一致；
                       之前只改了那两处，大图模式这个入口漏掉了） */}
-                  {onAddToAlbum && !PRIVATE_BUILD.hidePhotoMenuExtras && (
+                  {onAddToAlbum && SHOW_LIGHTBOX_ALBUM_ITEM && (
                     <MenuButton
                       icon={<Rows3 className="h-4 w-4" />}
                       label={t("addToAlbum")}
@@ -894,14 +948,18 @@ export const PhotoLightbox = memo(function PhotoLightbox({
                       }}
                     />
                   )}
-                  {!PRIVATE_BUILD.slimLightboxSlideshow && (
+                  {SHOW_LIGHTBOX_SLIDESHOW_ITEM && (
                     <MenuButton
                       icon={<Play className="h-4 w-4" />}
                       label={t("playSlideshow")}
                       onClick={startSlideshow}
                     />
                   )}
-                  <div className="my-1 border-white/10 border-t" />
+                  {/* 只有上面真的渲染了项目时才画分隔线（否则就是那条悬空的线） */}
+                  {((onAddToAlbum && SHOW_LIGHTBOX_ALBUM_ITEM) ||
+                    SHOW_LIGHTBOX_SLIDESHOW_ITEM) && (
+                    <div className="my-1 border-white/10 border-t" />
+                  )}
                   <MenuButton
                     icon={<ImageIcon className="h-4 w-4" />}
                     label={t("copyImage")}
@@ -1335,6 +1393,7 @@ export const PhotoLightbox = memo(function PhotoLightbox({
 
       {infoVisible && (
         <LightboxInfoPanel
+          closing={infoClosing}
           onClose={closeInfoPanel}
           onOpenExplorer={(path) => {
             ipc.client.shell.openInExplorer({ path }).catch(() => undefined);

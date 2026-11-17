@@ -7,6 +7,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { ipc } from "@/ipc/manager";
 import { getTagDisplayName } from "@/localization/tag-display";
 import { getDateLocale } from "@/utils/date-locale";
@@ -56,6 +57,8 @@ interface TagInfo {
 }
 
 interface LightboxInfoPanelProps {
+  /** 2026-11-18：正在播"收回"动画（由 PhotoLightbox 控制卸载时机）。 */
+  closing?: boolean;
   onClose: () => void;
   onOpenExplorer: (path: string) => void;
   photo: LightboxInfoPhoto;
@@ -117,11 +120,13 @@ function hasCaptureInfo(exif: ExifData | null) {
 }
 
 export function LightboxInfoPanel({
+  closing = false,
   photo,
   onClose,
   onOpenExplorer,
 }: LightboxInfoPanelProps) {
   const { t, i18n } = useTranslation();
+  const reduceMotion = useReducedMotion();
   const [exif, setExif] = useState<ExifData | null>(null);
   const [tags, setTags] = useState<TagInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -221,12 +226,32 @@ export function LightboxInfoPanel({
   return (
     <aside
       aria-label={t("photoDetail")}
-      className="relative z-40 flex h-full shrink-0 flex-col border-white/10 border-l bg-[#111114] text-white max-[800px]:absolute max-[800px]:inset-y-0 max-[800px]:right-0 max-[800px]:max-w-[calc(100vw-3rem)] max-[800px]:shadow-2xl"
-      style={{ width }}
+      /*
+       * 2026-11-18（会话#14）：用户口径 ——
+       *  ① 这个面板原来是大图模式的深色风格（`bg-[#111114] text-white`），
+       *     标签用了彩色底 + 白字，在深底上对比度太低，用户一直没注意到这里能看标签；
+       *     现在改成**跟应用主题一致的浅色面板**（浅色主题下就是白底），标签自然看得清。
+       *  ② 面板本来就从右侧弹出，但没有动画 → 加 `lightbox-panel-enter`（见 global.css）。
+       *     仍然受「减少动画」开关 / 系统 prefers-reduced-motion 管控。
+       */
+      className={`lightbox-panel--light relative z-40 flex h-full shrink-0 flex-col border-border border-l bg-background text-foreground max-[800px]:absolute max-[800px]:inset-y-0 max-[800px]:right-0 max-[800px]:max-w-[calc(100vw-3rem)] max-[800px]:shadow-2xl ${
+        reduceMotion
+          ? ""
+          : closing
+            ? "lightbox-panel-exit"
+            : "lightbox-panel-enter"
+      }`}
+      style={
+        {
+          width,
+          /* 滑入动画的位移量 = 面板宽度（见 global.css 的 lightbox-panel-in） */
+          "--lightbox-panel-width": `${width}px`,
+        } as React.CSSProperties
+      }
     >
       <div
         aria-hidden="true"
-        className={`absolute top-0 -left-1 h-full w-2 cursor-col-resize max-[800px]:hidden ${resizing ? "bg-primary/50" : "hover:bg-white/10"}`}
+        className={`absolute top-0 -left-1 h-full w-2 cursor-col-resize max-[800px]:hidden ${resizing ? "bg-primary/50" : "hover:bg-muted"}`}
         onMouseDown={(event) => {
           event.preventDefault();
           resizeStart.current = { x: event.clientX, width };
@@ -235,13 +260,13 @@ export function LightboxInfoPanel({
           document.body.style.userSelect = "none";
         }}
       />
-      <header className="flex h-14 shrink-0 items-center justify-between border-white/10 border-b px-4">
+      <header className="flex h-14 shrink-0 items-center justify-between border-border border-b px-4">
         <div className="min-w-0">
           <h2 className="font-semibold text-[14px]">{t("photoDetail")}</h2>
           <Tooltip>
             <TooltipTrigger asChild>
               <p
-                className="truncate text-[11px] text-white/45"
+                className="truncate text-[11px] text-muted-foreground"
                 // biome-ignore lint/a11y/noNoninteractiveTabindex: truncated filename must expose its Tooltip to keyboard users
                 tabIndex={0}
               >
@@ -286,9 +311,9 @@ export function LightboxInfoPanel({
         {loading ? (
           <div className="space-y-2" role="status">
             <span className="sr-only">{t("loading")}</span>
-            <div className="h-3 w-24 animate-pulse rounded bg-white/10" />
-            <div className="h-7 animate-pulse rounded bg-white/[0.06]" />
-            <div className="h-7 animate-pulse rounded bg-white/[0.06]" />
+            <div className="h-3 w-24 animate-pulse rounded bg-muted" />
+            <div className="h-7 animate-pulse rounded bg-muted/60" />
+            <div className="h-7 animate-pulse rounded bg-muted/60" />
           </div>
         ) : (
           <>
@@ -322,12 +347,24 @@ export function LightboxInfoPanel({
                 <div className="flex flex-wrap gap-1.5">
                   {tags.map((tag) => (
                     <span
-                      className={`rounded px-2 py-0.5 text-[11px] ${tag.isConfirmed === false ? "border border-foreground/20 border-dashed bg-foreground/5 text-foreground/65" : "text-white"}`}
+                      className={`rounded px-2 py-0.5 text-[11px] ${
+                        tag.isConfirmed === false
+                          ? "border border-foreground/20 border-dashed bg-foreground/5 text-foreground/70"
+                          : "ring-1 ring-black/10"
+                      }`}
                       key={tag.id}
                       style={
                         tag.isConfirmed === false
                           ? undefined
-                          : { backgroundColor: tag.color ?? "var(--primary)" }
+                          : {
+                              backgroundColor: tag.color ?? "var(--primary)",
+                              /*
+                               * 2026-11-18：面板改浅色后，标签底色仍按用户设置显示，
+                               * 但**文字颜色按底色亮度自动选黑/白** —— 否则浅色标签
+                               * （黄、粉、浅绿）上的白字会看不清，又会变成"看不见"。
+                               */
+                              color: readableOn(tag.color),
+                            }
                       }
                     >
                       {getTagDisplayName(tag.name, i18n.language)}
@@ -352,15 +389,15 @@ export function LightboxInfoPanel({
             )}
 
             {advancedGroups.length > 0 && (
-              <details className="group rounded-lg border border-white/10 bg-white/[0.025] p-3">
-                <summary className="flex cursor-pointer list-none items-center justify-between font-medium text-[11px] text-white/60 uppercase tracking-wider">
+              <details className="group rounded-lg border border-border bg-muted/30 p-3">
+                <summary className="flex cursor-pointer list-none items-center justify-between font-medium text-[11px] text-muted-foreground uppercase tracking-wider">
                   {t("advancedMetadata")}
                   <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
                 </summary>
                 <div className="mt-3 space-y-4">
                   {advancedGroups.map(([title, values]) => (
                     <div key={String(title)}>
-                      <h4 className="mb-1.5 font-medium text-[11px] text-white/65">
+                      <h4 className="mb-1.5 font-medium text-[11px] text-foreground/80">
                         {String(title)}
                       </h4>
                       <div className="space-y-1.5">
@@ -386,7 +423,7 @@ export function LightboxInfoPanel({
         <InfoSection title={t("filePath")}>
           <Tooltip>
             <TooltipTrigger asChild>
-              <p className="truncate text-[11px] text-white/55 leading-relaxed">
+              <p className="truncate text-[11px] text-muted-foreground leading-relaxed">
                 {photo.path}
               </p>
             </TooltipTrigger>
@@ -432,7 +469,7 @@ function InfoSection({
 }) {
   return (
     <section>
-      <h3 className="mb-2 font-medium text-[11px] text-white/40 uppercase tracking-wider">
+      <h3 className="mb-2 font-medium text-[11px] text-muted-foreground uppercase tracking-wider">
         {title}
       </h3>
       <div className="space-y-1.5">{children}</div>
@@ -443,10 +480,31 @@ function InfoSection({
 function InfoRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-start justify-between gap-4 text-[11px]">
-      <span className="shrink-0 text-white/40">{label}</span>
-      <span className="min-w-0 text-right text-white/75 [overflow-wrap:anywhere]">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className="min-w-0 text-right text-foreground/90 [overflow-wrap:anywhere]">
         {value}
       </span>
     </div>
   );
+}
+
+/**
+ * 2026-11-18：按标签底色的亮度自动选黑/白文字。
+ * 浅色底（黄、粉、浅绿）用深字，深色底用白字 —— 否则浅色标签上的白字会糊成一片。
+ */
+function readableOn(hex?: string | null): string {
+  if (!hex) {
+    return "#ffffff";
+  }
+  const match = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!match) {
+    return "#ffffff";
+  }
+  const value = Number.parseInt(match[1], 16);
+  const r = (value >> 16) & 0xff;
+  const g = (value >> 8) & 0xff;
+  const b = value & 0xff;
+  // sRGB 亮度近似（0~1）：> 0.62 视为浅色底
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.62 ? "#111114" : "#ffffff";
 }

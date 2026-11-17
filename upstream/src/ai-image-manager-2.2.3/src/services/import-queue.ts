@@ -63,6 +63,14 @@ export interface ImportQueueStatus {
 
 const queue: ImportTask[] = [];
 const history: ImportTask[] = [];
+/** 2026-11-18：历史只留最近 200 条（长期运行不至于无限涨；读取时本来也只显示最近 20）。 */
+const HISTORY_LIMIT = 200;
+function pushHistory(task: ImportTask): void {
+  history.push(task);
+  if (history.length > HISTORY_LIMIT) {
+    history.splice(0, history.length - HISTORY_LIMIT);
+  }
+}
 let current: ImportTask | null = null;
 let running = false;
 let nextId = 1;
@@ -666,7 +674,7 @@ async function runScanPhase(task: ImportTask): Promise<boolean> {
     );
     task.status = "cancelled";
     rememberRoot(task.folderPath, false);
-    history.push(task);
+    pushHistory(task);
     return false;
   }
 
@@ -759,6 +767,16 @@ async function processNext(): Promise<void> {
     activeScan = runScanPhase(task);
     const ok = await activeScan;
     if (!ok) {
+      /*
+       * 2026-11-18：取消 / 中断时把任务状态落干净。
+       * 原来这里直接 return —— finally 会清 running/current，但这个任务永远是 "scanning"，
+       * 既不在队列也不在历史里，状态查询会看到一个幽灵任务。
+       * ⚠️ 关闭流程（suspending）里**不记历史**：那是"下次启动续跑"，不是取消。
+       */
+      if (!suspending) {
+        task.status = "cancelled";
+        pushHistory(task);
+      }
       return;
     }
     task.status = "done";
@@ -768,14 +786,25 @@ async function processNext(): Promise<void> {
         scheduleAdvancedExifEnrichment(1000)
       )
       .catch(() => undefined);
-    history.push(task);
+    pushHistory(task);
   } catch (err: unknown) {
     if (suspending) {
       return;
     }
     task.status = "failed";
     task.error = err instanceof Error ? err.message : String(err);
-    history.push(task);
+    pushHistory(task);
+    /*
+     * 2026-11-18：**永久性**错误（路径不存在 / 没权限）不要留在"未完成根目录"里，
+     * 否则每次启动都会自动重试、每次都失败。临时性错误仍然保留，让启动时续跑。
+     */
+    if (
+      /ENOENT|EACCES|EPERM|ENOTDIR|不存在|not exist|permission|无法访问/i.test(
+        task.error
+      )
+    ) {
+      rememberRoot(task.folderPath, false);
+    }
   } finally {
     // Flush IPC-level COUNT cache so the frontend sees accurate totals
     // immediately after import finishes — no stale counts from before
@@ -845,7 +874,7 @@ export function cancelQueuedImports(): ImportTask[] {
   for (const t of cancelled) {
     rememberRoot(t.folderPath, false);
     t.status = "cancelled";
-    history.push(t);
+    pushHistory(t);
   }
   broadcast();
   return cancelled;
