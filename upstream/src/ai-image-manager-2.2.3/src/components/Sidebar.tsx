@@ -1166,11 +1166,53 @@ export function Sidebar({
    *  - 留空则去掉中文名，退回纯英文
    * 于是无论中文名怎么改，标签身份都不变，中文和英文都能搜到。
    */
-  function splitTagName(stored: string): { chinese: string; english: string } {
-    const matched = /^(.+?) \(([^()]+)\)$/.exec(stored);
-    return matched
-      ? { chinese: matched[1], english: matched[2] }
-      : { chinese: "", english: stored };
+  function splitTagName(stored: string): {
+    chinese: string;
+    english: string;
+    separator: string;
+  } {
+    /*
+     * 2026-11-18：**只修解析，不改约定**（名字仍是 `中文 + 分隔 + (英文原名)`）。
+     *
+     * 旧正则 `/^(.+?) \(([^()]+)\)$/` 要求"空格 + 括号里不能再有括号"，
+     * 而标签器给的英文原名本身可能带括号（`sakurada_shiro_(hy_plus)`），
+     * 也可能紧贴中文没有空格（`樱田诗露(sakurada_shiro_(hy_plus))`）。
+     * 这时旧正则匹配失败 → 整串被当成英文名 → 再改名又追加一层 → **越叠越长**。
+     *
+     * 现在：以**第一个** `(` 为界取中文名，括号到末尾为英文名（内层括号原样保留），
+     * 并记住原来的分隔写法（`" ("` 或 `"("`），改名时原样沿用。
+     */
+    const trimmed = stored.trim();
+    const open = trimmed.indexOf("(");
+    if (open <= 0 || !trimmed.endsWith(")")) {
+      return { chinese: "", english: trimmed, separator: " (" };
+    }
+    const head = trimmed.slice(0, open);
+    /*
+     * 括号前**没有中文**（例如纯英文标签 `sakurada_shiro_(hy_plus)`）：
+     * 整串就是英文原名，不能拆 —— 否则改名会把 `sakurada_shiro_` 弄丢。
+     */
+    if (!/[\u4e00-\u9fff]/.test(head)) {
+      return { chinese: "", english: trimmed, separator: " (" };
+    }
+    const chinese = head.trim();
+    let english = trimmed.slice(open + 1, -1).trim();
+    /*
+     * 已经被旧 bug 叠坏的名字（`樱田诗露 (樱田诗露 (hy plus))`）：
+     * 括号里若还套着一层"中文 + 括号"，就把外层剥掉，只留里面的原名。
+     */
+    for (let depth = 0; depth < 10; depth += 1) {
+      const inner = /^(.+?)[(](.+)[)]$/.exec(english);
+      if (!inner || !/[\u4e00-\u9fff]/.test(inner[1])) {
+        break;
+      }
+      english = inner[2].trim();
+    }
+    return {
+      chinese,
+      english,
+      separator: /\s$/.test(head) ? " (" : "(",
+    };
   }
 
   async function handleRenameTag() {
@@ -1179,8 +1221,8 @@ export function Sidebar({
       return;
     }
     const name = renameTagName.trim();
-    const { english } = splitTagName(target.name);
-    const finalName = name ? `${name} (${english})` : english;
+    const { english, separator } = splitTagName(target.name);
+    const finalName = name ? `${name}${separator}${english})` : english;
     if (finalName === target.name) {
       setRenameTagTarget(null);
       setRenameTagName("");
