@@ -1166,29 +1166,11 @@ export function Sidebar({
    *  - 留空则去掉中文名，退回纯英文
    * 于是无论中文名怎么改，标签身份都不变，中文和英文都能搜到。
    */
-  /**
-   * 2026-11-18（用户实测：「tag 反复重命名会越叠越长」）：
-   *   · 旧实现只认"内层不含括号"的 `中文 (english)`，内层一旦有括号就整体当 english →
-   *     再改一次又追加一层，越叠越长（实测出现了 `樱田诗露 (樱田诗露 (hy plus))` 这种）；
-   *   · 现在：中文名取**第一个** ` (` 之前的部分；英文名从括号里取，并**逐层剥掉**
-   *     已经被叠进去的旧名字（`X (Y)` → `Y`），只留最里面的原名。
-   */
   function splitTagName(stored: string): { chinese: string; english: string } {
-    const trimmed = stored.trim();
-    const first = trimmed.indexOf(" (");
-    if (first <= 0 || !trimmed.endsWith(")")) {
-      return { chinese: "", english: trimmed };
-    }
-    const chinese = trimmed.slice(0, first).trim();
-    let english = trimmed.slice(first + 2, -1).trim();
-    for (let depth = 0; depth < 10; depth += 1) {
-      const inner = /^.* \(([^()]*)\)$/.exec(english);
-      if (!inner) {
-        break;
-      }
-      english = inner[1].trim();
-    }
-    return { chinese, english };
+    const matched = /^(.+?) \(([^()]+)\)$/.exec(stored);
+    return matched
+      ? { chinese: matched[1], english: matched[2] }
+      : { chinese: "", english: stored };
   }
 
   async function handleRenameTag() {
@@ -1197,16 +1179,8 @@ export function Sidebar({
       return;
     }
     const name = renameTagName.trim();
-    const { chinese, english } = splitTagName(target.name);
-    /*
-     * 2026-11-18：**不再无条件追加 ` (english)`**。
-     *   · 用户输入里已经带了 `(...)`（或直接粘贴了完整名字）→ 原样用，不再追加；
-     *   · 否则按原来的约定补上英文原名。
-     * 这样无论改几次，名字都不会越叠越长。
-     */
-    const hasSuffix = /\)\s*$/.test(name);
-    const baseName = name || chinese || english;
-    const finalName = hasSuffix ? baseName : `${baseName} (${english})`;
+    const { english } = splitTagName(target.name);
+    const finalName = name ? `${name} (${english})` : english;
     if (finalName === target.name) {
       setRenameTagTarget(null);
       setRenameTagName("");
