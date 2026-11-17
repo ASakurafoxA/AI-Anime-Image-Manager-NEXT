@@ -5462,7 +5462,7 @@ export const PIXAI_CHARACTER_ZH: Record<string, string> = {
   "sakura_miku": "樱初音",
   "sakura_uta_(precure)": "咲良诗",
   "sakuraba_ema": "樱庭绘麻",
-  "sakurada_shiro_(hy_plus)": "樱田诗郎（hy plus）",
+  "sakurada_shiro_(hy_plus)": "樱田诗露",
   "sakurada_yuuta": "樱田悠太",
   "sakuragi_hanamichi": "樱木花道",
   "sakuragi_mano": "樱木真乃",
